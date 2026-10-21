@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <TargetPlatformMoniker>Windows,Version=7.0</TargetPlatformMoniker>
+    <TargetPlatformDisplayName>Windows</TargetPlatformDisplayName>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>CodexDaily</AssemblyName>
+    <InformationalVersion>0.1.0-daily.20261021-r5</InformationalVersion>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../CodexUsage.DailyCore/CodexUsage.DailyCore.csproj" />
+    <Reference Include="CodexUsage.Core"><HintPath>../../frozen-core/CodexUsage.Core.dll</HintPath><Private>true</Private></Reference>
+  </ItemGroup>
+</Project>

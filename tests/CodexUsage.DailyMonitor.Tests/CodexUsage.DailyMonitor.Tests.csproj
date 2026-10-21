@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/CodexUsage.DailyCore/CodexUsage.DailyCore.csproj" />
+    <Reference Include="CodexUsage.Core"><HintPath>../../frozen-core/CodexUsage.Core.dll</HintPath><Private>true</Private></Reference>
+    <Compile Include="../../src/CodexUsage.DailyPanel/SessionLogMonitor.cs" Link="SessionLogMonitor.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/DailyLogReader.cs" Link="DailyLogReader.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/OversizedEnvelopeValidator.cs" Link="OversizedEnvelopeValidator.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/DailyToolTimingParser.cs" Link="DailyToolTimingParser.cs" />
+  </ItemGroup>
+</Project>
