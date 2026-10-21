@@ -67,6 +67,7 @@ try
     await OversizedLineTests.RunAsync();
     EnvelopeValidatorTests.Run();
     await LifecycleHistoryTests.RunAsync();
+    await LegacyIntegrityMonitorTests.RunAsync();
     Console.WriteLine($"RESULT: {passes} passed, 0 failed");
 }
 finally { Directory.Delete(directory, true); }

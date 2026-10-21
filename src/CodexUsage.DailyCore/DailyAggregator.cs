@@ -75,6 +75,8 @@ public static class DailyAggregator
             // arrival time must neither move it to another day nor outside its turn.
             // Keep latest counters separately, with their original revision ordering.
             var evidence = versions[0];
+            var coverageEvidence = versions[0];
+            var coverageHistory = new List<UsageEvent> { versions[0] };
             foreach (var version in versions.Skip(1))
             {
                 // Exact replays must not promote an intermediate cumulative snapshot
@@ -82,16 +84,28 @@ public static class DailyAggregator
                 // correction advances evidence order; a thread-only change does not.
                 if (version.Usage != evidence.Usage || version.TurnSnapshot != evidence.TurnSnapshot)
                     evidence = version;
+                // Aggregate legacy coverage also depends on the thread snapshot.
+                // Keep its revision order separate from unchanged TPS evidence.
+                if (!SamePayload(version, coverageEvidence))
+                {
+                    coverageEvidence = version;
+                    coverageHistory.Add(version);
+                }
             }
-            accepted.Add(new(selected, versions[0].Timestamp, evidence));
+            accepted.Add(new(selected, versions[0].Timestamp, evidence, coverageEvidence, versions[0].Ordinal, [.. coverageHistory]));
         }
 
         var dayRequests = accepted.Where(x => InDay(x.OccurredAt)).ToArray();
         TokenVector? totals = dayRequests.Length == 0 ? null : Sum(dayRequests);
         if (dayRequests.Any(x => !x.Latest.Usage!.IsComplete)) issues.Add("部分 token 字段未提供");
         if (totals is { IsComplete: false } && dayRequests.All(x => x.Latest.Usage!.IsComplete)) issues.Add("累计数值超出范围");
-        var legacyOnly = dayRequests.Length == 0 && today.OfType<UsageEvent>().Any(x => x.Legacy);
-        if (legacyOnly) issues.Add("仅有旧格式快照，不能还原今日请求");
+        var legacy = today.OfType<UsageEvent>().Where(x => x.Legacy).ToArray();
+        if (legacy.Length > 0)
+        {
+            var covered = BuildLegacyCoverage(accepted);
+            if (legacy.Any(x => !LegacyCovered(x, covered)))
+                issues.Add("旧格式快照覆盖关系未知，无法还原全部今日用量");
+        }
         // Revision arrival alone is not a new daily chat or turn. Lifecycle rows
         // and legacy snapshots establish observed chat/turn presence on their own
         // event dates; modern usage follows its request occurrence. Legacy presence
@@ -278,7 +292,143 @@ public static class DailyAggregator
         public List<AcceptedRequest> Requests { get; } = [];
     }
 
-    private sealed record AcceptedRequest(UsageEvent Latest, DateTimeOffset OccurredAt, UsageEvent SnapshotEvidence);
+    private sealed record AcceptedRequest(UsageEvent Latest, DateTimeOffset OccurredAt, UsageEvent SnapshotEvidence,
+        UsageEvent CoverageEvidence, long? FirstOrdinal, UsageEvent[] CoverageHistory);
+
+    private sealed record LegacyCheckpoint(UsageEvent Evidence, long? PrefixMaxKnownOrdinal);
+
+    private sealed class LegacyCheckpoints
+    {
+        public LegacyCheckpoint? KnownOrdinal { get; private set; }
+        public LegacyCheckpoint? UnknownOrdinal { get; private set; }
+
+        public void Include(UsageEvent checkpoint, long? prefixMaxKnownOrdinal)
+        {
+            // Both position and the prefix's known ordinal bound must survive a
+            // later missing ordinal. Missing evidence never erases a contradiction.
+            if (checkpoint.Ordinal.HasValue) KnownOrdinal ??= new(checkpoint, prefixMaxKnownOrdinal);
+            else UnknownOrdinal ??= new(checkpoint, prefixMaxKnownOrdinal);
+        }
+
+        public bool Covers(UsageEvent legacy)
+        {
+            bool Matches(LegacyCheckpoint? checkpoint) => checkpoint is { } value
+                && !(value.PrefixMaxKnownOrdinal > legacy.Ordinal)
+                && AtOrBefore(value.Evidence.Timestamp, value.Evidence.Ordinal, legacy.Timestamp, legacy.Ordinal) == true;
+            return Matches(KnownOrdinal) || Matches(UnknownOrdinal);
+        }
+    }
+
+    private static bool LegacyCovered(UsageEvent legacy,
+        Dictionary<(string Session, string Turn, TokenVector Snapshot), LegacyCheckpoints> covered)
+    {
+        // The frozen parser supplies no native legacy request/turn identity. A
+        // contextual turn constrains scope; it does not turn last_token_usage
+        // into a request. Only a fully reconciled cumulative checkpoint can
+        // prove aggregate coverage, and no legacy value enters the sum.
+        if (string.IsNullOrWhiteSpace(legacy.TurnKey)
+            || legacy.Usage is not { IsComplete: true, IsValid: true } last
+            || legacy.ThreadSnapshot is not { IsComplete: true, IsValid: true } snapshot
+            || last.Input > snapshot.Input || last.CachedInput > snapshot.CachedInput
+            || last.Output > snapshot.Output || last.ReasoningOutput > snapshot.ReasoningOutput
+            || last.Total > snapshot.Total) return false;
+
+        return covered.TryGetValue((legacy.SessionKey, legacy.TurnKey, snapshot), out var checkpoints)
+            && checkpoints.Covers(legacy);
+    }
+
+    private static Dictionary<(string Session, string Turn, TokenVector Snapshot), LegacyCheckpoints> BuildLegacyCoverage(
+        List<AcceptedRequest> accepted)
+    {
+        var covered = new Dictionary<(string Session, string Turn, TokenVector Snapshot), LegacyCheckpoints>();
+        foreach (var session in accepted.GroupBy(x => x.Latest.SessionKey))
+        {
+            // Sweep final meaningful revisions once. A still-pending request
+            // whose first occurrence belongs to this prefix makes it unknown;
+            // its revised counters must not be backdated into the checkpoint.
+            var ordered = session.OrderBy(x => x.CoverageEvidence.Timestamp).ThenBy(x => x.CoverageEvidence.Ordinal).ToArray();
+            var pendingFirst = new AcceptedRequest?[ordered.Length + 1];
+            var pendingOrdinal = new long?[ordered.Length + 1];
+            for (var i = ordered.Length - 1; i >= 0; i--)
+            {
+                var next = pendingFirst[i + 1];
+                var request = ordered[i];
+                pendingFirst[i] = next is null || request.OccurredAt < next.OccurredAt
+                    || (request.OccurredAt == next.OccurredAt && Nullable.Compare(request.FirstOrdinal, next.FirstOrdinal) < 0)
+                    ? request : next;
+                pendingOrdinal[i] = request.FirstOrdinal is { } ordinal
+                    ? Math.Min(ordinal, pendingOrdinal[i + 1] ?? long.MaxValue) : pendingOrdinal[i + 1];
+            }
+            var firstTimes = session.GroupBy(x => x.OccurredAt)
+                .ToDictionary(x => x.Key, x => (Count: x.Count(), MissingOrdinal: x.Count(r => r.FirstOrdinal is null)));
+            var revisionTimes = session.GroupBy(x => x.CoverageEvidence.Timestamp)
+                .ToDictionary(x => x.Key, x => (Count: x.Count(), MissingOrdinal: x.Count(r => r.CoverageEvidence.Ordinal is null)));
+            // Preserve ordering evidence from every meaningful version, including
+            // intermediate corrections. Replays do not become new positions.
+            var history = session.SelectMany(x => x.CoverageHistory)
+                .OrderBy(x => x.Timestamp).ThenBy(x => x.Ordinal).ToArray();
+            var historyIndex = 0;
+            long? maxHistoryOrdinal = null;
+            var historyConflict = false;
+            var total = TokenVector.Zero;
+            long? maxFirstOrdinal = null, maxRevisionOrdinal = null;
+            for (var index = 0; index < ordered.Length;)
+            {
+                var evidence = ordered[index].CoverageEvidence;
+                var end = index;
+                while (end < ordered.Length && ordered[end].CoverageEvidence.Timestamp == evidence.Timestamp
+                    && ordered[end].CoverageEvidence.Ordinal == evidence.Ordinal)
+                {
+                    var request = ordered[end++];
+                    total += request.Latest.Usage!;
+                    if (request.FirstOrdinal is { } first) maxFirstOrdinal = Math.Max(first, maxFirstOrdinal ?? long.MinValue);
+                    if (request.CoverageEvidence.Ordinal is { } revision) maxRevisionOrdinal = Math.Max(revision, maxRevisionOrdinal ?? long.MinValue);
+                }
+                while (historyIndex < history.Length && (history[historyIndex].Timestamp < evidence.Timestamp
+                    || (history[historyIndex].Timestamp == evidence.Timestamp
+                        && Nullable.Compare(history[historyIndex].Ordinal, evidence.Ordinal) <= 0)))
+                {
+                    if (history[historyIndex++].Ordinal is not { } ordinal) continue;
+                    historyConflict |= maxHistoryOrdinal > ordinal;
+                    maxHistoryOrdinal = Math.Max(ordinal, maxHistoryOrdinal ?? long.MinValue);
+                }
+                var pending = pendingFirst[end];
+                var completePrefix = total.IsComplete && total.IsValid && !historyConflict
+                    && (pending is null || AtOrBefore(pending.OccurredAt, pending.FirstOrdinal, evidence.Timestamp, evidence.Ordinal) == false)
+                    && !(pendingOrdinal[end] < maxHistoryOrdinal)
+                    && !(evidence.Ordinal is { } boundary && (maxFirstOrdinal > boundary
+                        || maxRevisionOrdinal > boundary || pendingOrdinal[end] < boundary));
+                var revisionsAtTime = revisionTimes[evidence.Timestamp];
+                completePrefix &= revisionsAtTime.Count == 1 || revisionsAtTime.MissingOrdinal == 0;
+                for (var i = index; completePrefix && i < end; i++)
+                {
+                    var request = ordered[i];
+                    var checkpoint = request.CoverageEvidence;
+                    var firstAtTime = firstTimes.GetValueOrDefault(evidence.Timestamp);
+                    if (evidence.Ordinal.HasValue ? firstAtTime.MissingOrdinal > 0
+                        : firstAtTime.Count > (request.OccurredAt == evidence.Timestamp ? 1 : 0)) continue;
+                    if (checkpoint.ThreadSnapshot is { IsComplete: true, IsValid: true } snapshot && snapshot == total
+                        && !string.IsNullOrWhiteSpace(checkpoint.TurnKey))
+                    {
+                        var key = (session.Key, checkpoint.TurnKey, snapshot);
+                        if (!covered.TryGetValue(key, out var checkpoints)) covered.Add(key, checkpoints = new());
+                        checkpoints.Include(checkpoint, maxHistoryOrdinal);
+                    }
+                }
+                index = end;
+            }
+        }
+        return covered;
+    }
+
+    private static bool? AtOrBefore(DateTimeOffset at, long? ordinal, DateTimeOffset boundary, long? boundaryOrdinal)
+    {
+        if (at == boundary)
+            return ordinal is { } same && boundaryOrdinal is { } other ? same <= other : null;
+        if (ordinal is { } known && boundaryOrdinal is { } limit
+            && (at < boundary ? known > limit : known < limit)) return null;
+        return at < boundary;
+    }
 
     private static (string Session, string Turn)? TurnKey(StatsEvent row) => row switch
     {

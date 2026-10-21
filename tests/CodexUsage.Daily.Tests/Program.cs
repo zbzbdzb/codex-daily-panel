@@ -283,5 +283,6 @@ Test("Same-bucket equal-time quota mirrors across chats remain one allowance", (
     var window = new QuotaWindow(40, 10080, now.AddDays(3)); var s = Sum([new QuotaEvent("root", now.AddMinutes(-1), "bucket", null, window), new QuotaEvent("other", now.AddMinutes(-1), "bucket", null, window)]); Need(s.Weekly is not null && s.Weekly.UsedPercent == 40, "identical account quota mirrors treated as conflict");
 });
 
+LegacyIntegrityTests.Run(Test);
 Console.WriteLine($"Daily aggregation: {checks - failures}/{checks} passed; {failures} failed.");
 return failures == 0 ? 0 : 1;

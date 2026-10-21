@@ -96,7 +96,7 @@ public sealed class SessionLogMonitor : IDisposable
                 : _sources.Values.Any(source => source.OversizedLine) ? "部分统计或未知日志行超过 4 MiB 读取上限；当前为可读取范围"
                 : discoveryPartial || _sources.Values.Any(source => source.ReadFailed || source.BadStatistics) ? "部分日志不可读取或格式不完整；当前为可读取范围"
                 : snapshot.Status;
-            return snapshot with { Status = status };
+            return snapshot with { Status = status == snapshot.Status ? status : status + "；" + snapshot.Status };
         }
         finally { _gate.Release(); }
     }
