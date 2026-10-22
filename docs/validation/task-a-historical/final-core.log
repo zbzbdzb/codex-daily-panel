@@ -1,0 +1,117 @@
+PASS No observations remain unknown rather than zero
+PASS Complete daily request with observed zero TTFT retains its duration
+PASS Observed TTFT is removed from processing but not active time
+PASS Missing negative or excessive TTFT cannot fall back to full duration
+PASS TPS output and adjusted duration cover exactly the same accepted turns
+PASS Matched tool wait is removed from accepted processing time
+PASS Tool wait overlapping TTFT is deducted only once
+PASS Parallel and nested tool waits form one union within each turn
+PASS Replayed tool metadata never increases deductions
+PASS Unmatched or conflicting tool metadata excludes only its affected turn
+PASS Reversed nonpositive or out-of-lifecycle tool intervals cannot inflate TPS
+PASS Tool metadata with missing call invalid phase or unknown time cannot enter TPS
+PASS Unavailable timing evidence excludes its explicit turn without dropping tokens
+PASS Unknown turn tool or unavailable evidence makes session timing unavailable
+PASS Unrelated explicit turn evidence cannot poison a different completed turn
+PASS Tool call identity reused across turns cannot pair arbitrarily
+PASS Tool identity scoped to different sessions remains independent
+PASS Tool metadata of a known child cannot affect root timing
+PASS A wait union consuming the complete duration cannot produce infinite TPS
+PASS TTFT anchor uses declared duration despite tolerated explicit-start skew
+PASS Tool outside declared duration is rejected despite tolerated start skew
+PASS Tool before explicit start is rejected even when within declared duration
+PASS A declared duration without explicit start supports bounded tool timing
+PASS Submillisecond tool timing retains precision instead of rounding net time to zero
+PASS Session unavailable evidence after completion invalidates earlier session timings
+PASS Complete tool pairs from future timestamps cannot silently disappear
+PASS Identity replay across files never increases token or time totals
+PASS Different request identities retain identical token values
+PASS A newer valid revision replaces its prior identity
+PASS Same-vector replay written after completion keeps the original occurrence and TPS
+PASS Changed valid counters written after completion reconcile against the updated snapshot
+PASS An earlier request's no-op replay cannot replace the final turn snapshot order
+PASS A changed earlier request may supply a corrected final cumulative snapshot
+PASS A late snapshot-only correction supplies reconciliation without moving occurrence
+PASS A late contradictory snapshot cannot reuse earlier matching reconciliation
+PASS A revision across local midnight stays on its first occurrence day
+PASS An invalid late revision still rejects the identity's contribution
+PASS Conflicting late revisions still reject the identity's contribution
+PASS A request first observed after completion does not invent an in-turn occurrence
+PASS Equal-order conflicting identity invalidates its contribution
+PASS Conflicted request does not remove an unrelated valid request
+PASS Timestamp and ordinal inversion cannot silently choose a revision
+PASS Same-time missing ordinal conflict cannot choose a revision
+PASS Negative and inconsistent subset fields never contribute
+PASS Missing fields preserve known fields and never imply zeros
+PASS A true observed zero remains zero
+PASS Modern and legacy mirrors never double count
+PASS Legacy-only data remains unknown and partial
+PASS Today's legacy snapshot counts its observed chat and optional turn without token totals
+PASS Known children do not enter root tokens counts or timing
+PASS Missing request identity never invents a daily contribution
+PASS Missing session metadata cannot silently claim a root-only total
+PASS Local midnight assigns usage by event time not UTC calendar date
+PASS A crossing-midnight turn contributes only today's requests and no TPS
+PASS Parallel turn durations add while active intervals form a union
+PASS Completion lacking duration keeps valid tokens but no invented TPS
+PASS Gross disagreement between explicit elapsed time and declared duration cannot inflate TPS
+PASS Small log scheduling skew does not discard valid declared timing
+PASS TPS numerator only includes turns with accepted matching durations
+PASS Mismatching turn snapshot suppresses timing and reports incomplete history
+PASS A missing completion snapshot cannot claim reliable throughput
+PASS A recent observed ongoing turn has active time and no completed TPS
+PASS An old unmatched start is not declared active
+PASS An explicit abort ends observed interval and never enters completed TPS
+PASS A superseded unmatched start cannot extend the active union
+PASS Simultaneous distinct root starts do not guess which turn is active
+PASS A trustworthy duration supplies an interval when explicit start is absent
+PASS A prior-day request omitted by the daily reader fails snapshot reconciliation
+PASS Conflicting completions never choose an arbitrary duration
+PASS Events from the future cannot inflate current daily totals
+PASS Overflow becomes unknown without wrapping other known fields
+PASS Explicit scanner partial flag survives valid statistical data
+PASS Actual weekly window shows latest valid original sample timestamp
+PASS Expired weekly window is unavailable
+PASS A 300-minute quota cannot be labeled weekly
+PASS A newer bucket snapshot removes its older unknown weekly value
+PASS A future quota sample is never presented as already observed
+PASS Weekly snapshot without reset requires a recent known sample
+PASS Different valid weekly buckets never collapse into one allowance
+PASS Same-bucket equal-time quota mirrors across chats remain one allowance
+PASS LEG-01 A modern + B legacy: known input=100/output=40; Partial=true; legacy coverage unknown
+PASS LEG-02 pure modern unchanged: input=100/output=40; Partial=False; reason=none
+PASS LEG-03 modern replay and shuffled projected input: input=100/output=40; Partial=False; reason=none
+PASS LEG-04 conflicting request revision stays rejected: input=unknown/output=unknown; Partial=True; reason=请求修订冲突
+PASS LEG-05 pure legacy stays unknown: input=unknown/output=unknown; Partial=True; reason=旧格式
+PASS LEG-06 another turn in same session cannot hide legacy: input=100/output=40; Partial=True; reason=覆盖关系未知
+PASS LEG-07 complete matching aggregate checkpoint is covered: input=100/output=40; Partial=False; reason=none
+PASS LEG-08 matching request values without thread snapshot prove nothing: input=100/output=40; Partial=True; reason=覆盖关系未知
+PASS LEG-09 matching snapshots without full modern history prove nothing: input=100/output=40; Partial=True; reason=覆盖关系未知
+PASS LEG-10 unknown contextual turn is not invented across sources: input=100/output=40; Partial=True; reason=覆盖关系未知
+PASS LEG-11 a historical prefix can reconcile today's mirror: input=100/output=40; Partial=False; reason=none
+PASS LEG-12 later exact replay does not move checkpoint evidence: input=100/output=40; Partial=False; reason=none
+PASS LEG-13 later thread-only correction invalidates old coverage evidence: input=100/output=40; Partial=True; reason=覆盖关系未知
+PASS LEG-14 modern counter revision never backfills legacy: input=200/output=80; Partial=True; reason=覆盖关系未知
+PASS LEG-15 yesterday's legacy does not poison today: input=100/output=40; Partial=False; reason=none
+PASS LEG-16 child legacy does not enter root completeness: input=100/output=40; Partial=False; reason=none
+PASS LEG-17 cross-day revision keeps original occurrence day: input=unknown/output=unknown; Partial=False; reason=none
+PASS LEG-18 covered replay of yesterday request invents no today tokens: input=unknown/output=unknown; Partial=False; reason=none
+PASS LEG-19 missing metadata reason survives known modern subtotal: input=100/output=40; Partial=True; reason=缺少会话元数据
+PASS LEG-20 scanner partial survives a proven mirror: input=100/output=40; Partial=True; reason=来源仍在读取
+PASS LEG-21 invalid legacy last vector cannot be hidden by a valid total snapshot: input=100/output=40; Partial=True; reason=覆盖关系未知
+PASS LEG-22 unordered equal-time snapshot boundary stays unknown: input=100/output=40; Partial=True; reason=覆盖关系未知
+PASS LEG-23 a legacy checkpoint before first modern occurrence is not guessed covered: input=100/output=40; Partial=True; reason=覆盖关系未知
+PASS LEG-24 mirror exact replay and unordered aggregation do not duplicate or warn: input=100/output=40; Partial=False; reason=none
+PASS LEG-25 frozen parser contract: legacy has snapshots and contextual turn, no request/root/turn snapshot
+PASS LEG-26 different-request ordinal inversion leaves coverage unknown: input=300/output=120; Partial=True; reason=覆盖关系未知
+PASS LEG-27 ambiguous equal-time prefix cannot prove a checkpoint: input=300/output=120; Partial=True; reason=覆盖关系未知
+PASS LEG-28 known equal-time ordinals reconcile a multi-request prefix: input=300/output=120; Partial=False; reason=none
+PASS LEG-29 incomplete legacy fields do not inherit complete coverage: input=100/output=40; Partial=True; reason=覆盖关系未知
+PASS LEG-30 an ordinal-free checkpoint cannot hide a known prefix-to-legacy inversion: input=100/output=40; Partial=True; reason=覆盖关系未知
+PASS LEG-31 each equal-position batch member supplies its own turn and snapshot: input=300/output=120; Partial=False; reason=none
+PASS LEG-32 an ordinal-free checkpoint cannot hide an inversion inside the prefix: input=300/output=120; Partial=True; reason=覆盖关系未知
+PASS LEG-33 a later thread revision cannot hide first-occurrence ordinal inversion: input=300/output=120; Partial=True; reason=覆盖关系未知
+PASS LEG-34 a later correction cannot hide an intermediate cross-request inversion: input=300/output=120; Partial=True; reason=覆盖关系未知
+PASS LEG-35 an ordinal-free checkpoint with consistent known prefix order can cover a mirror: input=100/output=40; Partial=False; reason=none
+PASS LEG-36 a missing final ordinal cannot erase a known intermediate revision boundary: input=100/output=40; Partial=True; reason=覆盖关系未知
+Daily aggregation: 116/116 passed; 0 failed.

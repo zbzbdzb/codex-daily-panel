@@ -65,6 +65,7 @@ try
     Check(dst.InputTokens is null, "skipped midnight does not break refresh");
     await CoverageLossTests.RunAsync();
     await ExclusionCoverageTests.RunAsync();
+    await HistoricalDecisionTests.RunAsync();
     await ToolTimingTests.RunAsync();
     await OversizedLineTests.RunAsync();
     EnvelopeValidatorTests.Run();
