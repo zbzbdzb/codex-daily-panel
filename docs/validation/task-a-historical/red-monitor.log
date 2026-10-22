@@ -1,0 +1,80 @@
+
+Welcome to .NET 9.0!
+---------------------
+SDK Version: 9.0.318
+
+----------------
+Write your first app: https://aka.ms/dotnet-hello-world
+Find out what's new: https://aka.ms/dotnet-whats-new
+Explore documentation: https://aka.ms/dotnet-docs
+Report issues and find source on GitHub: https://github.com/dotnet/core
+Use 'dotnet --help' to see available commands or visit: https://aka.ms/dotnet-cli
+--------------------------------------------------------------------------------------
+PASS: missing source is unknown
+PASS: resumed old folder counted by event day
+PASS: idle refresh does not add totals
+PASS: unfinished JSONL row not counted
+PASS: completed append counted exactly once
+PASS: truncate replacement removes prior contributions
+PASS: cross-directory replay deduplicated
+PASS: deleted file removes stale totals
+PASS: unknown timestamp marks daily subtotal partial
+PASS: equal-time conflicting quota rows stay unavailable
+PASS: skipped midnight does not break refresh
+PASS: COV-01 truncation withdraws old counters and retains daily coverage debt
+PASS: COV-02 equal-length replacement does not imply complete daily coverage
+PASS: COV-03 longer replacement also retains missing generation evidence
+PASS: COV-04 deleting A preserves only B's readable subtotal and a loss reason
+PASS: COV-05 exact clean full replay restores coverage without restoring stale totals
+PASS: COV-06 split migration from sessions to archive recovers the full event union
+PASS: COV-07 repeated recovered events across files never double count
+PASS: COV-08 yesterday's unresolved loss expires at the local date boundary
+PASS: COV-09 losing a yesterday-only file does not create today's coverage debt
+PASS: COV-10 residual valid events cannot erase lost malformed input
+PASS: COV-11 a clean mirror cannot erase a deleted malformed source's unknown bytes
+PASS: COV-12 exclusive read failure clears after the original file is readable again
+PASS: COV-13 losing an uncovered legacy source cannot make the remaining modern subtotal complete
+PASS: COV-14 matching request identity alone cannot prove the withdrawn revision returned
+PASS: COV-15 deleting a source that failed its first read cannot erase unknown coverage
+PASS: COV-16 read failure followed by half-line loss cannot be repaired by a clean event mirror
+PASS: COV-17 exact raw half-line prefix replayed and completed across paths proves recovery
+PASS: COV-18 an already drained longer mirror can replay a newly challenged raw prefix
+PASS: COV-19 a later quota snapshot does not hide proof that the old generation was replayed
+PASS: COV-20 deleting a confirmed child source does not taint independent root coverage
+PASS: COV-21 deleting yesterday's request replayed today does not taint today's independent request
+PASS: COV-22 deleting a stale yesterday start does not create today's active coverage debt
+PASS: COV-23 recovering from a transient read lock preserves an existing format cause
+PASS: COV-24 removing unrelated yesterday history preserves today's fully replayed request
+PASS: COV-25 deleting a today-only no-op replay respects the request's first occurrence in another file
+RESULT COVERAGE LOSS: 25 passed, 0 failed
+PASS: EXC-01 losing yesterday's first occurrence cannot promote today's replay to complete coverage
+PASS: EXC-02 losing a newer child marker cannot silently promote its usage into root coverage
+PASS: EXC-03 losing historical cross-turn call identity conflict cannot manufacture trusted TPS
+PASS: EXC-04 a read failure before an appended tail cannot be discharged by an old prefix mirror
+PASS: EXC-05 an initially unreadable source can recover while the original source remains present
+PASS: EXC-06 today's tool fixture has reliable timing when no conflicting historical owner exists
+PASS: EXC-07 an interrupted longer mirror settles EOF before a proof replay and recovers within two refreshes
+PASS: EXC-08 lost timing exclusion is scoped to its root while an independent completed root keeps TPS
+PASS: EXC-09 a dormant lost origin becomes relevant when a later source replays that request today
+PASS: EXC-10 an explicitly newer root relation can supersede a lost child marker
+PASS: EXC-11 truncating an observed unread tail exactly to the cursor still resets the reader
+PASS: EXC-12 the explicit access-denied retry resumes after a configured directory becomes a file
+PASS: EXC-13 losing a child marker remains relevant when the excluded source contains only legacy usage
+PASS: EXC-14 midnight expires daily gaps without forgetting a lost request's original day
+PASS: EXC-15 a first occurrence read yesterday survives rollover before its source loss is observed
+PASS: EXC-16 a queued prefix replay interrupted before open can settle EOF and recover within three refreshes
+PASS: EXC-17 two missing exclusion facts cannot make each other's coverage guard dormant
+RESULT EXCLUSION COVERAGE: 17 passed, 0 failed
+FAIL: HIS-01 a request first observed while child keeps its original day after history loss and a newer root marker: new root relation cannot turn A's remembered yesterday request into today's usage: expected input=200, cached=80, output=70, reasoning=20, Partial=True; actual input=300, cached=140, output=110, reasoning=30, Partial=False, ActiveTurns=0, ActiveSeconds=, ProcessingSeconds=, TPS=; Status=本地日志 · 根会话
+FAIL: HIS-02 historical child tool conflicts survive history loss before the session becomes root: current readable A counters become root counters with incomplete historical coverage: expected input=100, cached=60, output=40, reasoning=10, Partial=True; actual input=100, cached=60, output=40, reasoning=10, Partial=False, ActiveTurns=0, ActiveSeconds=10, ProcessingSeconds=6, TPS=6.666666666666667; Status=本地日志 · 根会话；平均 TPS 为扣除首字与工具等待后的估算
+FAIL: HIS-03A a successor read today keeps a prior-day unfinished turn inactive after successor loss: losing the already observed successor cannot restart the old turn or invent today's active seconds: expected input=, cached=, output=, reasoning=, Partial=True; actual input=, cached=, output=, reasoning=, Partial=False, ActiveTurns=1, ActiveSeconds=60, ProcessingSeconds=, TPS=; Status=暂无今日可核验 token 记录；观察到 1 个运行中回合（最近15分钟启动）
+FAIL: HIS-03B successor history read before midnight still suppresses the old turn after rollover loss: rollover cannot forget the observed successor and restart the old turn: expected input=, cached=, output=, reasoning=, Partial=True; actual input=, cached=, output=, reasoning=, Partial=False, ActiveTurns=1, ActiveSeconds=60, ProcessingSeconds=, TPS=; Status=暂无今日可核验 token 记录；观察到 1 个运行中回合（最近15分钟启动）
+RESULT HISTORICAL DECISIONS: 0 passed, 4 failed
+Unhandled exception. System.InvalidOperationException: Historical decision regressions:
+HIS-01 a request first observed while child keeps its original day after history loss and a newer root marker: new root relation cannot turn A's remembered yesterday request into today's usage: expected input=200, cached=80, output=70, reasoning=20, Partial=True; actual input=300, cached=140, output=110, reasoning=30, Partial=False, ActiveTurns=0, ActiveSeconds=, ProcessingSeconds=, TPS=; Status=本地日志 · 根会话
+HIS-02 historical child tool conflicts survive history loss before the session becomes root: current readable A counters become root counters with incomplete historical coverage: expected input=100, cached=60, output=40, reasoning=10, Partial=True; actual input=100, cached=60, output=40, reasoning=10, Partial=False, ActiveTurns=0, ActiveSeconds=10, ProcessingSeconds=6, TPS=6.666666666666667; Status=本地日志 · 根会话；平均 TPS 为扣除首字与工具等待后的估算
+HIS-03A a successor read today keeps a prior-day unfinished turn inactive after successor loss: losing the already observed successor cannot restart the old turn or invent today's active seconds: expected input=, cached=, output=, reasoning=, Partial=True; actual input=, cached=, output=, reasoning=, Partial=False, ActiveTurns=1, ActiveSeconds=60, ProcessingSeconds=, TPS=; Status=暂无今日可核验 token 记录；观察到 1 个运行中回合（最近15分钟启动）
+HIS-03B successor history read before midnight still suppresses the old turn after rollover loss: rollover cannot forget the observed successor and restart the old turn: expected input=, cached=, output=, reasoning=, Partial=True; actual input=, cached=, output=, reasoning=, Partial=False, ActiveTurns=1, ActiveSeconds=60, ProcessingSeconds=, TPS=; Status=暂无今日可核验 token 记录；观察到 1 个运行中回合（最近15分钟启动）
+   at HistoricalDecisionTests.RunAsync() in F:\CodexData\home\worktrees\fe65\github-export-codex-daily-panel-20261021\tests\CodexUsage.DailyMonitor.Tests\HistoricalDecisionTests.cs:line 165
+   at Program.<Main>$(String[] args) in F:\CodexData\home\worktrees\fe65\github-export-codex-daily-panel-20261021\tests\CodexUsage.DailyMonitor.Tests\Program.cs:line 68
+   at Program.<Main>(String[] args)

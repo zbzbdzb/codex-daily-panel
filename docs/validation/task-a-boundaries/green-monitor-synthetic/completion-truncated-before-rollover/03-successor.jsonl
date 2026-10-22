@@ -1,0 +1,2 @@
+{"type":"session_meta","timestamp":"2026-10-20T23:57:00+08:00","payload":{"id":"synthetic-closure-session-activity","source":"cli"}}
+{"type":"event_msg","timestamp":"2026-10-20T23:58:00+08:00","payload":{"type":"task_started","turn_id":"synthetic-closure-turn-successor-turn"}}

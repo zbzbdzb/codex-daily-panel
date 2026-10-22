@@ -1,0 +1,98 @@
+param(
+    [Parameter(Mandatory)][string]$Name,
+    [Parameter(Mandatory)][string]$Project,
+    [switch]$Build,
+    [switch]$Gui
+)
+$ErrorActionPreference = 'Stop'
+$taskRepository = 'F:/CodexData/home/worktrees/fe65/github-export-codex-daily-panel-20261021'
+$taskRunRoot = $PSScriptRoot
+$env:TEMP = Join-Path $taskRunRoot 'scratch'
+$env:TMP = $env:TEMP
+$env:DOTNET_CLI_HOME = Join-Path $taskRunRoot 'dotnet-home'
+$env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
+$env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
+$env:DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'
+$env:CODEX_DAILY_BOUNDARY_INPUTS = Join-Path $taskRunRoot "$Name-synthetic"
+Set-Location -LiteralPath $taskRunRoot
+$taskUtf8 = [Text.UTF8Encoding]::new($false)
+if (Test-Path -LiteralPath (Join-Path $taskRunRoot "$Name.run.json")) { throw 'Run name already exists; preserve the previous evidence.' }
+function Get-TaskInputs {
+    $taskPaths = @(& git -C $taskRepository ls-files --cached --others --exclude-standard -- src tests frozen-core Directory.Build.props NuGet.Config global.json)
+    $taskPaths = @($taskPaths | Sort-Object -Unique)
+    $taskLines = foreach ($taskRelative in $taskPaths) {
+        $taskAbsolute = Join-Path $taskRepository $taskRelative
+        $taskFile = Get-Item -LiteralPath $taskAbsolute
+        $taskHash = (Get-FileHash -LiteralPath $taskAbsolute -Algorithm SHA256).Hash
+        "$taskHash  $($taskFile.Length)  $taskRelative"
+    }
+    return ($taskLines -join "`n") + "`n"
+}
+$taskBefore = Get-TaskInputs
+$taskInputFile = Join-Path $taskRunRoot "$Name.inputs.sha256"
+[IO.File]::WriteAllText($taskInputFile, $taskBefore, $taskUtf8)
+$taskSourceSnapshots = @()
+if ($Project -eq 'tests/CodexUsage.DailyMonitor.Tests') {
+    $taskSnapshotRoot = Join-Path $taskRunRoot "$Name-source"
+    New-Item -ItemType Directory -Path $taskSnapshotRoot | Out-Null
+    foreach ($taskFileName in @('Program.cs', 'ClosureCoverageTests.cs')) {
+        $taskOriginalPath = "tests/CodexUsage.DailyMonitor.Tests/$taskFileName"
+        $taskSnapshot = Join-Path $taskSnapshotRoot "$taskFileName.txt"
+        Copy-Item -LiteralPath (Join-Path $taskRepository $taskOriginalPath) -Destination $taskSnapshot
+        $taskSourceSnapshots += [ordered]@{ original = $taskOriginalPath; snapshot = "$Name-source/$taskFileName.txt"; bytes = (Get-Item -LiteralPath $taskSnapshot).Length; sha256 = (Get-FileHash -LiteralPath $taskSnapshot -Algorithm SHA256).Hash }
+    }
+}
+$taskHead = (& git -C $taskRepository rev-parse HEAD).Trim()
+$taskBranch = (& git -C $taskRepository branch --show-current).Trim()
+$taskStatus = @(& git -C $taskRepository status --porcelain=v1)
+$taskDotnet = (Get-Command dotnet).Source
+$taskSdk = (& $taskDotnet --version | Out-String).Trim()
+$taskInfo = & $taskDotnet --info
+[IO.File]::WriteAllText((Join-Path $taskRunRoot "$Name.dotnet-info.txt"), ($taskInfo -join "`n") + "`n", $taskUtf8)
+$taskArtifacts = Join-Path $taskRunRoot "$Name-artifacts"
+$taskArguments = if ($Build) {
+    @('build', (Join-Path $taskRepository $Project), '-c', 'Release', '--artifacts-path', $taskArtifacts)
+} else {
+    @('run', '--project', (Join-Path $taskRepository $Project), '-c', 'Release', '--artifacts-path', $taskArtifacts, '--no-launch-profile')
+}
+if ($Gui) {
+    $taskProduct = Join-Path $taskRunRoot 'final-app-artifacts/bin/CodexUsage.DailyPanel/release'
+    $taskArguments += @("-p:ProductDirectory=$taskProduct", '--', (Join-Path $taskRunRoot "$Name-output"))
+}
+$taskLog = Join-Path $taskRunRoot "$Name.log"
+$taskStarted = [DateTimeOffset]::UtcNow.ToString('O')
+& $taskDotnet @taskArguments *> $taskLog
+$taskExitCode = $LASTEXITCODE
+$taskFinished = [DateTimeOffset]::UtcNow.ToString('O')
+$taskAfter = Get-TaskInputs
+$taskStable = $taskBefore -ceq $taskAfter
+$taskAfterFile = Join-Path $taskRunRoot "$Name.after.inputs.sha256"
+[IO.File]::WriteAllText($taskAfterFile, $taskAfter, $taskUtf8)
+$taskOutputs = @(Get-ChildItem -LiteralPath (Join-Path $taskArtifacts 'bin') -Recurse -File -Filter '*.dll' | ForEach-Object {
+    [ordered]@{ path = [IO.Path]::GetRelativePath($taskArtifacts, $_.FullName).Replace('\', '/'); bytes = $_.Length; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+})
+$taskSyntheticInputs = @()
+if (Test-Path -LiteralPath $env:CODEX_DAILY_BOUNDARY_INPUTS) {
+    $taskSyntheticInputs = @(Get-ChildItem -LiteralPath $env:CODEX_DAILY_BOUNDARY_INPUTS -Recurse -File | ForEach-Object {
+        [ordered]@{ path = [IO.Path]::GetRelativePath($taskRunRoot, $_.FullName).Replace('\', '/'); bytes = $_.Length; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+    })
+}
+$taskRecord = [ordered]@{
+    name = $Name; head = $taskHead; branch = $taskBranch; status = $taskStatus
+    started_utc = $taskStarted; finished_utc = $taskFinished
+    cwd = $taskRunRoot; executable = $taskDotnet; sdk = $taskSdk; argv = $taskArguments
+    environment = [ordered]@{ TEMP = $env:TEMP; TMP = $env:TMP; DOTNET_CLI_HOME = $env:DOTNET_CLI_HOME; DOTNET_CLI_TELEMETRY_OPTOUT = '1'; DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'; DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'; CODEX_DAILY_BOUNDARY_INPUTS = $env:CODEX_DAILY_BOUNDARY_INPUTS }
+    exit_code = $taskExitCode; inputs_stable = $taskStable
+    input_manifest = "$Name.inputs.sha256"; input_manifest_sha256 = (Get-FileHash -LiteralPath $taskInputFile -Algorithm SHA256).Hash
+    after_manifest = "$Name.after.inputs.sha256"; after_manifest_sha256 = (Get-FileHash -LiteralPath $taskAfterFile -Algorithm SHA256).Hash
+    raw_log = "$Name.log"; raw_log_sha256 = (Get-FileHash -LiteralPath $taskLog -Algorithm SHA256).Hash
+    source_snapshots = $taskSourceSnapshots; synthetic_inputs = $taskSyntheticInputs
+    capture_script_sha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+    outputs = $taskOutputs
+}
+[IO.File]::WriteAllText((Join-Path $taskRunRoot "$Name.run.json"), ($taskRecord | ConvertTo-Json -Depth 10) + "`n", $taskUtf8)
+[pscustomobject]$taskRecord | Select-Object name, head, sdk, exit_code, inputs_stable, input_manifest_sha256, raw_log_sha256 | ConvertTo-Json
+Get-Content -LiteralPath $taskLog | Select-Object -Last 8
+if (-not $taskStable) { throw 'Input files changed during this check; the result is not a stable source snapshot.' }
+exit $taskExitCode
+

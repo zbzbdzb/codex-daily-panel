@@ -1,0 +1,4 @@
+# Captured evidence must retain its exact bytes and recorded hashes on checkout.
+* -text
+*.log whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+*.json whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

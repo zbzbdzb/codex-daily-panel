@@ -1,0 +1,73 @@
+{
+  "name": "final-core",
+  "head": "25fa9745f2b74aa1f058cb5773f83951ad456518",
+  "branch": "fix/log-coverage-loss",
+  "status": [
+    " M src/CodexUsage.DailyCore/DailyAggregator.cs",
+    " M src/CodexUsage.DailyPanel/SessionLogMonitor.cs",
+    " M tests/CodexUsage.DailyMonitor.Tests/Program.cs",
+    "?? tests/CodexUsage.DailyMonitor.Tests/ClosureCoverageTests.cs"
+  ],
+  "started_utc": "2026-10-22T05:13:43.4040543+00:00",
+  "finished_utc": "2026-10-22T05:13:45.5436603+00:00",
+  "cwd": "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-boundaries-759ab5d847834509bb74f589077a25c5",
+  "executable": "C:\\Program Files\\dotnet\\dotnet.exe",
+  "sdk": "9.0.318",
+  "argv": [
+    "run",
+    "--project",
+    "F:\\CodexData\\home\\worktrees\\fe65\\github-export-codex-daily-panel-20261021\\tests\\CodexUsage.Daily.Tests",
+    "-c",
+    "Release",
+    "--artifacts-path",
+    "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-boundaries-759ab5d847834509bb74f589077a25c5\\final-core-artifacts",
+    "--no-launch-profile"
+  ],
+  "environment": {
+    "TEMP": "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-boundaries-759ab5d847834509bb74f589077a25c5\\scratch",
+    "TMP": "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-boundaries-759ab5d847834509bb74f589077a25c5\\scratch",
+    "DOTNET_CLI_HOME": "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-boundaries-759ab5d847834509bb74f589077a25c5\\dotnet-home",
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+    "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1",
+    "DOTNET_GENERATE_ASPNET_CERTIFICATE": "false",
+    "CODEX_DAILY_BOUNDARY_INPUTS": "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-boundaries-759ab5d847834509bb74f589077a25c5\\final-core-synthetic"
+  },
+  "exit_code": 0,
+  "inputs_stable": true,
+  "input_manifest": "final-core.inputs.sha256",
+  "input_manifest_sha256": "0DEFE5DF5AD08038A47C78FFD608DC356A12AAFA5E94CDA6C70D57B3FE735C56",
+  "after_manifest": "final-core.after.inputs.sha256",
+  "after_manifest_sha256": "0DEFE5DF5AD08038A47C78FFD608DC356A12AAFA5E94CDA6C70D57B3FE735C56",
+  "raw_log": "final-core.log",
+  "raw_log_sha256": "26402591541D27193D0258B366EC1693658422C029FE805609FD6F3A10AF8AE3",
+  "source_snapshots": [],
+  "synthetic_inputs": [],
+  "capture_script_sha256": "5733ED829A78FC5D18D7037AE6E26771B7D8362E14C8A3AB83DAC84599F8AEAC",
+  "outputs": [
+    {
+      "path": "bin/CodexUsage.Daily.Tests/release/CodexUsage.Core.dll",
+      "bytes": 155648,
+      "sha256": "6B3D5C61F342C68D3C356DE726341AE93DD1C7321E7384C3892D42618A363EEE"
+    },
+    {
+      "path": "bin/CodexUsage.Daily.Tests/release/CodexUsage.Daily.Tests.dll",
+      "bytes": 98816,
+      "sha256": "3EB907384CE5567FCA6554B66BEF5D19B1B465F1074F0B8128D3C3F7C792EB6E"
+    },
+    {
+      "path": "bin/CodexUsage.Daily.Tests/release/CodexUsage.DailyCore.dll",
+      "bytes": 66560,
+      "sha256": "7F7A27D13F055A4D11BEB5DE1C131B01C42EF2BCBE4175BCBEA10D347B534CF0"
+    },
+    {
+      "path": "bin/CodexUsage.DailyCore/release/CodexUsage.Core.dll",
+      "bytes": 155648,
+      "sha256": "6B3D5C61F342C68D3C356DE726341AE93DD1C7321E7384C3892D42618A363EEE"
+    },
+    {
+      "path": "bin/CodexUsage.DailyCore/release/CodexUsage.DailyCore.dll",
+      "bytes": 66560,
+      "sha256": "7F7A27D13F055A4D11BEB5DE1C131B01C42EF2BCBE4175BCBEA10D347B534CF0"
+    }
+  ]
+}

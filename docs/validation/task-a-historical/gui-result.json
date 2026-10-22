@@ -1,0 +1,161 @@
+{
+  "passed": true,
+  "exit": 0,
+  "checks": [
+    {
+      "name": "window_460_by_640",
+      "passed": true
+    },
+    {
+      "name": "popup_has_no_taskbar_entry",
+      "passed": true
+    },
+    {
+      "name": "popup_is_topmost",
+      "passed": true
+    },
+    {
+      "name": "exact_input_subtitle",
+      "passed": true
+    },
+    {
+      "name": "exact_output_subtitle",
+      "passed": true
+    },
+    {
+      "name": "total_tokens_visible_and_exact",
+      "passed": true
+    },
+    {
+      "name": "two_decimal_tps",
+      "passed": true
+    },
+    {
+      "name": "cache_rate_weighted",
+      "passed": true
+    },
+    {
+      "name": "exact_reasoning",
+      "passed": true
+    },
+    {
+      "name": "processing_includes_seconds",
+      "passed": true
+    },
+    {
+      "name": "copy_scope_and_precision",
+      "passed": true
+    },
+    {
+      "name": "weekly_73_percent",
+      "passed": true
+    },
+    {
+      "name": "normal_footer_visible",
+      "passed": true
+    },
+    {
+      "name": "icon_actions_have_accessible_names",
+      "passed": true
+    },
+    {
+      "name": "normal_body_fits",
+      "passed": true
+    },
+    {
+      "name": "adjusted_timing_reaches_visible_tps_and_duration",
+      "passed": true
+    },
+    {
+      "name": "unknown_does_not_become_zero",
+      "passed": true
+    },
+    {
+      "name": "empty_badge",
+      "passed": true
+    },
+    {
+      "name": "busy_refresh_disabled",
+      "passed": true
+    },
+    {
+      "name": "partial_badge_and_notice",
+      "passed": true
+    },
+    {
+      "name": "small_work_area_footer_visible",
+      "passed": true
+    },
+    {
+      "name": "small_work_area_scrolls",
+      "passed": true
+    },
+    {
+      "name": "small_scroller_reaches_details",
+      "passed": true
+    },
+    {
+      "name": "tray_visible",
+      "passed": true
+    },
+    {
+      "name": "startup_is_tray_only",
+      "passed": true
+    },
+    {
+      "name": "tray_summary",
+      "passed": true
+    },
+    {
+      "name": "close_hides_but_retains_tray",
+      "passed": true
+    },
+    {
+      "name": "tray_open_restores_window",
+      "passed": true
+    },
+    {
+      "name": "context_menu_reuses_actual_tray_anchor",
+      "passed": true
+    },
+    {
+      "name": "popup_stays_inside_current_monitor",
+      "passed": true
+    },
+    {
+      "name": "tray_second_click_hides_popup",
+      "passed": true
+    },
+    {
+      "name": "tray_next_click_reopens_popup",
+      "passed": true
+    },
+    {
+      "name": "outside_activation_hides_popup",
+      "passed": true
+    },
+    {
+      "name": "pause_sets_state",
+      "passed": true
+    },
+    {
+      "name": "resume_clears_state",
+      "passed": true
+    },
+    {
+      "name": "manual_refresh_completed",
+      "passed": true
+    },
+    {
+      "name": "demo_creates_no_log_directory",
+      "passed": true
+    },
+    {
+      "name": "exit_removes_tray",
+      "passed": true
+    }
+  ],
+  "completedAt": "2026-10-22T11:33:02.9109038+08:00",
+  "appSha256": "E18E17709B7E6DC05ECD9148C19427ADB09F57D136824415BF9D8E241D47ACF0",
+  "coreSha256": "444CA0C35DE9D91B211E931E919EDFA1CCD341149FA95EAECC2B6CEEE33B00BD"
+}
