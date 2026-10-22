@@ -7,7 +7,8 @@ public static class DailyAggregator
     private static readonly TimeSpan RecentObservation = TimeSpan.FromMinutes(15);
 
     public static DailySnapshot Summarize(IEnumerable<StatsEvent> events, DateOnly day, TimeZoneInfo zone,
-        DateTimeOffset now, bool partial = false, ISet<StatsEvent>? coverageProof = null)
+        DateTimeOffset now, bool partial = false, ISet<StatsEvent>? coverageProof = null,
+        ISet<StatsEvent>? exclusionProof = null, IReadOnlyDictionary<string, DateTimeOffset>? requestOrigins = null)
     {
         ArgumentNullException.ThrowIfNull(events);
         ArgumentNullException.ThrowIfNull(zone);
@@ -92,7 +93,12 @@ public static class DailyAggregator
                     coverageHistory.Add(version);
                 }
             }
-            accepted.Add(new(selected, versions[0].Timestamp, evidence, coverageEvidence, versions[0].Ordinal, [.. coverageHistory]));
+            var occurredAt = versions[0].Timestamp;
+            // A remembered identity/date is a classification fact, not an old token
+            // sample. Current counters still come exclusively from selected.
+            if (requestOrigins is not null && requestOrigins.TryGetValue(selected.RequestKey!, out var origin) && origin < occurredAt)
+                occurredAt = origin;
+            accepted.Add(new(selected, occurredAt, evidence, coverageEvidence, versions[0].Ordinal, [.. coverageHistory]));
         }
 
         var dayRequests = accepted.Where(x => InDay(x.OccurredAt)).ToArray();
@@ -274,6 +280,20 @@ public static class DailyAggregator
         if (issues.Count > 0) status += "；统计不完整：" + string.Join("、", issues.Order(StringComparer.Ordinal));
         var weekly = LatestWeekly(rows.OfType<QuotaEvent>(), now, out var multipleWeekly);
         if (multipleWeekly) status += "；日志报告多个独立周额度窗口，未合并显示";
+        if (exclusionProof is not null)
+        {
+            // These dependencies can be dormant: yesterday's first occurrence,
+            // a child relation, or historical timing may govern later input today.
+            // The caller retains only identity/date/scope facts and replay hashes.
+            foreach (var request in accepted.Where(x => x.CoverageHistory[0].Timestamp < lower))
+                exclusionProof.Add(request.CoverageHistory[0]);
+            foreach (var group in rows.OfType<MetadataEvent>().Where(x => children.Contains(x.SessionKey)).GroupBy(x => x.SessionKey))
+            {
+                var latestTime = group.Max(x => x.Timestamp);
+                foreach (var metadata in group.Where(x => x.Timestamp == latestTime)) exclusionProof.Add(metadata);
+            }
+            foreach (var timing in toolRows.Cast<StatsEvent>().Concat(timingUnavailable)) exclusionProof.Add(timing);
+        }
         if (coverageProof is not null)
         {
             // Export proof dependencies from the same projection that produced the

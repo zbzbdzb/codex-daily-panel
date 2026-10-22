@@ -23,7 +23,7 @@ internal readonly record struct DailyCoverageState(DailyCoverageStamp Stamp, lon
 
 /// <summary>
 /// Reads one explicitly configured log without modifying it. Instances start at byte zero;
-/// callers reconcile replayed events by request identity. A denied instance must be replaced by reconfiguration.
+/// callers reconcile replayed events by request identity. Denied reads may be retried without discarding their cursor.
 /// Head/boundary fingerprints detect common truncate-and-regrow operations, not arbitrary interior edits.
 /// Independent daily reader: the frozen Core implementation remains unchanged. Oversized known
 /// conversation envelopes are validated incrementally and discarded without retaining their bodies.
@@ -58,9 +58,8 @@ internal sealed class DailyLogReader : IDisposable
     private int _coverageTargetIndex;
     private readonly HashSet<DailyCoverageStamp> _coverageMatches = [];
     private readonly HashSet<DailyCoverageStamp> _coverageAttempts = [];
-    private bool _coverageReplay;
+    private readonly HashSet<DailyCoverageStamp> _pendingCoverageReplays = [];
     private long _observedLength;
-    private bool _interruptedLine;
 
     public DailyLogReader(string path, Func<DailyCoverageStamp[]>? coverageTargets = null)
     {
@@ -91,11 +90,12 @@ internal sealed class DailyLogReader : IDisposable
     /// <summary>Number of consumed bytes in the current file identity, including an unfinished line.</summary>
     public long Offset { get; private set; }
     public bool IsStopped { get; private set; }
+    internal void RetryAccessDenied() => IsStopped = false;
     internal int RetainedLineBytes => _line.Length;
     /// <summary>Raised after resetting the cursor and before delivering any replacement-file lines.</summary>
     public event Action? ResetDetected;
     internal DailyCoverageState Coverage => new(new(Offset, Convert.ToHexString(_coverage.GetCurrentHash())), _observedLength,
-        !_pendingReset, _interruptedLine || _lineLength > 0 || _skippingOversizedLine);
+        !_pendingReset, _lineLength > 0 || _skippingOversizedLine);
     internal DailyCoverageState CoverageBeforeReset { get; private set; }
     internal bool Proves(DailyCoverageStamp stamp) => !_pendingReset && (_coverageMatches.Contains(stamp) || Coverage.Stamp == stamp);
 
@@ -103,7 +103,7 @@ internal sealed class DailyLogReader : IDisposable
     // Replay it once per challenge through the ordinary bounded reader and parser.
     internal void RequestCoverageReplay(DailyCoverageStamp stamp)
     {
-        if (Offset >= stamp.Bytes && !Proves(stamp) && _coverageAttempts.Add(stamp)) _coverageReplay = true;
+        if (Offset >= stamp.Bytes && !Proves(stamp) && _coverageAttempts.Add(stamp)) _pendingCoverageReplays.Add(stamp);
     }
 
     public async Task<DailyReadBatchResult> ReadAvailableAsync(Action<string> onCompleteLine, CancellationToken cancellationToken = default)
@@ -143,8 +143,9 @@ internal sealed class DailyLogReader : IDisposable
                     // and a later baseline must not become the trusted new baseline for an old half-line.
                     long initialLength = stream.Length;
                     byte[] initialFingerprint = Fingerprint(stream, initialLength);
-                    bool changed = _pendingReset || (_identity is not null && (_identity.Value != identity || initialLength < Offset || !FingerprintMatches(stream)));
-                    reset = changed || _coverageReplay;
+                    bool changed = _pendingReset || (_identity is not null && (_identity.Value != identity
+                        || initialLength < Offset || initialLength < _observedLength || !FingerprintMatches(stream)));
+                    reset = changed || _pendingCoverageReplays.Count > 0;
                     if (reset)
                     {
                         CoverageBeforeReset = Coverage;
@@ -251,6 +252,11 @@ internal sealed class DailyLogReader : IDisposable
         }
         finally
         {
+            // A queued proof replay may fail before opening/validating the
+            // original. Cancel only unstarted challenges, so its cursor can first
+            // recover to EOF and the same proof can be scheduled afterwards.
+            _coverageAttempts.ExceptWith(_pendingCoverageReplays);
+            _pendingCoverageReplays.Clear();
             if (_disposed)
             {
                 _line.AsSpan().Clear();
@@ -433,23 +439,17 @@ internal sealed class DailyLogReader : IDisposable
 
     private void StopAfterAccessDenied()
     {
-        _interruptedLine |= _lineLength > 0 || _skippingOversizedLine;
         IsStopped = true;
         _sourceMissing = false;
-        _line.AsSpan().Clear();
-        _line = [];
-        _lineLength = 0;
-        _skippingOversizedLine = false;
-        _oversizedEnvelope = null;
-        _hasMore = false;
+        // Preserve the bounded half-line/validator and identity until a retry can
+        // verify continuity. A replacement still triggers the normal reset path.
     }
 
     private void ResetCursor()
     {
         _coverage.GetHashAndReset();
         _coverageMatches.Clear();
-        _coverageReplay = false;
-        _interruptedLine = false;
+        _pendingCoverageReplays.Clear();
         Offset = 0;
         _line.AsSpan().Clear();
         _lineLength = 0;

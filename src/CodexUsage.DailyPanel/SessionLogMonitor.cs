@@ -25,8 +25,8 @@ public sealed class SessionLogMonitor : IDisposable
     private DateTimeOffset _refreshAt;
     private bool _disposed;
     private int _retainedEvents;
-    // Evidence belongs to _day, independently of the currently discovered paths.
-    // Only hashes survive withdrawal; retired events never supply subtotal values.
+    // Daily coverage is independent of the currently discovered paths. Withdrawn
+    // sources retain hashes and classification facts, never subtotal counters.
     private readonly List<CoverageLoss> _coverageLosses = [];
     private bool _unprovableCoverage;
     private int _coverageEvidenceCount;
@@ -50,10 +50,25 @@ public sealed class SessionLogMonitor : IDisposable
             _refreshAt = now;
             if (_day != day)
             {
+                // Daily numeric gaps expire. Missing classification facts remain
+                // conditional: a later replay must not erase a known earlier day,
+                // child relationship or shared-call ambiguity at midnight.
+                // A still-live source may disappear between the last poll of
+                // yesterday and this one. Capture its new-day classification
+                // dependencies before discarding the previous day's cache.
+                var exclusions = new HashSet<StatsEvent>();
+                DailyAggregator.Summarize(_sources.Values.SelectMany(x => x.Events).Concat(ChildEvidence()), day, _zone, now,
+                    exclusionProof: exclusions, requestOrigins: RequestOrigins());
+                var guards = Guards().Concat(exclusions.Select(CreateGuard).OfType<ExclusionGuard>())
+                    .Distinct().Take(MaximumRetainedEvents + 1).ToList();
+                var overflow = guards.Count > MaximumRetainedEvents;
+                if (overflow) guards.RemoveAt(MaximumRetainedEvents);
                 ClearSources();
                 _coverageLosses.Clear();
-                _coverageEvidenceCount = 0;
-                _unprovableCoverage = false;
+                if (guards.Count > 0)
+                    _coverageLosses.Add(new CoverageLoss([], null, false, false, false, false, guards, [], []) { PositiveResolved = true });
+                _coverageEvidenceCount = guards.Count;
+                _unprovableCoverage = overflow;
                 _lostBadStatistics = _lostOversizedLine = _lostReadFailed = false;
                 _day = day;
             }
@@ -76,22 +91,22 @@ public sealed class SessionLogMonitor : IDisposable
             {
                 if (_sources.TryGetValue(path, out var existing))
                 {
-                    // A transient I/O failure does not require throwing away its cursor,
-                    // parser context, format diagnostics or historical occurrence dates.
-                    if (!existing.Reader.IsStopped) continue;
-                    var coverage = existing.Reader.Coverage;
-                    // An initial denied open has not withdrawn any observed data.
-                    // Its still-discovered path can recover by a complete first read.
-                    if (coverage.Stamp.Bytes > 0 || coverage.ObservedLength > 0) RecordLoss(existing, coverage);
-                    existing.Dispose();
-                    _sources.Remove(path);
+                    // Retry the same identity/cursor, including a denied half-line.
+                    // Only a successful EOF can settle its uncertain tail. A changed
+                    // identity or prefix still captures loss before the normal reset.
+                    if (existing.Reader.IsStopped) existing.Reader.RetryAccessDenied();
+                    continue;
                 }
                 try { _sources.Add(path, new Source(path, day, _zone, () => _retainedEvents < MaximumRetainedEvents,
                     delta => _retainedEvents += delta, RecordLoss, CoverageTargets)); }
                 catch (ArgumentException) { discoveryPartial = true; }
             }
             foreach (var stamp in CoverageTargets())
-                foreach (var source in _sources.Values) source.Reader.RequestCoverageReplay(stamp);
+                foreach (var source in _sources.Values)
+                    // Settle an interrupted original read before any optional replay
+                    // withdraws its cache. EOF recovery and a physical reset must not
+                    // be confused with a subsequent proof-only replay.
+                    if (!source.ReadFailed && !source.UncertainTail) source.Reader.RequestCoverageReplay(stamp);
             foreach (var source in _sources.Values) source.VerifiedThisRefresh = false;
             long bytes = 0;
             foreach (var source in _sources.Values)
@@ -115,6 +130,7 @@ public sealed class SessionLogMonitor : IDisposable
                     bytes += pending.BytesRead;
                     source.Apply(pending);
                     source.ReadFailed = true;
+                    source.UncertainTail = true;
                     source.VerifiedThisRefresh = false;
                 }
                 catch (UnauthorizedAccessException)
@@ -123,23 +139,28 @@ public sealed class SessionLogMonitor : IDisposable
                     bytes += pending.BytesRead;
                     source.Apply(pending);
                     source.ReadFailed = true;
+                    source.UncertainTail = true;
                     source.VerifiedThisRefresh = false;
                 }
                 catch (OperationCanceledException) { source.Apply(source.Reader.DrainPendingResult()); throw; }
             }
             ReconcileCoverage();
             IsLoading = _sources.Values.Any(source => source.HasMore);
-            var coverageLost = _unprovableCoverage || _coverageLosses.Count > 0;
-            var partial = coverageLost || discoveryPartial || IsLoading || _sources.Values.Any(source => source.BadStatistics || source.ReadFailed || source.PendingLine);
-            var events = _sources.Values.SelectMany(source => source.SummaryEvents(now));
-            var snapshot = DailyAggregator.Summarize(events, day, _zone, now, partial) with { SourceCount = _sources.Count };
+            var current = _sources.Values.SelectMany(source => source.Events).ToArray();
+            var view = _coverageLosses.Count > 0 || _unprovableCoverage ? CoverageViewFor(current) : null;
+            var activeLosses = view is null ? [] : _coverageLosses.Where(x => !x.PositiveResolved || x.Guards.Any(g => GuardActive(g, view))).ToArray();
+            var coverageLost = _unprovableCoverage || activeLosses.Length > 0;
+            var partial = coverageLost || discoveryPartial || IsLoading || _sources.Values.Any(source => source.BadStatistics || source.ReadFailed || source.UncertainTail || source.PendingLine);
+            var events = _sources.Values.SelectMany(source => source.SummaryEvents(now))
+                .Concat(ChildEvidence()).Concat(view is null ? [] : MissingTiming(view, activeLosses, now));
+            var snapshot = DailyAggregator.Summarize(events, day, _zone, now, partial, requestOrigins: RequestOrigins()) with { SourceCount = _sources.Count };
             var reasons = new List<string>();
             if (!directoryFound) reasons.Add("未找到本机 Codex sessions 日志目录");
             if (IsLoading) reasons.Add("正在读取今日统计，请稍候…");
-            if (_lostOversizedLine || _sources.Values.Any(source => source.OversizedLine) || _coverageLosses.Any(loss => loss.OversizedLine))
+            if (_lostOversizedLine || _sources.Values.Any(source => source.OversizedLine) || activeLosses.Any(loss => !loss.PositiveResolved && loss.OversizedLine))
                 reasons.Add("部分统计或未知日志行超过 4 MiB 读取上限；当前为可读取范围");
-            if (_lostBadStatistics || _lostReadFailed || discoveryPartial || _sources.Values.Any(source => source.ReadFailed || source.BadStatistics)
-                || _coverageLosses.Any(loss => loss.BadStatistics || loss.ReadFailed))
+            if (_lostBadStatistics || _lostReadFailed || discoveryPartial || _sources.Values.Any(source => source.ReadFailed || source.UncertainTail || source.BadStatistics)
+                || activeLosses.Any(loss => !loss.PositiveResolved && (loss.BadStatistics || loss.ReadFailed)))
                 reasons.Add("部分日志不可读取或格式不完整；当前为可读取范围");
             if (coverageLost) reasons.Add("日志截断、替换或删除后，当日覆盖无法确认；仅显示当前可核验小计");
             reasons.Add(snapshot.Status);
@@ -148,7 +169,7 @@ public sealed class SessionLogMonitor : IDisposable
         finally { _gate.Release(); }
     }
 
-    private DailyCoverageStamp[] CoverageTargets() => _coverageLosses.Where(x => x.RawPrefix.HasValue)
+    private DailyCoverageStamp[] CoverageTargets() => _coverageLosses.Where(x => !x.PositiveResolved && x.RawPrefix.HasValue)
         .Select(x => x.RawPrefix!.Value).Distinct().ToArray();
 
     private void RecordLoss(Source source, DailyCoverageState coverage)
@@ -157,23 +178,32 @@ public sealed class SessionLogMonitor : IDisposable
         // A prior-day replay, closed historical turn or confirmed child alone is
         // not missing today's root-session coverage.
         var required = new HashSet<StatsEvent>();
-        DailyAggregator.Summarize(_sources.Values.SelectMany(x => x.Events), _day!.Value, _zone, _refreshAt,
-            coverageProof: required);
-        var hashes = source.Events.Where(required.Contains).Select(EventDigest).ToHashSet(StringComparer.Ordinal);
-        if (hashes.Count == 0 && !source.BadStatistics && !source.PendingLine && !source.HasMore && !source.ReadFailed && !coverage.Incomplete) return;
+        var exclusions = new HashSet<StatsEvent>();
+        DailyAggregator.Summarize(_sources.Values.SelectMany(x => x.Events).Concat(ChildEvidence()), _day!.Value, _zone, _refreshAt,
+            coverageProof: required, exclusionProof: exclusions, requestOrigins: RequestOrigins());
+        // Child metadata is a conditional decision fact, rather than a daily
+        // contribution. It is needed only while its session still has candidates.
+        var hashes = source.Events.Where(x => required.Contains(x) && x is not MetadataEvent { IsChild: true })
+            .Select(EventDigest).ToHashSet(StringComparer.Ordinal);
+        var guards = source.Events.Where(exclusions.Contains).Select(CreateGuard).Where(x => x is not null)
+            .Cast<ExclusionGuard>().Distinct().ToList();
+        if (hashes.Count == 0 && guards.Count == 0 && !source.BadStatistics && !source.PendingLine && !source.HasMore
+            && !source.ReadFailed && !source.UncertainTail && !coverage.Incomplete) return;
         // Unknown/unread bytes cannot be reconstructed from the remaining valid events.
         // An exact consumed prefix is required for malformed/half-line/timing input.
         var opaque = source.BadStatistics || coverage.Incomplete || source.PendingLine || source.TimingUnavailable || source.UnassociatedTiming
             || source.ReadFailed && hashes.Count == 0;
         var loss = new CoverageLoss(hashes, opaque ? coverage.Stamp : null,
-            !coverage.Stable || coverage.ObservedLength > coverage.Stamp.Bytes
+            source.ReadFailed || source.UncertainTail || !coverage.Stable || coverage.ObservedLength > coverage.Stamp.Bytes
                 || coverage.Stamp.Bytes == 0 && (source.ReadFailed || source.HasMore),
-            source.BadStatistics, source.OversizedLine, source.ReadFailed);
-        if (_coverageLosses.Any(x => x.RawPrefix == loss.RawPrefix && x.Unprovable == loss.Unprovable
+            source.BadStatistics, source.OversizedLine, source.ReadFailed || source.UncertainTail,
+            guards, source.Events.Select(x => x.SessionKey).Distinct(StringComparer.Ordinal).ToArray(),
+            source.Events.Where(required.Contains).Select(TimingTurn).Where(x => x.HasValue).Select(x => x!.Value).Distinct().ToArray());
+        if (_coverageLosses.Any(x => !x.PositiveResolved && x.RawPrefix == loss.RawPrefix && x.Unprovable == loss.Unprovable
             && x.BadStatistics == loss.BadStatistics && x.OversizedLine == loss.OversizedLine
-            && x.ReadFailed == loss.ReadFailed && x.Events.SetEquals(hashes))) return;
+            && x.ReadFailed == loss.ReadFailed && x.Events.SetEquals(hashes) && x.Guards.ToHashSet().SetEquals(guards))) return;
         // Repeated generations must not circumvent the existing bounded retention.
-        if (_coverageLosses.Count >= MaximumRetainedEvents || _coverageEvidenceCount + hashes.Count > MaximumRetainedEvents)
+        if (_coverageLosses.Count >= MaximumRetainedEvents || _coverageEvidenceCount + loss.EvidenceCount > MaximumRetainedEvents)
         {
             _unprovableCoverage = true;
             _lostBadStatistics |= loss.BadStatistics;
@@ -182,21 +212,24 @@ public sealed class SessionLogMonitor : IDisposable
             return;
         }
         _coverageLosses.Add(loss);
-        _coverageEvidenceCount += hashes.Count;
+        _coverageEvidenceCount += loss.EvidenceCount;
     }
 
     private void ReconcileCoverage()
     {
         if (_coverageLosses.Count == 0) return;
-        var drained = _sources.Values.Where(x => x.VerifiedThisRefresh && !x.HasMore && !x.PendingLine && !x.ReadFailed && x.Reader.Coverage.Stable).ToArray();
+        var drained = _sources.Values.Where(x => x.VerifiedThisRefresh && !x.HasMore && !x.PendingLine && !x.ReadFailed && !x.UncertainTail && x.Reader.Coverage.Stable).ToArray();
         var hashes = drained.Where(x => !x.BadStatistics).SelectMany(x => x.Events).Where(e => e is not QuotaEvent)
             .Select(EventDigest).ToHashSet(StringComparer.Ordinal);
         foreach (var loss in _coverageLosses.ToArray())
         {
-            if (loss.Unprovable || !loss.Events.IsSubsetOf(hashes)) continue;
-            if (loss.RawPrefix is { } prefix && !drained.Any(x => x.Reader.Proves(prefix))) continue;
+            var proven = loss.Guards.RemoveAll(x => hashes.Contains(x.Digest));
+            _coverageEvidenceCount -= proven;
+            if (!loss.Unprovable && loss.Events.IsSubsetOf(hashes)
+                && (loss.RawPrefix is not { } prefix || drained.Any(x => x.Reader.Proves(prefix)))) loss.PositiveResolved = true;
+            if (!loss.PositiveResolved || loss.Guards.Count > 0) continue;
             _coverageLosses.Remove(loss);
-            _coverageEvidenceCount -= loss.Events.Count;
+            _coverageEvidenceCount -= loss.EvidenceCount;
         }
     }
 
@@ -204,7 +237,133 @@ public sealed class SessionLogMonitor : IDisposable
         + Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(item, item.GetType())));
 
     private sealed record CoverageLoss(HashSet<string> Events, DailyCoverageStamp? RawPrefix, bool Unprovable,
-        bool BadStatistics, bool OversizedLine, bool ReadFailed);
+        bool BadStatistics, bool OversizedLine, bool ReadFailed, List<ExclusionGuard> Guards, string[] Sessions,
+        (string Session, string Turn)[] Turns)
+    {
+        public bool PositiveResolved { get; set; }
+        public int EvidenceCount => Events.Count + Guards.Count + Sessions.Length + Turns.Length;
+    }
+
+    // No retired UsageEvent or token counter is retained in a guard.
+    private abstract record ExclusionGuard(string Digest, string Session);
+    private sealed record OriginGuard(string Hash, string Key, string Request, DateTimeOffset At) : ExclusionGuard(Hash, Key);
+    private sealed record ChildGuard(string Hash, MetadataEvent Relation) : ExclusionGuard(Hash, Relation.SessionKey);
+    private sealed record TimingGuard(string Hash, StatsEvent Evidence) : ExclusionGuard(Hash, Evidence.SessionKey);
+
+    private static ExclusionGuard? CreateGuard(StatsEvent row) => row switch
+    {
+        UsageEvent { RequestKey: { } request } usage => new OriginGuard(EventDigest(row), usage.SessionKey, request, usage.Timestamp),
+        MetadataEvent { IsChild: true } metadata => new ChildGuard(EventDigest(row), metadata),
+        DailyToolEvent or DailyTimingUnavailableEvent => new TimingGuard(EventDigest(row), row),
+        _ => null
+    };
+
+    private IEnumerable<ExclusionGuard> Guards() => _coverageLosses.SelectMany(x => x.Guards);
+    private IEnumerable<MetadataEvent> ChildEvidence() => Guards().OfType<ChildGuard>().Select(x => x.Relation).Distinct();
+    private Dictionary<string, DateTimeOffset> RequestOrigins() => Guards().OfType<OriginGuard>()
+        .GroupBy(x => x.Request, StringComparer.Ordinal).ToDictionary(x => x.Key, x => x.Min(g => g.At), StringComparer.Ordinal);
+    private bool InDay(DateTimeOffset at) => at != DateTimeOffset.MinValue
+        && DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(at, _zone).DateTime) == _day;
+
+    private static (string Session, string Turn)? TimingTurn(StatsEvent row) => row switch
+    {
+        UsageEvent { TurnKey: { } turn } x => (x.SessionKey, turn),
+        StartEvent x => (x.SessionKey, x.TurnKey),
+        CompletionEvent x => (x.SessionKey, x.TurnKey),
+        DailyTurnAbortedEvent x => (x.SessionKey, x.TurnKey),
+        DailyToolEvent { TurnKey: { } turn } x => (x.SessionKey, turn),
+        DailyTimingUnavailableEvent { TurnKey: { } turn } x => (x.SessionKey, turn),
+        _ => null
+    };
+
+    private HashSet<(string Session, string Turn)> CandidateTurns(StatsEvent[] rows)
+    {
+        // Guard relevance must be decided from raw candidates. A retired origin
+        // fact must not hide the candidate that still needs a missing child fact.
+        var result = rows.Where(x => x is not UsageEvent && InDay(x.Timestamp)).Select(TimingTurn)
+            .Where(x => x.HasValue).Select(x => x!.Value).ToHashSet();
+        foreach (var group in rows.OfType<UsageEvent>().Where(x => !x.Legacy && x.RequestKey is not null).GroupBy(x => x.RequestKey!))
+        {
+            var first = group.Min(x => x.Timestamp);
+            if (InDay(first)) foreach (var row in group) if (TimingTurn(row) is { } turn) result.Add(turn);
+        }
+        var closed = rows.Where(x => x.Timestamp <= _refreshAt && x is CompletionEvent or DailyTurnAbortedEvent)
+            .Select(TimingTurn).Where(x => x.HasValue).Select(x => x!.Value).ToHashSet();
+        foreach (var start in rows.OfType<StartEvent>().Where(x => x.Timestamp <= _refreshAt && _refreshAt - x.Timestamp <= TimeSpan.FromMinutes(15)))
+            if (!closed.Contains((start.SessionKey, start.TurnKey))) result.Add((start.SessionKey, start.TurnKey));
+        return result;
+    }
+
+    private sealed record CoverageView(StatsEvent[] Rows, HashSet<(string Session, string Turn)> Turns,
+        HashSet<string> Roots, HashSet<string> TodayRequests, HashSet<string> CandidateSessions,
+        Dictionary<string, DateTimeOffset> MetadataTimes,
+        Dictionary<(string Session, string Call), (string Session, string Turn)[]> Calls);
+
+    private CoverageView CoverageViewFor(StatsEvent[] rows)
+    {
+        var turns = CandidateTurns(rows);
+        var roots = rows.OfType<MetadataEvent>().Concat(ChildEvidence()).GroupBy(x => x.SessionKey)
+            .Select(group =>
+            {
+                var at = group.Max(x => x.Timestamp);
+                return (Session: group.Key, Latest: group.Where(x => x.Timestamp == at).ToArray());
+            })
+            .Where(x => x.Latest.All(m => !m.IsChild) && x.Latest.Select(m => m.ParentKey).Distinct().Count() == 1)
+            .Select(x => x.Session).ToHashSet(StringComparer.Ordinal);
+        var todayRequests = rows.OfType<UsageEvent>().Where(x => !x.Legacy && x.RequestKey is not null && InDay(x.Timestamp))
+            .Select(x => x.RequestKey!).ToHashSet(StringComparer.Ordinal);
+        var sessions = turns.Select(x => x.Session).Concat(rows.Where(x => x is not (MetadataEvent or QuotaEvent or DailyToolEvent or DailyTimingUnavailableEvent)
+            && (InDay(x.Timestamp) || x.Timestamp == DateTimeOffset.MinValue)
+            && (x is not UsageEvent || x is UsageEvent { Legacy: true }
+                || x is UsageEvent usage && (string.IsNullOrWhiteSpace(usage.RequestKey) || string.IsNullOrWhiteSpace(usage.TurnKey)
+                    || string.IsNullOrWhiteSpace(usage.RootTurnKey))))
+            .Select(x => x.SessionKey)).ToHashSet(StringComparer.Ordinal);
+        var times = rows.OfType<MetadataEvent>().GroupBy(x => x.SessionKey).ToDictionary(x => x.Key, x => x.Max(m => m.Timestamp));
+        var calls = rows.OfType<DailyToolEvent>().Where(x => x.CallKey is not null && TimingTurn(x) is { } turn && turns.Contains(turn))
+            .GroupBy(x => (Session: x.SessionKey, Call: x.CallKey!))
+            .ToDictionary(x => x.Key, x => x.Select(TimingTurn).Select(t => t!.Value).Distinct().ToArray());
+        return new(rows, turns, roots, todayRequests, sessions, times, calls);
+    }
+
+    private static bool GuardActive(ExclusionGuard guard, CoverageView view) => guard switch
+    {
+        OriginGuard origin => view.Roots.Contains(origin.Session) && view.TodayRequests.Contains(origin.Request),
+        ChildGuard child => view.CandidateSessions.Contains(child.Session)
+            && (!view.MetadataTimes.TryGetValue(child.Session, out var latest) || latest <= child.Relation.Timestamp),
+        TimingGuard timing => view.Roots.Contains(timing.Session) && (TimingTurn(timing.Evidence) is { } own && view.Turns.Contains(own)
+            || timing.Evidence is DailyToolEvent { CallKey: { } call } && view.Calls.ContainsKey((timing.Session, call))
+            || TimingTurn(timing.Evidence) is null && view.CandidateSessions.Contains(timing.Session)),
+        _ => false
+    };
+
+    private IEnumerable<StatsEvent> MissingTiming(CoverageView view, CoverageLoss[] losses, DateTimeOffset now)
+    {
+        var scopes = new HashSet<(string Session, string? Turn)>();
+        var calls = new HashSet<(string Session, string Call)>();
+        if (_unprovableCoverage)
+            foreach (var session in view.Rows.Select(x => x.SessionKey).Distinct(StringComparer.Ordinal))
+                scopes.Add((session, null));
+        foreach (var loss in losses)
+        {
+            if (!loss.PositiveResolved)
+            {
+                foreach (var turn in loss.Turns) scopes.Add((turn.Session, turn.Turn));
+                if (loss.RawPrefix.HasValue || loss.Unprovable || loss.Turns.Length == 0)
+                    foreach (var session in loss.Sessions.Length > 0 ? loss.Sessions : view.Rows.Select(x => x.SessionKey).Distinct(StringComparer.Ordinal))
+                        scopes.Add((session, null));
+            }
+            foreach (var guard in loss.Guards.OfType<TimingGuard>())
+            {
+                if (!view.Roots.Contains(guard.Session)) continue;
+                if (TimingTurn(guard.Evidence) is { } turn && view.Turns.Contains(turn)) scopes.Add((turn.Session, turn.Turn));
+                if (guard.Evidence is DailyToolEvent { CallKey: { } call }) calls.Add((guard.Session, call));
+                if (TimingTurn(guard.Evidence) is null && view.CandidateSessions.Contains(guard.Session)) scopes.Add((guard.Session, null));
+            }
+        }
+        foreach (var call in calls)
+            foreach (var turn in view.Calls.GetValueOrDefault(call) ?? []) scopes.Add((turn.Session, turn.Turn));
+        return scopes.Select(x => new DailyTimingUnavailableEvent(x.Session, x.Turn, now));
+    }
 
     private List<string> Discover(DateTime midnightUtc, out bool partial, out bool found)
     {
@@ -267,6 +426,7 @@ public sealed class SessionLogMonitor : IDisposable
         public bool VerifiedThisRefresh { get; set; }
         public bool PendingLine { get; set; }
         public bool ReadFailed { get; set; }
+        public bool UncertainTail { get; set; }
         public bool BadStatistics { get; set; }
         public bool OversizedLine { get; set; }
         public bool TimingUnavailable { get; set; }
@@ -294,6 +454,7 @@ public sealed class SessionLogMonitor : IDisposable
                 OversizedLine = false;
                 TimingUnavailable = false;
                 ReadFailed = false;
+                UncertainTail = false;
             };
         }
 
@@ -302,6 +463,8 @@ public sealed class SessionLogMonitor : IDisposable
             HasMore = result.HasMore;
             PendingLine = result.WaitingForCompleteLine;
             ReadFailed = result.Missing || result.AccessDenied;
+            if (ReadFailed) UncertainTail = true;
+            else if (!result.HasMore && !result.WaitingForCompleteLine && Reader.Coverage.Stable) UncertainTail = false;
             BadStatistics |= result.InvalidUtf8 || result.OversizedLine;
             OversizedLine |= result.OversizedLine;
             TimingUnavailable |= result.TimingUnavailable;
@@ -371,7 +534,7 @@ public sealed class SessionLogMonitor : IDisposable
             if (!ReadFailed) foreach (var item in Events) yield return item;
             // This evidence is transient for a half-line/backlog, and persistent for damaged or
             // capped input. Token totals keep their existing partial semantics.
-            if (HasMore || PendingLine || ReadFailed || BadStatistics || TimingUnavailable || _unassociatedTiming)
+            if (HasMore || PendingLine || ReadFailed || UncertainTail || BadStatistics || TimingUnavailable || _unassociatedTiming)
                 foreach (var session in Events.Select(e => e.SessionKey).Distinct(StringComparer.Ordinal))
                     yield return new DailyTimingUnavailableEvent(session, null, now);
         }

@@ -64,6 +64,7 @@ try
     var dst = await dstMonitor.RefreshAsync(new DateTimeOffset(2026, 9, 6, 12, 0, 0, TimeSpan.FromHours(-3)));
     Check(dst.InputTokens is null, "skipped midnight does not break refresh");
     await CoverageLossTests.RunAsync();
+    await ExclusionCoverageTests.RunAsync();
     await ToolTimingTests.RunAsync();
     await OversizedLineTests.RunAsync();
     EnvelopeValidatorTests.Run();
