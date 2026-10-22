@@ -66,6 +66,7 @@ try
     await CoverageLossTests.RunAsync();
     await ExclusionCoverageTests.RunAsync();
     await HistoricalDecisionTests.RunAsync();
+    await ClosureCoverageTests.RunAsync();
     await ToolTimingTests.RunAsync();
     await OversizedLineTests.RunAsync();
     EnvelopeValidatorTests.Run();

@@ -1,0 +1,16 @@
+PASS adds input and output
+PASS keeps observed zero
+PASS accepts maximum representable total
+PASS accepts boundary addition
+PASS preserves unknown input
+PASS preserves unknown output
+PASS rejects negative input
+PASS rejects negative output
+PASS rejects overflow
+PASS rejects overflow in reverse order
+PASS compact total rounds daily fixture to 121.63M
+PASS copy includes exact total without adding cached or reasoning subsets
+PASS copy preserves unknown total when one component is missing
+PASS copy preserves unknown total on overflow
+PASS copy preserves known partial totals and an explicit legacy incompleteness reason
+15/15 passed

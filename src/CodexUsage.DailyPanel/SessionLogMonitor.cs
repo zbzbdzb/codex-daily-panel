@@ -58,7 +58,7 @@ public sealed class SessionLogMonitor : IDisposable
                 // dependencies before discarding the previous day's cache.
                 var exclusions = new HashSet<StatsEvent>();
                 DailyAggregator.Summarize(_sources.Values.SelectMany(x => x.Events).Concat(ChildEvidence()), day, _zone, now,
-                    exclusionProof: exclusions, requestOrigins: RequestOrigins(), startHistory: StartHistory());
+                    exclusionProof: exclusions, requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory());
                 var guards = Guards().Concat(exclusions.Select(CreateGuard).OfType<ExclusionGuard>())
                     .Distinct().Take(MaximumRetainedEvents + 1).ToList();
                 var overflow = guards.Count > MaximumRetainedEvents;
@@ -154,7 +154,7 @@ public sealed class SessionLogMonitor : IDisposable
             var events = _sources.Values.SelectMany(source => source.SummaryEvents(now))
                 .Concat(ChildEvidence()).Concat(view is null ? [] : MissingTiming(view, activeLosses, now));
             var snapshot = DailyAggregator.Summarize(events, day, _zone, now, partial,
-                requestOrigins: RequestOrigins(), startHistory: StartHistory()) with { SourceCount = _sources.Count };
+                requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory()) with { SourceCount = _sources.Count };
             var reasons = new List<string>();
             if (!directoryFound) reasons.Add("未找到本机 Codex sessions 日志目录");
             if (IsLoading) reasons.Add("正在读取今日统计，请稍候…");
@@ -181,7 +181,7 @@ public sealed class SessionLogMonitor : IDisposable
         var required = new HashSet<StatsEvent>();
         var exclusions = new HashSet<StatsEvent>();
         DailyAggregator.Summarize(_sources.Values.SelectMany(x => x.Events).Concat(ChildEvidence()), _day!.Value, _zone, _refreshAt,
-            coverageProof: required, exclusionProof: exclusions, requestOrigins: RequestOrigins(), startHistory: StartHistory());
+            coverageProof: required, exclusionProof: exclusions, requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory());
         // Child metadata is a conditional decision fact, rather than a daily
         // contribution. It is needed only while its session still has candidates.
         var hashes = source.Events.Where(x => required.Contains(x) && x is not MetadataEvent { IsChild: true })
@@ -251,6 +251,7 @@ public sealed class SessionLogMonitor : IDisposable
     private sealed record ChildGuard(string Hash, MetadataEvent Relation) : ExclusionGuard(Hash, Relation.SessionKey);
     private sealed record TimingGuard(string Hash, StatsEvent Evidence) : ExclusionGuard(Hash, Evidence.SessionKey);
     private sealed record StartOrderGuard(string Hash, StartEvent Evidence) : ExclusionGuard(Hash, Evidence.SessionKey);
+    private sealed record ClosureGuard(string Hash, string Key, string Turn, DateTimeOffset At, bool Aborted) : ExclusionGuard(Hash, Key);
 
     private static ExclusionGuard? CreateGuard(StatsEvent row) => row switch
     {
@@ -258,12 +259,16 @@ public sealed class SessionLogMonitor : IDisposable
         MetadataEvent { IsChild: true } metadata => new ChildGuard(EventDigest(row), metadata),
         DailyToolEvent or DailyTimingUnavailableEvent => new TimingGuard(EventDigest(row), row),
         StartEvent start => new StartOrderGuard(EventDigest(row), start),
+        CompletionEvent end => new ClosureGuard(EventDigest(row), end.SessionKey, end.TurnKey, end.Timestamp, false),
+        DailyTurnAbortedEvent abort => new ClosureGuard(EventDigest(row), abort.SessionKey, abort.TurnKey, abort.Timestamp, true),
         _ => null
     };
 
     private IEnumerable<ExclusionGuard> Guards() => _coverageLosses.SelectMany(x => x.Guards);
     private IEnumerable<MetadataEvent> ChildEvidence() => Guards().OfType<ChildGuard>().Select(x => x.Relation).Distinct();
     private IEnumerable<StartEvent> StartHistory() => Guards().OfType<StartOrderGuard>().Select(x => x.Evidence).Distinct();
+    private IEnumerable<(string Session, string Turn, DateTimeOffset At)> ClosureHistory() => Guards().OfType<ClosureGuard>()
+        .Select(x => (x.Session, x.Turn, x.At)).Distinct();
     private Dictionary<(string Session, string Request), DateTimeOffset> RequestOrigins() => Guards().OfType<OriginGuard>()
         .GroupBy(x => (x.Session, x.Request)).ToDictionary(x => x.Key, x => x.Min(g => g.At));
     private bool InDay(DateTimeOffset at) => at != DateTimeOffset.MinValue
@@ -339,7 +344,7 @@ public sealed class SessionLogMonitor : IDisposable
             || TimingTurn(timing.Evidence) is null && view.CandidateSessions.Contains(timing.Session)),
         // Activity qualification is compared in Summarize itself, using the same
         // closure/latest/recent rules that decide ActiveTurns and ActiveSeconds.
-        StartOrderGuard => false,
+        StartOrderGuard or ClosureGuard => false,
         _ => false
     };
 
