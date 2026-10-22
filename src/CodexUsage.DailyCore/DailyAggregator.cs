@@ -7,7 +7,11 @@ public static class DailyAggregator
     private static readonly TimeSpan RecentObservation = TimeSpan.FromMinutes(15);
 
     public static DailySnapshot Summarize(IEnumerable<StatsEvent> events, DateOnly day, TimeZoneInfo zone,
-        DateTimeOffset now, bool partial = false)
+        DateTimeOffset now, bool partial = false, ISet<StatsEvent>? coverageProof = null,
+        ISet<StatsEvent>? exclusionProof = null,
+        IReadOnlyDictionary<(string Session, string Request), DateTimeOffset>? requestOrigins = null,
+        IEnumerable<StartEvent>? startHistory = null,
+        IEnumerable<(string Session, string Turn, DateTimeOffset At)>? closureHistory = null)
     {
         ArgumentNullException.ThrowIfNull(events);
         ArgumentNullException.ThrowIfNull(zone);
@@ -92,7 +96,12 @@ public static class DailyAggregator
                     coverageHistory.Add(version);
                 }
             }
-            accepted.Add(new(selected, versions[0].Timestamp, evidence, coverageEvidence, versions[0].Ordinal, [.. coverageHistory]));
+            var occurredAt = versions[0].Timestamp;
+            // A remembered identity/date is a classification fact, not an old token
+            // sample. Current counters still come exclusively from selected.
+            if (requestOrigins is not null && requestOrigins.TryGetValue((selected.SessionKey, selected.RequestKey!), out var origin) && origin < occurredAt)
+                occurredAt = origin;
+            accepted.Add(new(selected, occurredAt, evidence, coverageEvidence, versions[0].Ordinal, [.. coverageHistory]));
         }
 
         var dayRequests = accepted.Where(x => InDay(x.OccurredAt)).ToArray();
@@ -155,14 +164,24 @@ public static class DailyAggregator
             }
         }
         foreach (var request in accepted) Get(request.Latest.SessionKey, request.Latest.TurnKey!).Requests.Add(request);
-        var lastStarts = observed.OfType<StartEvent>().GroupBy(x => x.SessionKey)
-            .ToDictionary(x => x.Key, x =>
+        Dictionary<string, (DateTimeOffset At, string? Key)> LatestStarts(IEnumerable<StartEvent> values, bool reportConflicts) =>
+            values.GroupBy(x => x.SessionKey).ToDictionary(x => x.Key, x =>
             {
                 var timestamp = x.Max(start => start.Timestamp);
                 var keys = x.Where(start => start.Timestamp == timestamp).Select(start => start.TurnKey).Distinct().ToArray();
-                if (keys.Length > 1 && InDay(timestamp)) issues.Add("当前回合启动关系冲突");
+                if (reportConflicts && keys.Length > 1 && InDay(timestamp)) issues.Add("当前回合启动关系冲突");
                 return (At: timestamp, Key: keys.Length == 1 ? keys[0] : null);
             }, StringComparer.Ordinal);
+        var rawLastStarts = LatestStarts(observed.OfType<StartEvent>(), true);
+        // Retired starts constrain ordering only. They must never create a turn,
+        // an interval, or a replacement completion duration in the current view.
+        var lastStarts = startHistory is null ? rawLastStarts : LatestStarts(observed.OfType<StartEvent>()
+            .Concat(startHistory.Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now)), false);
+        // A retired closure may disqualify activity, but cannot supply an old
+        // completion, duration, TTFT or interval to the current statistics.
+        var historicalClosedTurns = closureHistory?.Where(x => x.At != DateTimeOffset.MinValue && x.At <= now
+            && !string.IsNullOrWhiteSpace(x.Session) && !string.IsNullOrWhiteSpace(x.Turn))
+            .Select(x => (x.Session, x.Turn)).ToHashSet() ?? [];
         var intervals = new List<(DateTimeOffset Start, DateTimeOffset End)>();
         void AddInterval(DateTimeOffset start, DateTimeOffset finish)
         {
@@ -178,6 +197,7 @@ public static class DailyAggregator
         var timedTurns = 0;
         var unavailableTiming = 0;
         var active = 0;
+        var coverageTurns = coverageProof is null ? null : new HashSet<(string Session, string Turn)>();
         foreach (var turn in turns.Values)
         {
             var starts = turn.Starts.Distinct().Order().ToArray();
@@ -185,6 +205,7 @@ public static class DailyAggregator
             var aborts = turn.Aborts.Distinct().Order().ToArray();
             var relevantTurn = starts.Any(InDay) || completions.Any(x => InDay(x.Timestamp))
                 || aborts.Any(InDay) || turn.Requests.Any(x => InDay(x.OccurredAt));
+            if (relevantTurn) coverageTurns?.Add((turn.Session, turn.Key));
             var timingConflict = starts.Length > 1 || completions.Length > 1 || aborts.Length > 1
                 || (completions.Length > 0 && aborts.Length > 0);
             if (timingConflict)
@@ -204,10 +225,17 @@ public static class DailyAggregator
                 // A log start is only an observation, not proof the process is alive.
                 // Require the latest start in its root session and a short age limit.
                 if (explicitStart is { } began && InDay(now) && now - began <= RecentObservation
-                    && lastStarts.TryGetValue(turn.Session, out var latest) && began == latest.At && turn.Key == latest.Key)
+                    && rawLastStarts.TryGetValue(turn.Session, out var rawLatest) && began == rawLatest.At && turn.Key == rawLatest.Key)
                 {
-                    active++;
-                    AddInterval(began, now);
+                    if (historicalClosedTurns.Contains((turn.Session, turn.Key)))
+                        issues.Add("历史回合闭合依据缺失，活动状态无法确认");
+                    else if (lastStarts.TryGetValue(turn.Session, out var latest) && began == latest.At && turn.Key == latest.Key)
+                    {
+                        coverageTurns?.Add((turn.Session, turn.Key));
+                        active++;
+                        AddInterval(began, now);
+                    }
+                    else issues.Add("历史回合启动依据缺失，活动状态无法确认");
                 }
                 continue;
             }
@@ -271,6 +299,84 @@ public static class DailyAggregator
         if (issues.Count > 0) status += "；统计不完整：" + string.Join("、", issues.Order(StringComparer.Ordinal));
         var weekly = LatestWeekly(rows.OfType<QuotaEvent>(), now, out var multipleWeekly);
         if (multipleWeekly) status += "；日志报告多个独立周额度窗口，未合并显示";
+        if (exclusionProof is not null)
+        {
+            // These dependencies can be dormant: a request's first occurrence,
+            // a child relation, or historical timing may govern later input today.
+            // The caller retains only identity/date/scope facts and replay hashes.
+            // Today's child/unknown scope may later become root. Classification
+            // dependencies therefore come from raw identities, before Root filters.
+            foreach (var group in rows.OfType<UsageEvent>().Where(x => !x.Legacy && !string.IsNullOrWhiteSpace(x.RequestKey))
+                .GroupBy(x => (x.SessionKey, x.RequestKey)))
+            {
+                var versions = group.Distinct().OrderBy(x => x.Timestamp).ThenBy(x => x.Ordinal).ToArray();
+                if (versions.Any(x => string.IsNullOrWhiteSpace(x.SessionKey) || string.IsNullOrWhiteSpace(x.TurnKey)
+                    || string.IsNullOrWhiteSpace(x.RootTurnKey) || x.Timestamp == DateTimeOffset.MinValue
+                    || x.Usage is not { IsValid: true }) || RequestConflict(versions)) continue;
+                // Same-day occurrence time also governs whether a request lies
+                // inside its turn's interval and may contribute to adjusted TPS.
+                if (versions[0].Timestamp <= now) exclusionProof.Add(versions[0]);
+            }
+            foreach (var group in rows.OfType<MetadataEvent>().Where(x => children.Contains(x.SessionKey)).GroupBy(x => x.SessionKey))
+            {
+                var latestTime = group.Max(x => x.Timestamp);
+                foreach (var metadata in group.Where(x => x.Timestamp == latestTime)) exclusionProof.Add(metadata);
+            }
+            foreach (var timing in rows.Where(x => x is DailyToolEvent or DailyTimingUnavailableEvent)) exclusionProof.Add(timing);
+            foreach (var closure in rows.Where(x => x is CompletionEvent or DailyTurnAbortedEvent
+                && x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now))
+                if (TurnKey(closure) is { } identity && !string.IsNullOrWhiteSpace(identity.Session)
+                    && !string.IsNullOrWhiteSpace(identity.Turn)) exclusionProof.Add(closure);
+            foreach (var group in rows.OfType<StartEvent>().Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now
+                && !string.IsNullOrWhiteSpace(x.SessionKey) && !string.IsNullOrWhiteSpace(x.TurnKey)).GroupBy(x => x.SessionKey))
+            {
+                var latestTime = group.Max(x => x.Timestamp);
+                foreach (var start in group.Where(x => x.Timestamp == latestTime)) exclusionProof.Add(start);
+            }
+        }
+        if (coverageProof is not null)
+        {
+            // Export proof dependencies from the same projection that produced the
+            // statistics. Independent prior-day requests and no-op arrival copies
+            // are not today's coverage; original occurrence/revision evidence is.
+            var legacySessions = legacy.Select(x => x.SessionKey).ToHashSet(StringComparer.Ordinal);
+            foreach (var request in accepted.Where(x => InDay(x.OccurredAt) || legacySessions.Contains(x.Latest.SessionKey)
+                || coverageTurns!.Contains((x.Latest.SessionKey, x.Latest.TurnKey!))))
+                foreach (var evidence in request.CoverageHistory) coverageProof.Add(evidence);
+            var acceptedKeys = accepted.Select(x => x.Latest.RequestKey!).ToHashSet(StringComparer.Ordinal);
+            foreach (var group in modern.Where(x => x.RequestKey is not null && !acceptedKeys.Contains(x.RequestKey)).GroupBy(x => x.RequestKey))
+                if (group.Any(Relevant)) foreach (var evidence in group) coverageProof.Add(evidence);
+            foreach (var row in rows.Where(x => x is not (MetadataEvent or QuotaEvent)))
+            {
+                if (!Root(row))
+                {
+                    if (!children.Contains(row.SessionKey) && Relevant(row)) coverageProof.Add(row);
+                    continue;
+                }
+                if (row is UsageEvent { Legacy: false } usage)
+                {
+                    if (usage.RequestKey is null && Relevant(usage)) coverageProof.Add(row);
+                    continue;
+                }
+                var turn = row switch
+                {
+                    DailyToolEvent tool => tool.TurnKey is { } key ? (tool.SessionKey, key) : ((string, string)?)null,
+                    DailyTimingUnavailableEvent timing => timing.TurnKey is { } key ? (timing.SessionKey, key) : ((string, string)?)null,
+                    _ => TurnKey(row)
+                };
+                if (Relevant(row) || turn is { } keyTurn && coverageTurns!.Contains(keyTurn)
+                    || (row is DailyTimingUnavailableEvent missing && string.IsNullOrWhiteSpace(missing.TurnKey)
+                        || row is DailyToolEvent unpaired && string.IsNullOrWhiteSpace(unpaired.TurnKey))
+                        && coverageTurns!.Any(x => x.Session == row.SessionKey))
+                    coverageProof.Add(row);
+            }
+            var sessions = coverageProof.Select(x => x.SessionKey).ToHashSet(StringComparer.Ordinal);
+            foreach (var group in rows.OfType<MetadataEvent>().Where(x => sessions.Contains(x.SessionKey)).GroupBy(x => x.SessionKey))
+            {
+                var latestTime = group.Max(x => x.Timestamp);
+                foreach (var metadata in group.Where(x => x.Timestamp == latestTime)) coverageProof.Add(metadata);
+            }
+        }
         return new(day, now, totals?.Input, totals?.CachedInput, totals?.Output, totals?.ReasoningOutput,
             timedTurns > 0 ? (double)(processingMs / 1000m) : null, UnionSeconds(intervals),
             timedTurns > 0 ? (double)(matchedOutput / (processingMs / 1000m)) : null,

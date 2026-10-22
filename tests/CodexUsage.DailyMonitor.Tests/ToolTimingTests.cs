@@ -178,7 +178,8 @@ internal static class ToolTimingTests
                 Check(drained.AverageTps is not null, "completed ordinary append clears provisional timing exclusion");
                 Write(metadata + began + usage + complete);
                 var reset = await monitor.RefreshAsync(start.AddMinutes(1));
-                Check(reset.ProcessingSeconds == 9, "file replacement clears old tool lifecycle and timing");
+                Check(reset.IsPartial && reset.ProcessingSeconds is null && reset.AverageTps is null,
+                    "file replacement cannot turn lost tool timing into a trusted zero-wait estimate");
             }
             Console.WriteLine($"TOOL TIMING RESULT: {passes} passed, 0 failed");
         }

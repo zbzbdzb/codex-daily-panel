@@ -1,0 +1,11 @@
+  Determining projects to restore...
+  Restored F:\CodexData\home\worktrees\fe65\github-export-codex-daily-panel-20261021\src\CodexUsage.DailyCore\CodexUsage.DailyCore.csproj (in 43 ms).
+  Restored F:\CodexData\home\worktrees\fe65\github-export-codex-daily-panel-20261021\src\CodexUsage.DailyPanel\CodexUsage.DailyPanel.csproj (in 47 ms).
+  CodexUsage.DailyCore -> C:\Users\12914\AppData\Local\Temp\CodexDaily-boundaries-759ab5d847834509bb74f589077a25c5\final-app-artifacts\bin\CodexUsage.DailyCore\release\CodexUsage.DailyCore.dll
+  CodexUsage.DailyPanel -> C:\Users\12914\AppData\Local\Temp\CodexDaily-boundaries-759ab5d847834509bb74f589077a25c5\final-app-artifacts\bin\CodexUsage.DailyPanel\release\CodexDaily.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:01.62

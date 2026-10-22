@@ -1,0 +1,67 @@
+{
+  "name": "red-monitor",
+  "head": "71753d82695f4634887f6a6010eb6164461511bb",
+  "branch": "fix/log-coverage-loss",
+  "status": [
+    " M tests/CodexUsage.DailyMonitor.Tests/Program.cs",
+    "?? tests/CodexUsage.DailyMonitor.Tests/HistoricalDecisionTests.cs"
+  ],
+  "started_utc": "2026-10-22T03:29:47.4590270+00:00",
+  "finished_utc": "2026-10-22T03:29:55.7764975+00:00",
+  "cwd": "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-historical-fd56bf93161946c9b9716d859613f75a",
+  "executable": "C:\\Program Files\\dotnet\\dotnet.exe",
+  "sdk": "9.0.318",
+  "argv": [
+    "run",
+    "--project",
+    "F:\\CodexData\\home\\worktrees\\fe65\\github-export-codex-daily-panel-20261021\\tests\\CodexUsage.DailyMonitor.Tests",
+    "-c",
+    "Release",
+    "--artifacts-path",
+    "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-historical-fd56bf93161946c9b9716d859613f75a\\red-monitor-artifacts",
+    "--no-launch-profile"
+  ],
+  "environment": {
+    "TEMP": "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-historical-fd56bf93161946c9b9716d859613f75a\\scratch",
+    "TMP": "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-historical-fd56bf93161946c9b9716d859613f75a\\scratch",
+    "DOTNET_CLI_HOME": "C:\\Users\\12914\\AppData\\Local\\Temp\\CodexDaily-historical-fd56bf93161946c9b9716d859613f75a\\dotnet-home",
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+    "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1",
+    "DOTNET_GENERATE_ASPNET_CERTIFICATE": "false"
+  },
+  "exit_code": -532462766,
+  "inputs_stable": true,
+  "input_manifest": "red-monitor.inputs.sha256",
+  "input_manifest_sha256": "E5EE82D575BA1AD8038C486138592AF087EDDDEE7CC756A420DE4FE5082A97CC",
+  "after_manifest": "red-monitor.after.inputs.sha256",
+  "after_manifest_sha256": "E5EE82D575BA1AD8038C486138592AF087EDDDEE7CC756A420DE4FE5082A97CC",
+  "raw_log": "red-monitor.log",
+  "raw_log_sha256": "9CF55CAD204F1CC81B240B8733302144074E9E2BB9D4ED6B9B4C14A21D70234B",
+  "outputs": [
+    {
+      "path": "bin/CodexUsage.DailyCore/release/CodexUsage.Core.dll",
+      "bytes": 155648,
+      "sha256": "6B3D5C61F342C68D3C356DE726341AE93DD1C7321E7384C3892D42618A363EEE"
+    },
+    {
+      "path": "bin/CodexUsage.DailyCore/release/CodexUsage.DailyCore.dll",
+      "bytes": 63488,
+      "sha256": "C91720D1C9012F917C70E0263FCA745AF3B4705B9004158BD7C8929575A67451"
+    },
+    {
+      "path": "bin/CodexUsage.DailyMonitor.Tests/release/CodexUsage.Core.dll",
+      "bytes": 155648,
+      "sha256": "6B3D5C61F342C68D3C356DE726341AE93DD1C7321E7384C3892D42618A363EEE"
+    },
+    {
+      "path": "bin/CodexUsage.DailyMonitor.Tests/release/CodexUsage.DailyCore.dll",
+      "bytes": 63488,
+      "sha256": "C91720D1C9012F917C70E0263FCA745AF3B4705B9004158BD7C8929575A67451"
+    },
+    {
+      "path": "bin/CodexUsage.DailyMonitor.Tests/release/CodexUsage.DailyMonitor.Tests.dll",
+      "bytes": 306176,
+      "sha256": "465590AAC6D72453ACAE13B75CBE7EF9BBDFBC6CED243290C7291497ABC7F053"
+    }
+  ]
+}
