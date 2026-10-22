@@ -16,6 +16,7 @@ $env:DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'
 Push-Location $taskRoot
 try {
     [void](New-Item -ItemType Directory -Path $taskVerification)
+    & (Join-Path $PSScriptRoot 'verify-core-build.ps1') -OutputDirectory (Join-Path $taskVerification 'core-rebuild')
     & dotnet run --project tests/CodexUsage.Daily.Tests -c Release | Tee-Object -FilePath (Join-Path $taskVerification 'aggregation-tests.txt')
     if ($LASTEXITCODE -ne 0) { throw 'Daily aggregation tests failed.' }
     & dotnet run --project tests/CodexUsage.DailyMonitor.Tests -c Release | Tee-Object -FilePath (Join-Path $taskVerification 'monitor-tests.txt')
