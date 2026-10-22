@@ -81,7 +81,9 @@ internal static class OversizedLineTests
                 Check(bad.IsPartial, "same length rewritten oversized statistics detected");
                 File.WriteAllText(path, metadata + usage, Utf8);
                 var reset = await monitor.RefreshAsync(now);
-                Check(!reset.IsPartial && reset.OutputTokens == 25, "replacement resets oversized diagnostics and contributions");
+                Check(reset.IsPartial && reset.OutputTokens == 25
+                    && reset.Status.Contains("4 MiB", StringComparison.Ordinal),
+                    "replacement cannot erase lost oversized statistics or their diagnostic");
             }
             string priorUsage = usage.Replace(now.ToString("yyyy-MM-dd"), now.AddDays(-1).ToString("yyyy-MM-dd"), StringComparison.Ordinal);
             File.WriteAllText(path, metadata + priorUsage + usage, Utf8);

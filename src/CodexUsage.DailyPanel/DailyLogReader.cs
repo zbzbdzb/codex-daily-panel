@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Cryptography;
@@ -15,6 +17,9 @@ namespace CodexUsage.DailyPanel;
 /// HasMore requests a further byte drain; WaitingForCompleteLine independently marks an unfinished row at EOF.
 /// </summary>
 internal readonly record struct DailyReadBatchResult(long BytesRead, int LinesRead, bool ResetDetected, bool AccessDenied, bool Missing, bool InvalidUtf8, bool OversizedLine, bool HasMore = false, bool WaitingForCompleteLine = false, bool TimingUnavailable = false);
+
+internal readonly record struct DailyCoverageStamp(long Bytes, string Digest);
+internal readonly record struct DailyCoverageState(DailyCoverageStamp Stamp, long ObservedLength, bool Stable, bool Incomplete);
 
 /// <summary>
 /// Reads one explicitly configured log without modifying it. Instances start at byte zero;
@@ -47,9 +52,19 @@ internal sealed class DailyLogReader : IDisposable
     private bool _sourceMissing;
     private readonly object _pendingResultGate = new();
     private DailyReadBatchResult _pendingResult;
+    private readonly IncrementalHash _coverage = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+    private readonly Func<DailyCoverageStamp[]> _coverageTargets;
+    private DailyCoverageStamp[] _activeCoverageTargets = [];
+    private int _coverageTargetIndex;
+    private readonly HashSet<DailyCoverageStamp> _coverageMatches = [];
+    private readonly HashSet<DailyCoverageStamp> _coverageAttempts = [];
+    private bool _coverageReplay;
+    private long _observedLength;
+    private bool _interruptedLine;
 
-    public DailyLogReader(string path)
+    public DailyLogReader(string path, Func<DailyCoverageStamp[]>? coverageTargets = null)
     {
+        _coverageTargets = coverageTargets ?? (() => []);
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         _path = Path.GetFullPath(path);
         string extension = Path.GetExtension(_path);
@@ -79,6 +94,17 @@ internal sealed class DailyLogReader : IDisposable
     internal int RetainedLineBytes => _line.Length;
     /// <summary>Raised after resetting the cursor and before delivering any replacement-file lines.</summary>
     public event Action? ResetDetected;
+    internal DailyCoverageState Coverage => new(new(Offset, Convert.ToHexString(_coverage.GetCurrentHash())), _observedLength,
+        !_pendingReset, _interruptedLine || _lineLength > 0 || _skippingOversizedLine);
+    internal DailyCoverageState CoverageBeforeReset { get; private set; }
+    internal bool Proves(DailyCoverageStamp stamp) => !_pendingReset && (_coverageMatches.Contains(stamp) || Coverage.Stamp == stamp);
+
+    // A previously drained mirror may already be past a newly lost opaque prefix.
+    // Replay it once per challenge through the ordinary bounded reader and parser.
+    internal void RequestCoverageReplay(DailyCoverageStamp stamp)
+    {
+        if (Offset >= stamp.Bytes && !Proves(stamp) && _coverageAttempts.Add(stamp)) _coverageReplay = true;
+    }
 
     public async Task<DailyReadBatchResult> ReadAvailableAsync(Action<string> onCompleteLine, CancellationToken cancellationToken = default)
     {
@@ -117,9 +143,12 @@ internal sealed class DailyLogReader : IDisposable
                     // and a later baseline must not become the trusted new baseline for an old half-line.
                     long initialLength = stream.Length;
                     byte[] initialFingerprint = Fingerprint(stream, initialLength);
-                    reset = _pendingReset || (_identity is not null && (_identity.Value != identity || initialLength < Offset || !FingerprintMatches(stream)));
+                    bool changed = _pendingReset || (_identity is not null && (_identity.Value != identity || initialLength < Offset || !FingerprintMatches(stream)));
+                    reset = changed || _coverageReplay;
                     if (reset)
                     {
+                        CoverageBeforeReset = Coverage;
+                        if (changed) _coverageAttempts.Clear();
                         ResetCursor();
                         _pendingReset = true;
                         try { ResetDetected?.Invoke(); }
@@ -128,6 +157,13 @@ internal sealed class DailyLogReader : IDisposable
                         initialLength = stream.Length;
                         initialFingerprint = Fingerprint(stream, initialLength);
                     }
+                    _activeCoverageTargets = _coverageTargets().OrderBy(x => x.Bytes).ToArray();
+                    _coverageTargetIndex = 0;
+                    while (_coverageTargetIndex < _activeCoverageTargets.Length && _activeCoverageTargets[_coverageTargetIndex].Bytes <= Offset)
+                        _coverageTargetIndex++;
+                    _coverageMatches.IntersectWith(_activeCoverageTargets);
+                    _coverageAttempts.IntersectWith(_activeCoverageTargets);
+                    _observedLength = initialLength;
                     _identity = identity;
                     _hasMore = initialLength > Offset;
                     stream.Position = Offset;
@@ -165,6 +201,7 @@ internal sealed class DailyLogReader : IDisposable
                                 _fingerprint = cursorFingerprint;
                             }
                             _hasMore = stream.Length > Offset;
+                            _observedLength = Math.Max(_observedLength, stream.Length);
                         }
                         // Preserve the original callback/read exception if the cleanup probe also fails.
                         catch when (!readSucceeded) { _pendingReset = true; }
@@ -222,6 +259,7 @@ internal sealed class DailyLogReader : IDisposable
                 _skippingOversizedLine = false;
                 _oversizedEnvelope = null;
                 _fingerprint = null;
+                _coverage.Dispose();
             }
             _gate.Release();
         }
@@ -265,6 +303,7 @@ internal sealed class DailyLogReader : IDisposable
             int contentLength = newline < 0 ? bytes.Length : newline;
             AppendLineBytes(bytes[..contentLength]);
             int consumed = contentLength + (newline < 0 ? 0 : 1);
+            AppendCoverage(bytes[..consumed]);
             Offset += consumed;
             bytesRead += consumed;
             bytes = bytes[consumed..];
@@ -298,6 +337,21 @@ internal sealed class DailyLogReader : IDisposable
                 linesRead++;
             }
         }
+    }
+
+    private void AppendCoverage(ReadOnlySpan<byte> bytes)
+    {
+        int appended = 0;
+        long end = Offset + bytes.Length;
+        while (_coverageTargetIndex < _activeCoverageTargets.Length && _activeCoverageTargets[_coverageTargetIndex].Bytes <= end)
+        {
+            var target = _activeCoverageTargets[_coverageTargetIndex++];
+            int boundary = (int)(target.Bytes - Offset);
+            _coverage.AppendData(bytes[appended..boundary]);
+            appended = boundary;
+            if (Convert.ToHexString(_coverage.GetCurrentHash()) == target.Digest) _coverageMatches.Add(target);
+        }
+        _coverage.AppendData(bytes[appended..]);
     }
 
     private void AppendLineBytes(ReadOnlySpan<byte> bytes)
@@ -379,6 +433,7 @@ internal sealed class DailyLogReader : IDisposable
 
     private void StopAfterAccessDenied()
     {
+        _interruptedLine |= _lineLength > 0 || _skippingOversizedLine;
         IsStopped = true;
         _sourceMissing = false;
         _line.AsSpan().Clear();
@@ -391,6 +446,10 @@ internal sealed class DailyLogReader : IDisposable
 
     private void ResetCursor()
     {
+        _coverage.GetHashAndReset();
+        _coverageMatches.Clear();
+        _coverageReplay = false;
+        _interruptedLine = false;
         Offset = 0;
         _line.AsSpan().Clear();
         _lineLength = 0;
@@ -408,7 +467,7 @@ internal sealed class DailyLogReader : IDisposable
         // can leave cleanly after observing disposal, instead of racing SemaphoreSlim.Dispose.
         if (_gate.Wait(0))
         {
-            try { _line.AsSpan().Clear(); _line = []; _lineLength = 0; _skippingOversizedLine = false; _oversizedEnvelope = null; _fingerprint = null; }
+            try { _line.AsSpan().Clear(); _line = []; _lineLength = 0; _skippingOversizedLine = false; _oversizedEnvelope = null; _fingerprint = null; _coverage.Dispose(); }
             finally { _gate.Release(); }
         }
     }
