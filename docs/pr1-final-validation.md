@@ -116,4 +116,6 @@ $env:DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'
 
 2026-10-23 15:31–15:33（UTC+8）的 GitHub 查询无 Actions workflow、check run、commit status、正式 PR review 或 review thread，目标分支无保护规则；空 status 的合成状态显示 `pending`，并不存在一个实际在运行的检查。没有 CI 不等于通过，本次依据上述可复现本地证据。合并前仍须对最终上传 head 重新读取精确 head/base、检查/审查/保护规则和目标集成结果。此记录没有宣称远端已经包含本地修复或 PR 已合并。
 
+对目标分支的完整 PR 执行 `git diff --check` 返回 2，告警来自恢复的 Core 原始源码中的换行及末尾空行。与远端 A/B 集成 head `560382e...` 的同一检查逐条比较，告警完全相同；本阶段修复与文稿增量的检查返回 0。为保持冻结 Core 的原始源码字节及重建依据，本次不做这些非功能格式整理，也不把完整 PR 的检查写成全绿。
+
 历史修复验证的 SDK 原始输出记录曾自动生成并安装 ASP.NET Core HTTPS 开发证书。后续禁用自动生成不等于此前证书已撤销或清理，没有清理证据；本次审查未访问或修改证书存储。该历史副作用继续披露。
