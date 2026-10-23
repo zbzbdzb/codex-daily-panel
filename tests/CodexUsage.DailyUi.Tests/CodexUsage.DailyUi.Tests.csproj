@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>$(CodexTargetFramework)-windows</TargetFramework>
+    <UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms><ImplicitUsings>disable</ImplicitUsings>
+    <ApplicationManifest>../../src/CodexUsage.DailyPanel/app.manifest</ApplicationManifest><NoWarn>$(NoWarn);WFO0003</NoWarn>
+  </PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../src/CodexUsage.DailyPanel/CodexUsage.DailyPanel.csproj" /></ItemGroup>
+</Project>

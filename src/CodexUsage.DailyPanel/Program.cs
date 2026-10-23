@@ -2,6 +2,8 @@ using System;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -18,21 +20,23 @@ internal static class Program
     [STAThread]
     public static int Main(string[] args)
     {
-        var demo = false;
-        string? render = null;
-        string? snapshot = null;
-        string? home = null;
-        for (var i = 0; i < args.Length; i++)
+        if (!DailyOptions.TryParse(args, out var parsed, out var error))
         {
-            if (args[i] == "--demo") demo = true;
-            else if (args[i] == "--render" && i + 1 < args.Length) { render = Path.GetFullPath(args[++i]); demo = true; }
-            else if (args[i] == "--snapshot" && i + 1 < args.Length) snapshot = Path.GetFullPath(args[++i]);
-            else if (args[i] == "--codex-home" && i + 1 < args.Length) home = Path.GetFullPath(args[++i]);
-            else return 2;
+            WriteConsole(error ?? "Invalid arguments.", isError: true);
+            return 2;
         }
-        if (render is not null && snapshot is not null) return 2;
-        home ??= Environment.GetEnvironmentVariable("CODEX_HOME");
-        if (string.IsNullOrWhiteSpace(home)) home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
+        var options = parsed!;
+        if (options.ShowHelp) { WriteConsole(DailyOptions.HelpText); return 0; }
+        if (options.ShowVersion)
+        {
+            WriteConsole("CodexDaily " + (typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "unknown"));
+            return 0;
+        }
+        var demo = options.Demo;
+        var render = options.RenderPath;
+        var snapshot = options.SnapshotPath;
+        var home = options.Home;
+        var strings = new DailyStrings(LanguagePreference.System);
         try
         {
             if (snapshot is not null)
@@ -49,8 +53,19 @@ internal static class Program
                 File.WriteAllText(snapshot, JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true }));
                 return monitor.IsLoading ? 3 : 0;
             }
+            using var instance = demo ? null : SingleInstanceCoordinator.Acquire(home);
+            if (instance is { IsPrimary: false })
+            {
+                if (instance.TryActivateAsync(TimeSpan.FromSeconds(3)).GetAwaiter().GetResult()) return 0;
+                WriteConsole("The existing CodexDaily instance could not be activated. Try again after it has finished exiting.", isError: true);
+                return 1;
+            }
+            var settingsStore = new PanelSettingsStore(options.SettingsDirectory ?? PanelSettingsStore.DefaultDirectory);
+            var settingsResult = settingsStore.Load();
+            strings = new DailyStrings(settingsResult.Settings.Language);
             var application = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
             var window = new DailyWindow();
+            window.Configure(settingsResult.Settings);
             application.MainWindow = window;
             if (render is not null)
             {
@@ -68,23 +83,49 @@ internal static class Program
                 application.Shutdown();
                 return 0;
             }
-            using var controller = new DailyController(application, window, home, demo);
+            using var controller = new DailyController(application, window, home, demo, settingsStore, settingsResult);
             application.DispatcherUnhandledException += (_, e) =>
             {
                 e.Handled = true;
-                window.SetBusy(false);
-                MessageBox.Show("这次操作未能完成。请稍后刷新或重新启动面板。", "Codex Usage", MessageBoxButton.OK, MessageBoxImage.Information);
+                controller.HandleOperationFailure(e.Exception);
+                var currentStrings = new DailyStrings(window.Settings.Language);
+                MessageBox.Show(currentStrings["OperationFailed"], currentStrings["Title"], MessageBoxButton.OK, MessageBoxImage.Information);
             };
             controller.Start();
+            instance?.StartListening(controller.RequestShow);
             return application.Run();
         }
         catch (Exception exception) when (exception is not OutOfMemoryException)
         {
-            if (snapshot is not null) File.WriteAllText(snapshot, JsonSerializer.Serialize(new { error = exception.GetType().Name }));
-            else MessageBox.Show("无法启动面板。请确认已安装 .NET 9 Windows Desktop Runtime，并检查日志目录是否可读。", "Codex Usage", MessageBoxButton.OK, MessageBoxImage.Warning);
+            if (snapshot is not null)
+            {
+                // A missing/locked/unwritable output must not throw a second exception
+                // while trying to report the original operation failure.
+                try { File.WriteAllText(snapshot, JsonSerializer.Serialize(new { error = exception.GetType().Name })); }
+                catch (Exception writeError) when (writeError is not OutOfMemoryException) { }
+                WriteConsole("Snapshot operation failed: " + exception.GetType().Name, isError: true);
+            }
+            else if (render is not null) WriteConsole("Render operation failed: " + exception.GetType().Name, isError: true);
+            else MessageBox.Show(strings["StartupFailed"], strings["Title"], MessageBoxButton.OK, MessageBoxImage.Warning);
             return 1;
         }
     }
+
+    private static void WriteConsole(string message, bool isError = false)
+    {
+        try
+        {
+            // WinExe can still serve CLI callers. Keep redirected handles intact;
+            // attach to a parent console only when no console is already attached.
+            if (OperatingSystem.IsWindows()) AttachConsole(unchecked((uint)-1));
+            (isError ? Console.Error : Console.Out).WriteLine(message);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AttachConsole(uint processId);
 
     internal static DailySnapshot DemoSnapshot() => new(
         DateOnly.FromDateTime(DateTime.Now), DateTimeOffset.Now,

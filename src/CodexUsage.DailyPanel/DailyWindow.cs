@@ -1,483 +1,248 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
-using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Media.Effects;
 using System.Windows.Threading;
 using CodexUsage.Daily;
-using ShapePath = System.Windows.Shapes.Path;
+using Microsoft.Win32;
 
 namespace CodexUsage.DailyPanel;
 
 public sealed class DailyWindow : Window
 {
-    private static readonly Brush Ink = Brush("#20242C");
-    private static readonly Brush Muted = Brush("#818895");
-    private static readonly Brush Blue = Brush("#3279F5");
-    private static readonly Brush Hairline = Brush("#EAEDF2");
-    private readonly TextBlock _status = Label("Waiting", 10.5, Brush("#7C8794"));
-    private readonly Border _statusPill;
-    private readonly TextBlock _day = Label("Today", 14, Ink, FontWeights.SemiBold);
-    private readonly TextBlock _zone = Label("Local time", 10.5);
-    private readonly TextBlock _input = Label("—", 28, Ink, FontWeights.SemiBold);
-    private readonly TextBlock _output = Label("—", 28, Blue, FontWeights.SemiBold);
-    private readonly TextBlock _inputExact = Label("Exact count unavailable", 9.5);
-    private readonly TextBlock _outputExact = Label("Exact count unavailable", 9.5, Brush("#7794BF"));
-    private readonly TextBlock _total = Label("—", 25, Ink, FontWeights.SemiBold);
-    private readonly TextBlock _totalExact = Label("Exact count unavailable", 10);
-    private readonly TextBlock _tps = Label("—", 28, Ink, FontWeights.SemiBold);
-    private readonly TextBlock _processing = Label("—", 18, Ink, FontWeights.SemiBold);
-    private readonly TextBlock _weeklyRemaining = Label("No data", 12, Muted, FontWeights.SemiBold);
-    private readonly TextBlock _weeklyReset = Label("等待日志中的周额度快照", 10.5);
-    private readonly TextBlock _weeklyObserved = Label("", 10);
-    private readonly Border _weeklyFill;
-    private readonly Grid _weeklyTrack;
-    private readonly TextBlock _chats = Label("— chats", 10.5);
-    private readonly TextBlock _turns = Label("— turns", 10.5);
-    private readonly TextBlock _cached = Label("—", 12.5, Ink, FontWeights.SemiBold);
-    private readonly TextBlock _reasoning = Label("—", 12.5, Ink, FontWeights.SemiBold);
-    private readonly TextBlock _uncached = Label("—", 12.5, Ink, FontWeights.SemiBold);
-    private readonly TextBlock _active = Label("—", 12.5, Ink, FontWeights.SemiBold);
-    private readonly TextBlock _timingScope = Label("Root sessions only · TPS estimate", 10);
-    private readonly TextBlock _note = Label("Waiting for local usage logs", 10.5);
-    private readonly TextBlock _updated = Label("Not updated yet", 10);
-    private readonly TextBlock _copyLabel = Label("Copy stats", 12, Brushes.White, FontWeights.SemiBold);
-    private readonly Button _copyButton;
-    private readonly Button _refreshButton;
+    private readonly List<Action<DailyStrings>> _localized = new();
+    private readonly TextBlock _quality = Label("", 12), _activity = Label("", 12), _day = Label("", 14), _zone = Label("", 12);
+    private readonly TextBlock _total = Label("—", 32, true), _input = Label("—", 22, true), _output = Label("—", 22, true);
+    private readonly TextBlock _totalExact = Label("", 12), _inputExact = Label("", 12), _outputExact = Label("", 12);
+    private readonly TextBlock _tps = Label("—", 24, true), _processing = Label("—", 22, true);
+    private readonly TextBlock _weekly = Label("", 16, true), _weeklyObserved = Label("", 12), _weeklyReset = Label("", 12);
+    private readonly TextBlock _cache = Label("", 14), _reasoning = Label("", 14), _uncached = Label("", 14), _active = Label("", 14);
+    private readonly TextBlock _counts = Label("", 12), _timing = Label("", 12), _note = Label("", 12), _updated = Label("", 11);
+    private readonly TextBlock _copyLabel = Label("", 14, true);
+    private readonly Button _copyButton, _refreshButton;
+    private readonly ComboBox _themeChoice = new(), _languageChoice = new();
     private readonly DispatcherTimer _copyFeedbackTimer = new() { Interval = TimeSpan.FromSeconds(2) };
-    private DailySnapshot? _snapshot;
-    private bool _demo;
-    private bool _busy;
-    private double _weeklyPercent;
+    private readonly Expander _details;
+    private DailyPresentationState _state = new();
+    private PanelSettings _settings = new();
+    private DailyStrings _strings = new(LanguagePreference.System);
+    private DateTimeOffset _now = DateTimeOffset.Now;
+    private TimeZoneInfo _zoneInfo = TimeZoneInfo.Local;
+    private bool _demo, _updatingPreferences, _closed;
 
     public event Action? RefreshRequested;
     public event Action? FolderRequested;
     public event Action? ExitRequested;
-    public string CopyText => _snapshot is { } snapshot ? DailyFormatting.CopyText(snapshot, _demo) : "";
+    public event Action<PanelSettings>? SettingsChanged;
+    public string CopyText => DailyPresentationFormatting.Copy(_state.Project(_now, _zoneInfo), _strings, _zoneInfo, _demo);
+    public PanelSettings Settings => _settings;
 
     public DailyWindow()
     {
-        Title = "Codex Usage · Daily";
-        Width = 460;
-        Height = Math.Min(640, Math.Max(360, SystemParameters.WorkArea.Height - 30));
-        MinWidth = 360;
-        MinHeight = Math.Min(360, SystemParameters.WorkArea.Height);
-        MaxHeight = Math.Max(MinHeight, SystemParameters.WorkArea.Height - 16);
-        WindowStyle = WindowStyle.None;
-        ResizeMode = ResizeMode.NoResize;
-        AllowsTransparency = true;
-        Background = Brushes.Transparent;
-        FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI");
-        FontSize = 12;
-        Foreground = Ink;
-        UseLayoutRounding = true;
-        SnapsToDevicePixels = true;
-        ShowInTaskbar = false;
+        Width = 460; Height = 640; MinWidth = 300; MinHeight = 280;
+        WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize; AllowsTransparency = true;
+        Background = Brushes.Transparent; FontFamily = new FontFamily("Segoe UI, Microsoft YaHei UI"); FontSize = 14;
+        UseLayoutRounding = true; SnapsToDevicePixels = true; ShowInTaskbar = false; Topmost = true;
         WindowStartupLocation = WindowStartupLocation.Manual;
-        Topmost = true;
-
-        var shell = new Border
-        {
-            Margin = new Thickness(10), Background = Brushes.White, CornerRadius = new CornerRadius(18),
-            BorderBrush = Brush("#E2E6ED"), BorderThickness = new Thickness(1), Padding = new Thickness(21, 16, 21, 12),
-            Effect = new DropShadowEffect { Color = Color.FromRgb(33, 44, 66), BlurRadius = 18, ShadowDepth = 3, Opacity = .14 }
-        };
-        var layout = new DockPanel { LastChildFill = true };
-        shell.Child = layout;
+        SetResourceReference(ForegroundProperty, "Panel.Text");
+        DailyTheme.Apply(this, _settings.Theme);
+        var shell = new Border { Padding = new Thickness(16), Margin = new Thickness(8), CornerRadius = new CornerRadius(12), BorderThickness = new Thickness(1) };
+        shell.SetResourceReference(Border.BackgroundProperty, "Panel.Surface"); shell.SetResourceReference(Border.BorderBrushProperty, "Panel.Border");
         Content = shell;
-
-        var header = new StackPanel { Margin = new Thickness(0, 0, 0, 9) };
-        var heading = new Grid();
-        heading.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        heading.ColumnDefinitions.Add(new ColumnDefinition());
-        heading.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        heading.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        var histogram = new Border { Width = 31, Height = 31, CornerRadius = new CornerRadius(8), Background = Brush("#EAF2FF"), Child = Histogram() };
-        heading.Children.Add(histogram);
-        var title = Label("Codex Usage", 19, Ink, FontWeights.SemiBold);
-        title.VerticalAlignment = VerticalAlignment.Center;
-        title.Margin = new Thickness(10, 0, 0, 0);
-        Grid.SetColumn(title, 1);
-        heading.Children.Add(title);
-        _statusPill = new Border { Child = _status, Background = Brush("#F0F3F6"), CornerRadius = new CornerRadius(8), Padding = new Thickness(8, 3, 8, 3), VerticalAlignment = VerticalAlignment.Center };
-        Grid.SetColumn(_statusPill, 2);
-        heading.Children.Add(_statusPill);
-        var close = IconButton("M 4,4 L 12,12 M 12,4 L 4,12", "隐藏至托盘（Esc）", 23);
-        close.Margin = new Thickness(7, 0, -7, 0);
-        close.Background = Brushes.Transparent;
-        close.Click += (_, _) => Close();
-        Grid.SetColumn(close, 3);
-        heading.Children.Add(close);
-        header.Children.Add(heading);
-        var dateRow = new Grid { Margin = new Thickness(0, 10, 0, 0) };
-        dateRow.ColumnDefinitions.Add(new ColumnDefinition());
-        dateRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        dateRow.Children.Add(_day);
-        _zone.VerticalAlignment = VerticalAlignment.Center;
-        Grid.SetColumn(_zone, 1);
-        dateRow.Children.Add(_zone);
-        header.Children.Add(dateRow);
-        DockPanel.SetDock(header, Dock.Top);
-        layout.Children.Add(header);
+        var layout = new DockPanel(); shell.Child = layout;
+        var header = new StackPanel { Margin = new Thickness(0, 0, 0, 12) };
+        var titleRow = new DockPanel();
+        var hide = ActionButton("×", "Hide", "HidePanel"); hide.Width = 32; hide.Click += (_, _) => Close();
+        DockPanel.SetDock(hide, Dock.Right); titleRow.Children.Add(hide);
+        var title = LocalLabel("Title", 18, true); title.VerticalAlignment = VerticalAlignment.Center; titleRow.Children.Add(title); header.Children.Add(titleRow);
+        var date = new DockPanel { Margin = new Thickness(0, 8, 0, 4) }; DockPanel.SetDock(_zone, Dock.Right); date.Children.Add(_zone); date.Children.Add(_day); header.Children.Add(date);
+        var status = new WrapPanel(); status.Children.Add(Badge(_quality)); status.Children.Add(Badge(_activity)); header.Children.Add(status);
+        SetId(_quality, "DataQuality"); SetId(_activity, "UiActivity");
+        DockPanel.SetDock(header, Dock.Top); layout.Children.Add(header);
 
         var footer = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
-        footer.Children.Add(Divider());
-        var actions = new Grid { Margin = new Thickness(0, 8, 0, 8) };
-        actions.ColumnDefinitions.Add(new ColumnDefinition());
+        var actions = new Grid(); actions.ColumnDefinitions.Add(new ColumnDefinition());
         for (var i = 0; i < 3; i++) actions.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        var copyContent = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
-        copyContent.Children.Add(Glyph("M 6,5 L 6,3 Q 6,2 7,2 L 12,2 Q 13,2 13,3 L 13,10 Q 13,11 12,11 L 10,11 M 4,5 L 9,5 Q 10,5 10,6 L 10,13 Q 10,14 9,14 L 4,14 Q 3,14 3,13 L 3,6 Q 3,5 4,5 Z", Brushes.White, 15));
-        _copyLabel.Margin = new Thickness(7, 0, 0, 0);
-        copyContent.Children.Add(_copyLabel);
-        _copyButton = MakeButton(copyContent, "复制当前显示统计，包含精确 token 数和统计口径");
-        _copyButton.Background = Blue;
-        _copyButton.Foreground = Brushes.White;
-        _copyButton.IsEnabled = false;
-        _copyButton.Height = 35;
-        _copyButton.Click += (_, _) => CopyStats();
-        actions.Children.Add(_copyButton);
-        _refreshButton = IconButton("M 12.8,6 A 5.1,5.1 0 1 0 12.8,10 M 12.8,2.5 L 12.8,6.5 L 8.8,6.5", "刷新统计", 35);
-        _refreshButton.Click += (_, _) => RefreshRequested?.Invoke();
-        _refreshButton.Margin = new Thickness(8, 0, 0, 0);
-        Grid.SetColumn(_refreshButton, 1);
-        actions.Children.Add(_refreshButton);
-        var folder = IconButton("M 2,5 L 2,4 Q 2,3 3,3 L 6,3 L 7.5,5 L 13,5 Q 14,5 14,6 L 14,12 Q 14,13 13,13 L 3,13 Q 2,13 2,12 Z M 2,6 L 14,6", "打开本地 Codex 日志目录", 35);
-        folder.Margin = new Thickness(7, 0, 0, 0);
-        folder.Click += (_, _) => FolderRequested?.Invoke();
-        Grid.SetColumn(folder, 2);
-        actions.Children.Add(folder);
-        var power = IconButton("M 8,1.8 L 8,7.5 M 4.4,3.8 A 5.5,5.5 0 1 0 11.6,3.8", "退出面板", 35);
-        power.Margin = new Thickness(7, 0, 0, 0);
-        power.Click += (_, _) => ExitRequested?.Invoke();
-        Grid.SetColumn(power, 3);
-        actions.Children.Add(power);
-        footer.Children.Add(actions);
-        _updated.HorizontalAlignment = HorizontalAlignment.Center;
-        footer.Children.Add(_updated);
-        DockPanel.SetDock(footer, Dock.Bottom);
-        layout.Children.Add(footer);
+        _copyButton = ActionButton(_copyLabel, "CopyAccessible", "CopyStats"); _copyButton.Click += (_, _) => CopyStats(); actions.Children.Add(_copyButton);
+        _refreshButton = ActionButton("↻", "Refresh", "RefreshStats"); _refreshButton.Click += (_, _) => RefreshRequested?.Invoke();
+        var folder = ActionButton("▱", "Folder", "OpenLogs"); folder.Click += (_, _) => FolderRequested?.Invoke();
+        var exit = ActionButton("⏻", "Exit", "ExitPanel"); exit.Click += (_, _) => ExitRequested?.Invoke();
+        var iconButtons = new[] { _refreshButton, folder, exit };
+        for (var i = 0; i < iconButtons.Length; i++) { iconButtons[i].Width = 36; iconButtons[i].Margin = new Thickness(8,0,0,0); Grid.SetColumn(iconButtons[i], i + 1); actions.Children.Add(iconButtons[i]); }
+        footer.Children.Add(actions); _updated.Margin = new Thickness(0, 6, 0, 0); footer.Children.Add(_updated);
+        DockPanel.SetDock(footer, Dock.Bottom); layout.Children.Add(footer);
 
         var body = new StackPanel();
-        var tokenCards = new Grid();
-        tokenCards.ColumnDefinitions.Add(new ColumnDefinition());
-        tokenCards.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(10) });
-        tokenCards.ColumnDefinitions.Add(new ColumnDefinition());
-        tokenCards.Children.Add(TokenCard("Total input", _input, _inputExact, "输入 token，已包含缓存输入", "#F5F6F8"));
-        var outputCard = TokenCard("Total output", _output, _outputExact, "输出 token，已包含推理输出", "#EEF4FF");
-        Grid.SetColumn(outputCard, 2);
-        tokenCards.Children.Add(outputCard);
-        body.Children.Add(tokenCards);
-
-        var totalRow = new Grid();
-        totalRow.ColumnDefinitions.Add(new ColumnDefinition());
-        totalRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        totalRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        totalRow.Children.Add(Label("Total tokens", 11, Ink, FontWeights.SemiBold));
-        Grid.SetColumn(_total, 1);
-        totalRow.Children.Add(_total);
-        _totalExact.Margin = new Thickness(10, 0, 0, 0);
-        Grid.SetColumn(_totalExact, 2);
-        totalRow.Children.Add(_totalExact);
-        body.Children.Add(new Border
-        {
-            Child = totalRow, Padding = new Thickness(12, 4, 12, 4), Margin = new Thickness(0, 7, 0, 0),
-            Background = Brush("#F5F6F8"), CornerRadius = new CornerRadius(10),
-            ToolTip = "今日总 token = Total input + Total output；输入已包含缓存，输出已包含推理，不重复累加。"
-        });
-
-        var speedRow = new Grid { Margin = new Thickness(1, 5, 1, 6) };
-        speedRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.2, GridUnitType.Star) });
-        speedRow.ColumnDefinitions.Add(new ColumnDefinition());
-        var speed = new StackPanel { ToolTip = "估算平均 TPS：对应完成回合的输出 token ÷ 扣除首字延迟与可识别工具等待后的秒数。重叠等待只扣一次；缺少可靠首字、工具配对、时长或对账的回合不计入。仍可能包含推理、网络和调度耗时。" };
-        speed.Children.Add(Label("Average speed · est.", 11));
-        var speedValue = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 3, 0, 0) };
-        speedValue.Children.Add(_tps);
-        var unit = Label("tok/s", 13);
-        unit.VerticalAlignment = VerticalAlignment.Bottom;
-        unit.Margin = new Thickness(5, 0, 0, 5);
-        speedValue.Children.Add(unit);
-        speed.Children.Add(speedValue);
-        speedRow.Children.Add(speed);
-        var processing = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(17, 0, 0, 0), ToolTip = "与平均 TPS 使用同一组回合：整轮耗时扣除首字延迟与工具等待区间的并集。并发回合分别累计；这是日志估算值。" };
-        processing.Children.Add(Label("Net processing time", 11));
-        _processing.Margin = new Thickness(0, 8, 0, 0);
-        processing.Children.Add(_processing);
-        Grid.SetColumn(processing, 1);
-        speedRow.Children.Add(processing);
-        body.Children.Add(speedRow);
-
-        var weeklyContent = new StackPanel();
-        var weeklyHead = new Grid();
-        weeklyHead.ColumnDefinitions.Add(new ColumnDefinition());
-        weeklyHead.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        weeklyHead.Children.Add(Label("Weekly allowance", 12, Ink, FontWeights.SemiBold));
-        Grid.SetColumn(_weeklyRemaining, 1);
-        weeklyHead.Children.Add(_weeklyRemaining);
-        weeklyContent.Children.Add(weeklyHead);
-        _weeklyTrack = new Grid { Height = 4, Margin = new Thickness(0, 4, 0, 6) };
-        _weeklyTrack.Children.Add(new Border { Background = Brush("#E2E9F5"), CornerRadius = new CornerRadius(3) });
-        _weeklyFill = new Border { Background = Blue, CornerRadius = new CornerRadius(3), HorizontalAlignment = HorizontalAlignment.Left, Width = 0 };
-        _weeklyTrack.Children.Add(_weeklyFill);
-        _weeklyTrack.SizeChanged += (_, _) => UpdateWeeklyWidth();
-        weeklyContent.Children.Add(_weeklyTrack);
-        weeklyContent.Children.Add(_weeklyReset);
-        _weeklyObserved.Margin = new Thickness(0, 2, 0, 0);
-        weeklyContent.Children.Add(_weeklyObserved);
-        body.Children.Add(new Border
-        {
-            Child = weeklyContent, Padding = new Thickness(13, 8, 13, 8), Background = Brush("#F7F9FD"),
-            BorderBrush = Brush("#E9EDF5"), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(10),
-            ToolTip = "仅显示本地日志最新报告的 10080 分钟额度窗口。不是实时账号查询；超过日志报告的重置时间后不继续显示旧数值。"
-        });
-
-        var breakdownHeading = new Grid { Margin = new Thickness(0, 10, 0, 5) };
-        breakdownHeading.ColumnDefinitions.Add(new ColumnDefinition());
-        breakdownHeading.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        breakdownHeading.Children.Add(Label("BREAKDOWN", 10, Muted, FontWeights.SemiBold));
-        var counts = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-        _chats.ToolTip = "当天有统计事件的根会话数量";
-        _turns.ToolTip = "当天有统计事件的回合数量，包含运行中回合";
-        counts.Children.Add(_chats);
-        var countSeparator = Label("·", 10.5);
-        countSeparator.Margin = new Thickness(7, 0, 7, 0);
-        counts.Children.Add(countSeparator);
-        counts.Children.Add(_turns);
-        Grid.SetColumn(counts, 1);
-        breakdownHeading.Children.Add(counts);
-        body.Children.Add(breakdownHeading);
-        var details = new StackPanel();
-        details.Children.Add(DetailRow("Cache hit rate", _cached, "缓存输入 token ÷ 输入 token，按 token 加权；分母为零或任一分量未知时不计算"));
-        details.Children.Add(DetailRow("Reasoning output", _reasoning, "已包含在 Total output 中，请勿再次相加"));
-        details.Children.Add(DetailRow("Uncached input", _uncached, "Total input − Cached input；任一分量未知时保持未知"));
-        details.Children.Add(DetailRow("Active time", _active, "有效回合时间区间的并集：重叠并发时间只计一次，与处理时长之和不同"));
-        body.Children.Add(details);
-        _timingScope.Margin = new Thickness(0, 6, 0, 0);
-        body.Children.Add(_timingScope);
-        _note.Margin = new Thickness(0, 3, 0, 0);
-        _note.Visibility = Visibility.Collapsed;
-        _note.TextTrimming = TextTrimming.CharacterEllipsis;
-        body.Children.Add(_note);
-        layout.Children.Add(new ScrollViewer
-        {
-            Content = body, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-            Padding = new Thickness(0, 0, 2, 0), PanningMode = PanningMode.VerticalOnly
-        });
-
-        _copyFeedbackTimer.Tick += (_, _) => { _copyFeedbackTimer.Stop(); _copyLabel.Text = "Copy stats"; };
-        Closed += (_, _) => _copyFeedbackTimer.Stop();
-        KeyDown += (_, args) => { if (args.Key == Key.Escape) { Close(); args.Handled = true; } };
+        var totalContent = new StackPanel(); totalContent.Children.Add(LocalLabel("Total", 12)); totalContent.Children.Add(_total); totalContent.Children.Add(_totalExact);
+        body.Children.Add(Card(totalContent)); SetId(_total, "TotalTokens");
+        var tokenGrid = TwoColumns(TokenBlock("Input", _input, _inputExact), TokenBlock("Output", _output, _outputExact));
+        tokenGrid.Margin = new Thickness(0, 8, 0, 12); body.Children.Add(tokenGrid); SetId(_input,"TotalInput"); SetId(_output,"TotalOutput");
+        body.Children.Add(TwoColumns(TokenBlock("Speed", _tps, null), TokenBlock("NetTime", _processing, null)));
+        SetId(_tps,"AverageTps"); SetId(_processing,"ProcessingTime");
+        var weekly = new StackPanel(); weekly.Children.Add(LocalLabel("Weekly", 12)); weekly.Children.Add(_weekly); weekly.Children.Add(_weeklyObserved); weekly.Children.Add(_weeklyReset); weekly.Children.Add(LocalLabel("NotLive", 11));
+        var weeklyCard = Card(weekly); weeklyCard.Margin = new Thickness(0,12,0,8); body.Children.Add(weeklyCard);
+        var detailContent = new StackPanel();
+        detailContent.Children.Add(DetailRow("Cache", _cache)); detailContent.Children.Add(DetailRow("Reasoning", _reasoning));
+        detailContent.Children.Add(DetailRow("Uncached", _uncached)); detailContent.Children.Add(DetailRow("ActiveTime", _active));
+        detailContent.Children.Add(_counts); detailContent.Children.Add(_timing);
+        foreach (var key in new[] { "Scope", "Subsets", "TpsExplanation", "TpsLimit" }) { var line = LocalLabel(key, 12); line.Margin = new Thickness(0,8,0,0); detailContent.Children.Add(line); }
+        _details = new Expander { Content = detailContent, Margin = new Thickness(0,4,0,4) }; SetId(_details,"StatisticsDetails");
+        _localized.Add(s => { _details.Header=s["Details"]; AutomationProperties.SetName(_details,s["Details"]); }); body.Children.Add(_details);
+        _note.Margin = new Thickness(0,8,0,8); SetId(_note,"DataIssues"); body.Children.Add(_note);
+        var preferences = new StackPanel();
+        preferences.Children.Add(PreferenceRow("Theme", _themeChoice)); preferences.Children.Add(PreferenceRow("Language", _languageChoice));
+        foreach (var value in Enum.GetValues<ThemePreference>()) _themeChoice.Items.Add(new ComboBoxItem { Tag = value });
+        foreach (var value in Enum.GetValues<LanguagePreference>()) _languageChoice.Items.Add(new ComboBoxItem { Tag = value });
+        SetId(_themeChoice,"ThemePreference"); SetId(_languageChoice,"LanguagePreference");
+        var preferenceExpander = new Expander { Content=preferences, Margin=new Thickness(0,4,0,0) }; SetId(preferenceExpander,"Preferences");
+        _localized.Add(s => { preferenceExpander.Header=s["Settings"]; AutomationProperties.SetName(preferenceExpander,s["Settings"]); });
+        body.Children.Add(preferenceExpander);
+        var scroll = new ScrollViewer { Content=body, VerticalScrollBarVisibility=ScrollBarVisibility.Auto, HorizontalScrollBarVisibility=ScrollBarVisibility.Disabled, Padding=new Thickness(0,0,4,0), PanningMode=PanningMode.VerticalOnly };
+        SetId(scroll,"StatisticsScroll"); layout.Children.Add(scroll);
+        _themeChoice.SelectionChanged += PreferencesSelected; _languageChoice.SelectionChanged += PreferencesSelected;
+        _copyFeedbackTimer.Tick += (_,_) => { _copyFeedbackTimer.Stop(); _copyLabel.Text=_strings["Copy"]; };
+        KeyDown += (_,args) => { if(args.Key==Key.Escape) { Close(); args.Handled=true; } };
+        SystemEvents.UserPreferenceChanged += SystemPreferenceChanged;
+        Closed += (_,_) => { _closed=true; _copyFeedbackTimer.Stop(); SystemEvents.UserPreferenceChanged -= SystemPreferenceChanged; };
+        Configure(_settings);
     }
 
-    public void Update(DailySnapshot snapshot, bool demo = false)
+    public void Configure(PanelSettings settings)
     {
-        ArgumentNullException.ThrowIfNull(snapshot);
-        _snapshot = snapshot;
-        _demo = demo;
-        _day.Text = (snapshot.Day == DateOnly.FromDateTime(DateTime.Now) ? "Today · " : "")
-            + snapshot.Day.ToString("ddd, dd MMM", CultureInfo.InvariantCulture);
-        _day.ToolTip = snapshot.Day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        _zone.Text = DailyFormatting.ZoneLabel(snapshot.Day);
-        _zone.ToolTip = TimeZoneInfo.Local.DisplayName + "\n按本机时区划分当天统计";
-        SetTokens(_input, snapshot.InputTokens);
-        SetTokens(_output, snapshot.OutputTokens);
-        var total = DailyFormatting.TotalTokens(snapshot.InputTokens, snapshot.OutputTokens);
-        SetTokens(_total, total);
-        _totalExact.Text = total is >= 0 ? DailyFormatting.Exact(total) : "Exact count unavailable";
-        _totalExact.ToolTip = DailyFormatting.Exact(total) + " tokens";
-        _inputExact.Text = snapshot.InputTokens is >= 0 ? DailyFormatting.Exact(snapshot.InputTokens) + " tokens" : "Exact count unavailable";
-        _outputExact.Text = snapshot.OutputTokens is >= 0 ? DailyFormatting.Exact(snapshot.OutputTokens) + " tokens" : "Exact count unavailable";
-        _cached.Text = DailyFormatting.CacheRate(snapshot.InputTokens, snapshot.CachedInputTokens);
-        _cached.ToolTip = "缓存输入 " + DailyFormatting.Exact(snapshot.CachedInputTokens) + " tokens / 输入 " + DailyFormatting.Exact(snapshot.InputTokens) + " tokens";
-        SetTokens(_reasoning, snapshot.ReasoningTokens);
-        SetTokens(_uncached, DailyFormatting.Uncached(snapshot.InputTokens, snapshot.CachedInputTokens));
-        _reasoning.Text = snapshot.ReasoningTokens is { } reasoning ? reasoning.ToString("N0", CultureInfo.InvariantCulture) : "—";
-        _uncached.Text = DailyFormatting.Uncached(snapshot.InputTokens, snapshot.CachedInputTokens) is { } uncached ? uncached.ToString("N0", CultureInfo.InvariantCulture) : "—";
-        _tps.Text = DailyFormatting.Tps(snapshot.AverageTps);
-        _processing.Text = DailyFormatting.Duration(snapshot.ProcessingSeconds);
-        _processing.ToolTip = DailyFormatting.ExactDuration(snapshot.ProcessingSeconds);
-        _timingScope.Text = $"Root sessions · TPS: {snapshot.TimedTurnCount:N0} included / {snapshot.ExcludedTimingTurnCount:N0} excluded";
-        _timingScope.ToolTip = "仅统计本地根会话，不计子代理及云任务；输入包含缓存，输出包含推理。\n"
-            + $"估算 TPS 纳入 {snapshot.TimedTurnCount:N0} 个完成回合，排除 {snapshot.ExcludedTimingTurnCount:N0} 个。\n"
-            + "已扣首字与工具等待（区间并集）：" + DailyFormatting.ExactDuration(snapshot.ExcludedWaitSeconds)
-            + "\nTTFT 为整轮首 token 延迟，未必等同可见首字；不代表逐次模型请求的全部等待。";
-        _active.Text = DailyFormatting.Duration(snapshot.ActiveSeconds);
-        _active.ToolTip = DailyFormatting.ExactDuration(snapshot.ActiveSeconds) + "\n有效回合区间并集，重叠时间不重复计入";
-        _chats.Text = snapshot.ChatCount.ToString("N0", CultureInfo.InvariantCulture) + " chats";
-        _turns.Text = snapshot.TurnCount.ToString("N0", CultureInfo.InvariantCulture) + " turns";
-        UpdateWeekly(snapshot);
-        _note.Text = snapshot.Status;
-        _note.Visibility = snapshot.IsPartial ? Visibility.Visible : Visibility.Collapsed;
-        _note.Foreground = snapshot.IsPartial ? Brush("#A16D1C") : Muted;
-        _note.ToolTip = snapshot.Status + $"\n{snapshot.SourceCount:N0} 个本地日志来源 · {snapshot.ActiveTurns:N0} 个运行中回合";
-        _updated.Text = "Updated " + snapshot.UpdatedAt.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture)
-            + (demo ? " · Demo data" : " · Local logs");
-        _updated.ToolTip = snapshot.UpdatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz", CultureInfo.InvariantCulture)
-            + "\n" + snapshot.Status + $"\n{snapshot.SourceCount:N0} 个本地日志来源 · {snapshot.ActiveTurns:N0} 个运行中回合";
-        _copyButton.IsEnabled = true;
-        UpdateStatus();
-    }
-
-    public void SetBusy(bool busy)
-    {
-        _busy = busy;
-        _refreshButton.IsEnabled = !busy;
-        _refreshButton.ToolTip = busy ? "正在刷新本地统计…" : "刷新统计";
-        UpdateStatus();
-    }
-
-    private void UpdateStatus()
-    {
-        var partial = _snapshot?.IsPartial == true;
-        var empty = _snapshot is null || (_snapshot.SourceCount == 0 && _snapshot.InputTokens is null && _snapshot.OutputTokens is null);
-        _status.Text = _busy ? "Refreshing" : _demo ? "Demo" : partial ? "Partial" : empty ? "No data"
-            : _snapshot!.ActiveTurns > 0 ? _snapshot.ActiveTurns + " running" : "Local";
-        _status.Foreground = _demo || partial ? Brush("#A16D1C") : _busy ? Blue : empty ? Muted : Brush("#278663");
-        _statusPill.Background = _demo || partial ? Brush("#FFF5DE") : _busy ? Brush("#EAF2FF") : empty ? Brush("#F0F3F6") : Brush("#EAF7F0");
-        _statusPill.ToolTip = _demo ? "演示数据，不代表真实使用量" : _busy ? "正在读取本地日志" : partial ? "部分数据缺失或不完整，请查看下方状态" : "统计来源：本地日志";
-    }
-
-    private void UpdateWeekly(DailySnapshot snapshot)
-    {
-        if (snapshot.Weekly is not { } weekly || !double.IsFinite(weekly.UsedPercent) || weekly.UsedPercent is < 0 or > 100
-            || (weekly.ResetsAt is { } reset && reset <= snapshot.UpdatedAt))
+        ArgumentNullException.ThrowIfNull(settings);
+        _settings=settings; _strings=new(settings.Language);
+        DailyTheme.Apply(this,settings.Theme); Title=_strings["Title"];
+        foreach(var localize in _localized) localize(_strings);
+        _updatingPreferences=true;
+        try
         {
-            _weeklyPercent = 0;
-            _weeklyRemaining.Text = "No data";
-            _weeklyRemaining.Foreground = Muted;
-            _weeklyRemaining.ToolTip = "本地日志没有仍有效的周额度窗口";
-            _weeklyReset.Text = "No valid weekly snapshot";
-            _weeklyObserved.Text = "Local logs · 实时额度未查询";
+            foreach(ComboBoxItem item in _themeChoice.Items) item.Content=_strings[((ThemePreference)item.Tag).ToString()];
+            foreach(ComboBoxItem item in _languageChoice.Items) item.Content=_strings[(LanguagePreference)item.Tag switch { LanguagePreference.ZhCN=>"Chinese", LanguagePreference.EnUS=>"English", _=>"System" }];
+            _themeChoice.SelectedIndex=(int)settings.Theme; _languageChoice.SelectedIndex=(int)settings.Language;
         }
-        else
+        finally { _updatingPreferences=false; }
+        _copyLabel.Text=_strings["Copy"]; RenderState();
+    }
+    public void Update(DailySnapshot snapshot, bool demo=false)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot); _demo=demo;
+        SetState(_state with { Snapshot=snapshot, RefreshFailed=false },DateTimeOffset.Now,TimeZoneInfo.Local);
+    }
+    public void SetState(DailyPresentationState state, DateTimeOffset now, TimeZoneInfo zone)
+    {
+        ArgumentNullException.ThrowIfNull(state); ArgumentNullException.ThrowIfNull(zone);
+        _state=state; _now=now; _zoneInfo=zone; RenderState();
+    }
+    public void SetBusy(bool busy) => SetState(_state with { IsBusy=busy },DateTimeOffset.Now,_zoneInfo);
+    public void SetDemo(bool demo) { _demo=demo; RenderState(); }
+
+    private void RenderState()
+    {
+        var view=_state.Project(_now,_zoneInfo); var value=view.Snapshot;
+        var day=value?.Day ?? view.CurrentDay;
+        _day.Text=(day==view.CurrentDay ? _strings["Today"]+" · " : "")+day.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture);
+        _zone.Text=DailyPresentationFormatting.Zone(day,_zoneInfo,_strings);
+        _quality.Text=DailyPresentationFormatting.Quality(view,_strings);
+        _activity.Text=DailyPresentationFormatting.Activity(view,_strings,_demo);
+        ((UIElement)_activity.Parent).Visibility=_activity.Text.Length==0 ? Visibility.Collapsed : Visibility.Visible;
+        _quality.SetResourceReference(TextBlock.ForegroundProperty,value?.IsPartial==true || view.IsStale ? "Panel.Warning" : "Panel.Secondary");
+        Tokens(_total,_totalExact,DailyFormatting.TotalTokens(value?.InputTokens,value?.OutputTokens));
+        Tokens(_input,_inputExact,value?.InputTokens); Tokens(_output,_outputExact,value?.OutputTokens);
+        _tps.Text=DailyFormatting.Tps(value?.AverageTps); _processing.Text=DailyFormatting.Duration(value?.ProcessingSeconds);
+        _processing.ToolTip=DailyPresentationFormatting.Seconds(value?.ProcessingSeconds,_strings);
+        _cache.Text=DailyFormatting.CacheRate(value?.InputTokens,value?.CachedInputTokens);
+        _reasoning.Text=DailyPresentationFormatting.Exact(value?.ReasoningTokens,_strings);
+        _uncached.Text=DailyPresentationFormatting.Exact(DailyFormatting.Uncached(value?.InputTokens,value?.CachedInputTokens),_strings);
+        _active.Text=DailyFormatting.Duration(value?.ActiveSeconds);
+        _counts.Text=$"{_strings["Chats"]}: {value?.ChatCount ?? 0} · {_strings["Turns"]}: {value?.TurnCount ?? 0} · {_strings["ActiveTurns"]}: {DailyPresentationFormatting.Exact(view.DisplayActiveTurns,_strings)}";
+        _timing.Text=_strings.Format("Coverage",value?.TimedTurnCount ?? 0,value?.ExcludedTimingTurnCount ?? 0);
+        if(view.DisplayWeekly is { } weekly && double.IsFinite(weekly.UsedPercent) && weekly.UsedPercent is >=0 and <=100)
         {
-            _weeklyPercent = 100 - weekly.UsedPercent;
-            _weeklyRemaining.Text = _weeklyPercent.ToString("0.#", CultureInfo.InvariantCulture) + "% left";
-            _weeklyRemaining.Foreground = Blue;
-            _weeklyRemaining.ToolTip = "日志报告已用 " + weekly.UsedPercent.ToString("0.#", CultureInfo.InvariantCulture) + "%";
-            _weeklyReset.Text = weekly.ResetsAt is { } next ? "Resets " + next.ToLocalTime().ToString("ddd, dd MMM · HH:mm", CultureInfo.InvariantCulture) : "Reset time unavailable";
-            _weeklyObserved.Text = "Log snapshot · " + weekly.ObservedAt.ToLocalTime().ToString("dd MMM, HH:mm", CultureInfo.InvariantCulture);
+            _weekly.Text=_strings.Format("Remaining",(100-weekly.UsedPercent).ToString("0.#",CultureInfo.InvariantCulture));
+            _weeklyObserved.Text=_strings.Format("Observed",DailyPresentationFormatting.Stamp(weekly.ObservedAt,_zoneInfo));
+            _weeklyReset.Text=_strings.Format("Reset",weekly.ResetsAt is { } at ? DailyPresentationFormatting.Stamp(at,_zoneInfo) : _strings["Unavailable"]);
         }
-        UpdateWeeklyWidth();
+        else { _weekly.Text=_strings["NoWeekly"]; _weeklyObserved.Text=""; _weeklyReset.Text=""; }
+        _note.Text=DailyPresentationFormatting.Reasons(view,_strings); _note.Visibility=_note.Text.Length==0 ? Visibility.Collapsed : Visibility.Visible;
+        _note.SetResourceReference(TextBlock.ForegroundProperty,"Panel.Warning");
+        _updated.Text=value is null ? _strings["NotUpdated"] : _strings.Format("Updated",DailyPresentationFormatting.Stamp(value.UpdatedAt,_zoneInfo));
+        // Manual intent remains available during a read; the controller coalesces it.
+        _refreshButton.IsEnabled=!_state.IsExiting;
+        _refreshButton.ToolTip=_state.IsBusy ? _strings["RefreshPending"] : _strings["Refresh"];
+        _copyButton.IsEnabled=value is not null && !_state.IsExiting;
     }
-
-    private void UpdateWeeklyWidth() => _weeklyFill.Width = Math.Max(0, _weeklyTrack.ActualWidth * Math.Clamp(_weeklyPercent, 0, 100) / 100);
-
-    private void CopyStats()
+    private void PreferencesSelected(object sender, SelectionChangedEventArgs args)
     {
-        if (CopyText.Length == 0) return;
-        try { Clipboard.SetText(CopyText); _copyLabel.Text = "Copied"; }
-        catch (ExternalException) { _copyLabel.Text = "Copy failed"; }
-        _copyFeedbackTimer.Stop();
-        _copyFeedbackTimer.Start();
+        if(_updatingPreferences || _themeChoice.SelectedItem is not ComboBoxItem theme || _languageChoice.SelectedItem is not ComboBoxItem language) return;
+        var settings=new PanelSettings(1,(ThemePreference)theme.Tag,(LanguagePreference)language.Tag);
+        Configure(settings); SettingsChanged?.Invoke(settings);
     }
-
-    private static void SetTokens(TextBlock target, long? value)
+    private void SystemPreferenceChanged(object sender, UserPreferenceChangedEventArgs args)
     {
-        target.Text = DailyFormatting.Tokens(value);
-        target.ToolTip = DailyFormatting.Exact(value) + " tokens";
+        if(!_closed && !Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(() => { if(!_closed && _settings.Theme==ThemePreference.System) DailyTheme.Apply(this,_settings.Theme); }));
     }
-
-    private static Border TokenCard(string title, TextBlock value, TextBlock exact, string tooltip, string color)
+    public void CopyStats()
     {
-        var panel = new StackPanel();
-        panel.Children.Add(Label(title, 11));
-        value.Margin = new Thickness(0, 4, 0, 0);
-        panel.Children.Add(value);
-        exact.Margin = new Thickness(0, 1, 0, 0);
-        panel.Children.Add(exact);
-        return new Border { Child = panel, Padding = new Thickness(14, 8, 14, 8), Background = Brush(color), CornerRadius = new CornerRadius(10), ToolTip = tooltip };
+        if(_state.Snapshot is null || _state.IsExiting) return;
+        // The copy action may occur between timer ticks or after midnight while paused.
+        _now=DateTimeOffset.Now;
+        RenderState();
+        try { Clipboard.SetText(CopyText); _copyLabel.Text=_strings["Copied"]; }
+        catch(ExternalException) { _copyLabel.Text=_strings["CopyFailed"]; }
+        _copyFeedbackTimer.Stop(); _copyFeedbackTimer.Start();
     }
-
-    private static Grid DetailRow(string title, TextBlock value, string tooltip)
+    private void Tokens(TextBlock compact,TextBlock exact,long? value)
     {
-        var row = new Grid { Height = 21, ToolTip = tooltip };
-        row.ColumnDefinitions.Add(new ColumnDefinition());
-        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        row.Children.Add(Label(title, 11));
-        value.HorizontalAlignment = HorizontalAlignment.Right;
-        Grid.SetColumn(value, 1);
-        row.Children.Add(value);
-        return row;
+        compact.Text=DailyFormatting.Tokens(value); exact.Text=DailyPresentationFormatting.Exact(value,_strings);
+        compact.ToolTip=exact.Text;
     }
-
-    private static TextBlock Label(string value, double size = 12, Brush? color = null, FontWeight? weight = null) => new()
+    private FrameworkElement PreferenceRow(string key,ComboBox choice)
     {
-        Text = value, FontSize = size, Foreground = color ?? Muted, FontWeight = weight ?? FontWeights.Normal,
-        VerticalAlignment = VerticalAlignment.Center
-    };
-
-    private static Border Divider() => new() { Height = 1, Background = Hairline };
-
-    private static Button IconButton(string geometry, string tooltip, double size)
-    {
-        var button = MakeButton(Glyph(geometry, Brush("#687485"), 16), tooltip);
-        button.Width = size;
-        button.Height = size;
-        button.Padding = new Thickness(0);
-        return button;
+        choice.Margin=new Thickness(8,4,0,4); choice.MinWidth=140;
+        _localized.Add(s => AutomationProperties.SetName(choice,s[key]));
+        return TwoColumns(LocalLabel(key,12),choice);
     }
-
-    private static Button MakeButton(object content, string tooltip)
+    private FrameworkElement DetailRow(string key,TextBlock value)
     {
-        var border = new FrameworkElementFactory(typeof(Border));
-        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(7));
-        border.SetBinding(Border.BackgroundProperty, new Binding("Background") { RelativeSource = RelativeSource.TemplatedParent });
-        border.SetBinding(Border.BorderBrushProperty, new Binding("BorderBrush") { RelativeSource = RelativeSource.TemplatedParent });
-        border.SetBinding(Border.BorderThicknessProperty, new Binding("BorderThickness") { RelativeSource = RelativeSource.TemplatedParent });
-        var presenter = new FrameworkElementFactory(typeof(ContentPresenter));
-        presenter.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Center);
-        presenter.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
-        presenter.SetBinding(ContentPresenter.ContentProperty, new Binding("Content") { RelativeSource = RelativeSource.TemplatedParent });
-        presenter.SetBinding(FrameworkElement.MarginProperty, new Binding("Padding") { RelativeSource = RelativeSource.TemplatedParent });
-        border.AppendChild(presenter);
-        var template = new ControlTemplate(typeof(Button)) { VisualTree = border };
-        var hover = new Trigger { Property = IsMouseOverProperty, Value = true };
-        hover.Setters.Add(new Setter(OpacityProperty, .83));
-        template.Triggers.Add(hover);
-        var disabled = new Trigger { Property = IsEnabledProperty, Value = false };
-        disabled.Setters.Add(new Setter(OpacityProperty, .5));
-        template.Triggers.Add(disabled);
-        var button = new Button
-        {
-            Content = content, ToolTip = tooltip, Cursor = Cursors.Hand, Background = Brush("#F2F4F7"),
-            BorderThickness = new Thickness(0), Padding = new Thickness(9, 7, 9, 7), Template = template,
-            FocusVisualStyle = null
-        };
-        AutomationProperties.SetName(button, tooltip);
-        return button;
+        value.HorizontalAlignment=HorizontalAlignment.Right; var row=TwoColumns(LocalLabel(key,12),value); row.Margin=new Thickness(0,4,0,4); return row;
     }
-
-    private static ShapePath Glyph(string geometry, Brush color, double size) => new()
+    private TextBlock LocalLabel(string key,double size,bool primary=false)
     {
-        Data = Geometry.Parse(geometry), Stroke = color, StrokeThickness = 1.5, StrokeStartLineCap = PenLineCap.Round,
-        StrokeEndLineCap = PenLineCap.Round, StrokeLineJoin = PenLineJoin.Round, Stretch = Stretch.Uniform,
-        Width = size, Height = size, Margin = new Thickness(0), VerticalAlignment = VerticalAlignment.Center,
-        IsHitTestVisible = false
-    };
-
-    private static Grid Histogram()
-    {
-        var grid = new Grid { Width = 18, Height = 17, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center };
-        for (var i = 0; i < 4; i++)
-        {
-            grid.ColumnDefinitions.Add(new ColumnDefinition());
-            var bar = new Border { Background = Blue, CornerRadius = new CornerRadius(1), Width = 3, Height = new[] { 6d, 11d, 8d, 16d }[i], VerticalAlignment = VerticalAlignment.Bottom };
-            Grid.SetColumn(bar, i);
-            grid.Children.Add(bar);
-        }
-        return grid;
+        var label=Label("",size,primary); _localized.Add(s=>label.Text=s[key]); return label;
     }
-
-    private static Brush Brush(string color)
+    private Button ActionButton(object content,string key,string id)
     {
-        var value = new SolidColorBrush((Color)ColorConverter.ConvertFromString(color));
-        value.Freeze();
-        return value;
+        var button=new Button { Content=content, MinHeight=36, FontSize=16 }; SetId(button,id);
+        _localized.Add(s=>{ button.ToolTip=s[key]; AutomationProperties.SetName(button,s[key]); }); return button;
     }
-
+    private FrameworkElement TokenBlock(string key,TextBlock value,TextBlock? exact)
+    {
+        var panel=new StackPanel(); panel.Children.Add(LocalLabel(key,12)); panel.Children.Add(value); if(exact is not null) panel.Children.Add(exact); return panel;
+    }
+    private static TextBlock Label(string text,double size,bool primary=false)
+    {
+        var value=new TextBlock { Text=text, FontSize=size, TextWrapping=TextWrapping.Wrap, VerticalAlignment=VerticalAlignment.Center, FontWeight=primary ? FontWeights.SemiBold : FontWeights.Normal };
+        value.SetResourceReference(TextBlock.ForegroundProperty,primary ? "Panel.Text" : "Panel.Secondary"); return value;
+    }
+    private static Border Badge(TextBlock label)
+    {
+        var border=new Border { Child=label, Padding=new Thickness(8,4,8,4), Margin=new Thickness(0,0,8,0), CornerRadius=new CornerRadius(6) };
+        border.SetResourceReference(Border.BackgroundProperty,"Panel.Elevated"); return border;
+    }
+    private static Border Card(UIElement child)
+    {
+        var border=new Border { Child=child, Padding=new Thickness(12), CornerRadius=new CornerRadius(8) };
+        border.SetResourceReference(Border.BackgroundProperty,"Panel.Elevated"); return border;
+    }
+    private static Grid TwoColumns(UIElement first,UIElement second)
+    {
+        var grid=new Grid(); grid.ColumnDefinitions.Add(new ColumnDefinition()); grid.ColumnDefinitions.Add(new ColumnDefinition { Width=new GridLength(12) }); grid.ColumnDefinitions.Add(new ColumnDefinition());
+        grid.Children.Add(first); Grid.SetColumn(second,2); grid.Children.Add(second); return grid;
+    }
+    private static void SetId(DependencyObject target,string id) => AutomationProperties.SetAutomationId(target,id);
 }

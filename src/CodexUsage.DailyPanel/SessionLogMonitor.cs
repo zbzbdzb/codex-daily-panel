@@ -162,16 +162,24 @@ public sealed class SessionLogMonitor : IDisposable
                 requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory(), closureFacts: ClosureFacts(),
                 requestConflicts: RequestConflicts()) with { SourceCount = _sources.Count };
             var reasons = new List<string>();
-            if (!directoryFound) reasons.Add("未找到本机 Codex sessions 日志目录");
-            if (IsLoading) reasons.Add("正在读取今日统计，请稍候…");
+            var diagnostics = new List<DailyIssue>();
+            void Reason(string compatibilityReason, DailyIssue issue)
+            {
+                reasons.Add(compatibilityReason);
+                diagnostics.Add(issue);
+            }
+            if (!directoryFound) Reason("未找到本机 Codex sessions 日志目录", new(DailyIssueCodes.SourceNotFound));
+            if (IsLoading) Reason("正在读取今日统计，请稍候…", new(DailyIssueCodes.SourceLoading));
             if (_lostOversizedLine || _sources.Values.Any(source => source.OversizedLine) || activeLosses.Any(loss => !loss.PositiveResolved && loss.OversizedLine))
-                reasons.Add("部分统计或未知日志行超过 4 MiB 读取上限；当前为可读取范围");
+                Reason("部分统计或未知日志行超过 4 MiB 读取上限；当前为可读取范围",
+                    DailyIssue.With(DailyIssueCodes.SourceOversized, ("limitMiB", "4")));
             if (_lostBadStatistics || _lostReadFailed || discoveryPartial || _sources.Values.Any(source => source.ReadFailed || source.UncertainTail || source.BadStatistics)
                 || activeLosses.Any(loss => !loss.PositiveResolved && (loss.BadStatistics || loss.ReadFailed)))
-                reasons.Add("部分日志不可读取或格式不完整；当前为可读取范围");
-            if (coverageLost) reasons.Add("日志截断、替换或删除后，当日覆盖无法确认；仅显示当前可核验小计");
+                Reason("部分日志不可读取或格式不完整；当前为可读取范围", new(DailyIssueCodes.SourceUnreadable));
+            if (coverageLost) Reason("日志截断、替换或删除后，当日覆盖无法确认；仅显示当前可核验小计", new(DailyIssueCodes.CoverageLost));
             reasons.Add(snapshot.Status);
-            return snapshot with { Status = string.Join("；", reasons) };
+            diagnostics.AddRange(snapshot.Issues);
+            return snapshot with { Status = string.Join("；", reasons), Issues = diagnostics.AsReadOnly() };
         }
         finally
         {
