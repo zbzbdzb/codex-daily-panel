@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup>
+  <PropertyGroup><TargetFramework>$(CodexTargetFramework)</TargetFramework></PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
-    <!-- Reproduce frozen-core/CodexUsage.Core.dll without debug-directory data. -->
+    <!-- Product build; historical byte reproduction lives in historical/core-sdk9. -->
     <DebugType>None</DebugType>
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>

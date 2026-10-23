@@ -1,4 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><TargetFramework>net9.0</TargetFramework><RootNamespace>CodexUsage.Daily</RootNamespace></PropertyGroup>
+  <PropertyGroup><TargetFramework>$(CodexTargetFramework)</TargetFramework><RootNamespace>CodexUsage.Daily</RootNamespace></PropertyGroup>
   <ItemGroup><ProjectReference Include="../CodexUsage.Core/CodexUsage.Core.csproj" /></ItemGroup>
 </Project>

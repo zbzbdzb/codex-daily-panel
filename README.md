@@ -7,30 +7,30 @@ Windows 托盘统计面板：查看本机 Codex 今日根会话的 token 用量�
 ## 环境要求
 
 - Windows x64。
-- 构建：PowerShell 7 与固定的 .NET SDK 9.0.318，需具备 .NET / Windows Desktop targeting packs。
-- 运行：.NET 9 Windows Desktop Runtime。
+- 产品构建：PowerShell 7 与固定的 .NET SDK 10.0.402 / runtime 10.0.13；历史 Core 字节核验独立使用 SDK 9.0.318。
+- 正式自包含 win-x64 ZIP 运行时无需另装 .NET；框架依赖开发构建需要 .NET 10 Windows Desktop Runtime。
 
-项目不依赖外部 NuGet 包，`NuGet.Config` 清空包源。当前 InformationalVersion（构建信息版本）为 `0.1.0-daily.20261021-r5`；本次修复的准确版本以 Git 提交及完整构建记录为准，不能仅凭该标识或 EXE 文件名识别。
+产品没有外部应用库依赖，`NuGet.Config` 默认清空包源。v0.2.0 候选构建将完整源码提交写入版本；直接开发构建标为 `0.2.0-local`。
 
 ## 构建与分层验证
 
-在仓库根目录执行，输出目录必须尚不存在：
+先提交并保持工作区干净，再从仓库根运行；输出目录必须不存在：
 
 ```powershell
-$env:DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'
-pwsh -NoProfile -File scripts/build-daily-panel.ps1 -OutputDirectory artifacts/CodexDaily-local-win-x64
+pwsh -NoProfile -File scripts/build-daily-panel.ps1 `
+  -DotNetExecutable <SDK10-dotnet.exe> `
+  -LegacyDotNetExecutable <SDK9-dotnet.exe> `
+  -OutputDirectory <new-candidate-directory>
 ```
 
-脚本先在两个全新输出路径重建 Core，并逐字节核对冻结基准，再运行聚合、日志读取、格式和弹窗测试，生成发布目录，并针对其中的 DLL 运行合成数据驱动的 WPF 控件夹具。它在相邻的 `.verification` 目录保存构建、测试、界面渲染与文件哈希证据，最后生成 ZIP。已有交付不会被覆盖。控件夹具不替代普通 EXE 的同实例日志读取、托盘和退出验收。
+脚本从当前提交导出纯源码，在隔离环境构建完整 Release，运行所有逻辑测试、历史 Core 字节比较与候选 DLL 的 GUI harness，并保存命令、退出码、编译输入和产物哈希。默认不创建 ZIP。冻结后显式使用 `-Package -RuntimeFeed <verified-local-feed>` 才构建自包含 win-x64 归档；不会推送或发布。全部参数、清单与验证边界见 [v0.2.0 构建文档](docs/build-v020.md)。控件夹具不替代普通 EXE 的日志读取、托盘和退出验收。
 
-只检查 Core 的源码构建与字节一致性，不运行面板、业务测试或发布流程：
+历史 SDK9 验证独立运行：
 
 ```powershell
-$env:DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'
-pwsh -NoProfile -File scripts/verify-core-build.ps1 -OutputDirectory artifacts/Core-rebuild-local
+pwsh -NoProfile -File scripts/verify-core-build.ps1 `
+  -DotNetExecutable <SDK9-dotnet.exe> -OutputDirectory <new-historical-directory>
 ```
-
-该目录也必须尚不存在。源码来源、全部文件哈希、构建配置及本次实际验证结果见[Core 源码与可复现构建](docs/core-source-build.md)。
 
 ## 运行
 
@@ -72,7 +72,7 @@ TTFT 直接读取整轮日志字段，工具等待以调用与返回的时间戳
 6B3D5C61F342C68D3C356DE726341AE93DD1C7321E7384C3892D42618A363EEE
 ```
 
-恢复的 9 份原始 C# 文件在固定 SDK 和 Release 配置下可重建出与该 DLL 字节一致的产物。源码逐字节保留；Core 的 Release 配置关闭调试信息，构建核验脚本会检查两次输出及历史基准。该结论限于 Core DLL，不代表发布 ZIP、WPF 程序或其他环境的全部产物均已证明可复现。第三方参考与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 `licenses/`；其中旧集成参考的署名一并保留，不代表本面板启用那些集成。
+恢复的 9 份原始 C# 文件逐字节保留。历史 SDK9 配置隔离在 `historical/core-sdk9`，它的两次独立输出须与冻结基准逐字节一致；产品 SDK10 则从原源码重新编译，不要求新 DLL 维持旧哈希。该结论限于 Core DLL，不代表发布 ZIP、WPF 程序或其他环境的全部产物均已证明可复现。第三方参考与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 `licenses/`；其中旧集成参考的署名一并保留，不代表本面板启用那些集成。
 
 ## 验证范围
 

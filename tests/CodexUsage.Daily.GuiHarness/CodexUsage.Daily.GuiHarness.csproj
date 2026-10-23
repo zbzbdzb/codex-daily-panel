@@ -1,13 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net9.0-windows</TargetFramework>
+    <TargetFramework>$(CodexTargetFramework)-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>disable</ImplicitUsings>
     <ApplicationManifest>../../src/CodexUsage.DailyPanel/app.manifest</ApplicationManifest>
     <NoWarn>$(NoWarn);WFO0003</NoWarn>
-    <ProductDirectory Condition="'$(ProductDirectory)' == ''">../../src/CodexUsage.DailyPanel/bin/Release/net9.0-windows</ProductDirectory>
+    <ProductDirectory Condition="'$(ProductDirectory)' == ''">../../src/CodexUsage.DailyPanel/bin/Release/$(CodexTargetFramework)-windows</ProductDirectory>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="CodexDaily"><HintPath>$(ProductDirectory)/CodexDaily.dll</HintPath><Private>true</Private></Reference>
