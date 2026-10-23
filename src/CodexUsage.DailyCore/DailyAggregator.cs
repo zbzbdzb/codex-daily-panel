@@ -11,7 +11,10 @@ public static class DailyAggregator
         ISet<StatsEvent>? exclusionProof = null,
         IReadOnlyDictionary<(string Session, string Request), DateTimeOffset>? requestOrigins = null,
         IEnumerable<StartEvent>? startHistory = null,
-        IEnumerable<(string Session, string Turn, DateTimeOffset At)>? closureHistory = null)
+        IEnumerable<(string Session, string Turn, DateTimeOffset At)>? closureHistory = null,
+        IEnumerable<DailyClosureFact>? closureFacts = null,
+        IReadOnlySet<(string Session, string Request)>? requestConflicts = null,
+        ISet<(string Session, string Request)>? requestConflictProof = null)
     {
         ArgumentNullException.ThrowIfNull(events);
         ArgumentNullException.ThrowIfNull(zone);
@@ -63,7 +66,7 @@ public static class DailyAggregator
             && !string.IsNullOrWhiteSpace(x.RootTurnKey)).GroupBy(x => x.RequestKey!, StringComparer.Ordinal))
         {
             var versions = group.Distinct().OrderBy(x => x.Timestamp).ThenBy(x => x.Ordinal).ToArray();
-            var conflict = RequestConflict(versions);
+            var conflict = RequestConflict(versions) || versions.Any(x => requestConflicts?.Contains((x.SessionKey, x.RequestKey!)) == true);
             var invalid = versions.Any(x => x.Usage is null || !x.Usage.IsValid);
             var missingTime = versions.Any(x => x.Timestamp == DateTimeOffset.MinValue);
             if (conflict || invalid || missingTime)
@@ -182,6 +185,11 @@ public static class DailyAggregator
         var historicalClosedTurns = closureHistory?.Where(x => x.At != DateTimeOffset.MinValue && x.At <= now
             && !string.IsNullOrWhiteSpace(x.Session) && !string.IsNullOrWhiteSpace(x.Turn))
             .Select(x => (x.Session, x.Turn)).ToHashSet() ?? [];
+        var knownClosures = (closureFacts ?? []).Where(x => x.At != DateTimeOffset.MinValue && x.At <= now)
+            .GroupBy(x => (x.Session, x.Turn)).ToDictionary(x => x.Key, x => x.Distinct().ToArray());
+        historicalClosedTurns.UnionWith(knownClosures.Keys);
+        var knownStarts = (startHistory ?? []).Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now)
+            .GroupBy(x => (x.SessionKey, x.TurnKey)).ToDictionary(x => x.Key, x => x.Select(s => s.Timestamp).Distinct().ToArray());
         var intervals = new List<(DateTimeOffset Start, DateTimeOffset End)>();
         void AddInterval(DateTimeOffset start, DateTimeOffset finish)
         {
@@ -206,8 +214,13 @@ public static class DailyAggregator
             var relevantTurn = starts.Any(InDay) || completions.Any(x => InDay(x.Timestamp))
                 || aborts.Any(InDay) || turn.Requests.Any(x => InDay(x.OccurredAt));
             if (relevantTurn) coverageTurns?.Add((turn.Session, turn.Key));
-            var timingConflict = starts.Length > 1 || completions.Length > 1 || aborts.Length > 1
-                || (completions.Length > 0 && aborts.Length > 0);
+            var retiredClosures = knownClosures.GetValueOrDefault((turn.Session, turn.Key)) ?? [];
+            var completionCount = completions.Select(x => DailyClosureFact.From(x).Fingerprint)
+                .Concat(retiredClosures.Where(x => x.Kind == DailyClosureKind.Completed).Select(x => x.Fingerprint)).Distinct().Count();
+            var abortCount = aborts.Concat(retiredClosures.Where(x => x.Kind == DailyClosureKind.Aborted).Select(x => x.At)).Distinct().Count();
+            var startCount = starts.Concat(knownStarts.GetValueOrDefault((turn.Session, turn.Key)) ?? []).Distinct().Count();
+            var timingConflict = startCount > 1 || completionCount > 1 || abortCount > 1
+                || (completionCount > 0 && abortCount > 0);
             if (timingConflict)
             {
                 if (relevantTurn) issues.Add("回合时间事件冲突");
@@ -310,9 +323,18 @@ public static class DailyAggregator
                 .GroupBy(x => (x.SessionKey, x.RequestKey)))
             {
                 var versions = group.Distinct().OrderBy(x => x.Timestamp).ThenBy(x => x.Ordinal).ToArray();
+                if (RequestConflict(versions) || versions.Any(x => requestConflicts?.Contains((x.SessionKey, x.RequestKey!)) == true))
+                {
+                    // A contradictory identity observed in child scope may later
+                    // become root. Export its dependencies without retaining any
+                    // of their counters as historical samples.
+                    requestConflictProof?.Add((group.Key.SessionKey, group.Key.RequestKey!));
+                    foreach (var version in versions) exclusionProof.Add(version);
+                    continue;
+                }
                 if (versions.Any(x => string.IsNullOrWhiteSpace(x.SessionKey) || string.IsNullOrWhiteSpace(x.TurnKey)
                     || string.IsNullOrWhiteSpace(x.RootTurnKey) || x.Timestamp == DateTimeOffset.MinValue
-                    || x.Usage is not { IsValid: true }) || RequestConflict(versions)) continue;
+                    || x.Usage is not { IsValid: true })) continue;
                 // Same-day occurrence time also governs whether a request lies
                 // inside its turn's interval and may contribute to adjusted TPS.
                 if (versions[0].Timestamp <= now) exclusionProof.Add(versions[0]);
@@ -327,12 +349,10 @@ public static class DailyAggregator
                 && x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now))
                 if (TurnKey(closure) is { } identity && !string.IsNullOrWhiteSpace(identity.Session)
                     && !string.IsNullOrWhiteSpace(identity.Turn)) exclusionProof.Add(closure);
-            foreach (var group in rows.OfType<StartEvent>().Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now
-                && !string.IsNullOrWhiteSpace(x.SessionKey) && !string.IsNullOrWhiteSpace(x.TurnKey)).GroupBy(x => x.SessionKey))
-            {
-                var latestTime = group.Max(x => x.Timestamp);
-                foreach (var start in group.Where(x => x.Timestamp == latestTime)) exclusionProof.Add(start);
-            }
+            // Older starts may contradict another start of the same turn after a
+            // child session becomes root. Keep their ordering facts as well.
+            foreach (var start in rows.OfType<StartEvent>().Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now
+                && !string.IsNullOrWhiteSpace(x.SessionKey) && !string.IsNullOrWhiteSpace(x.TurnKey))) exclusionProof.Add(start);
         }
         if (coverageProof is not null)
         {
