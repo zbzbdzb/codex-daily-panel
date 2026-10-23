@@ -20,6 +20,36 @@ function Invoke-ExpectedFailure([string]$Label,[scriptblock]$Operation,[string]$
     Assert-BuildTest $Label ($null -ne $message -and $message.Contains($Expected))
 }
 try {
+    # Execute the product script's actual feed-validation block with a typed
+    # Package switch. This catches PowerShell's case-insensitive name binding
+    # without compiling or packaging an application.
+    $buildTokens=$null; $buildParseErrors=$null
+    $buildAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'build-daily-panel.ps1'),[ref]$buildTokens,[ref]$buildParseErrors)
+    if($buildParseErrors.Count){throw 'Build script did not parse.'}
+    $feedBlock=$buildAst.Find({param($node) $node -is [Management.Automation.Language.IfStatementAst] -and $node.Clauses[0].Item1.Extent.Text -ceq '$RuntimeFeed'},$false)
+    if($null -eq $feedBlock){throw 'Runtime-feed validation block not found.'}
+    $probeSource=Join-Path $output 'feed-probe-source'
+    $probeFeed=Join-Path $output 'feed-probe-packages'
+    [void][IO.Directory]::CreateDirectory((Join-Path $probeSource 'scripts'))
+    [void][IO.Directory]::CreateDirectory($probeFeed)
+    $probeBytes=[Text.Encoding]::UTF8.GetBytes('synthetic package bytes; not an executable or a NuGet package')
+    [IO.File]::WriteAllBytes((Join-Path $probeFeed 'synthetic.nupkg'),$probeBytes)
+    @([ordered]@{file='synthetic.nupkg';sha512Base64=[Convert]::ToBase64String([Security.Cryptography.SHA512]::HashData($probeBytes));notices=@()}) |
+        ConvertTo-Json -Depth 5 -AsArray | Set-Content -LiteralPath (Join-Path $probeSource 'scripts/runtime-packages.json') -Encoding utf8NoBOM
+    $probePrelude=@'
+param([switch]$Package,[string]$ProbeSource,[string]$ProbeFeed)
+$repository=$ProbeSource; $source=$ProbeSource; $RuntimeFeed=$ProbeFeed
+$restore=@(); $record=[ordered]@{}
+'@
+    $probeEnd=@'
+[pscustomobject]@{packageSelected=[bool]$Package;feedFiles=$record.runtimeFeedFiles.Count;restoreArguments=@($restore)}
+'@
+    $feedProbe=[scriptblock]::Create($probePrelude+[Environment]::NewLine+$feedBlock.Extent.Text+[Environment]::NewLine+$probeEnd)
+    foreach($packageEnabled in @($false,$true)){
+        $probeResult=& $feedProbe -Package:$packageEnabled -ProbeSource $probeSource -ProbeFeed $probeFeed
+        Assert-BuildTest "runtime-feed-preserves-package-switch-$packageEnabled" ($probeResult.packageSelected -eq $packageEnabled)
+        Assert-BuildTest "runtime-feed-records-input-$packageEnabled" ($probeResult.feedFiles -eq 1 -and $probeResult.restoreArguments[0] -ceq '--source')
+    }
     $keys=@('DOTNET_ROOT','DOTNET_ROOT_X64','DOTNET_MULTILEVEL_LOOKUP','DOTNET_CLI_HOME','DOTNET_GENERATE_ASPNET_CERTIFICATE','TEMP','TMP','NUGET_PACKAGES','APPDATA','LOCALAPPDATA','USERPROFILE','HOME','CODEX_HOME')
     $before=@{};foreach($key in $keys){$before[$key]=[Environment]::GetEnvironmentVariable($key,'Process')}
     $state=$null

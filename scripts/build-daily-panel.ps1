@@ -85,11 +85,11 @@ try {
         Assert-PhysicalBuildDirectory $feed
         if (-not (Test-Path -LiteralPath $feed -PathType Container)) { throw 'RuntimeFeed must be an existing physical local package directory.' }
         $pinnedPackages = Get-Content -LiteralPath (Join-Path $source 'scripts/runtime-packages.json') -Raw | ConvertFrom-Json
-        foreach ($package in $pinnedPackages) {
-            $packagePath = Join-Path $feed $package.file
+        foreach ($runtimePackage in $pinnedPackages) {
+            $packagePath = Join-Path $feed $runtimePackage.file
             $actualSha512 = [Convert]::ToBase64String([Security.Cryptography.SHA512]::HashData([IO.File]::ReadAllBytes($packagePath)))
-            if ($actualSha512 -cne $package.sha512Base64) { throw "Microsoft runtime package SHA512 mismatch: $($package.file)" }
-            foreach ($notice in $package.notices) {
+            if ($actualSha512 -cne $runtimePackage.sha512Base64) { throw "Microsoft runtime package SHA512 mismatch: $($runtimePackage.file)" }
+            foreach ($notice in $runtimePackage.notices) {
                 $actualNotice = Get-BuildFileEvidence (Join-Path $source $notice.path)
                 if ($actualNotice.sha256 -cne $notice.sha256 -or $actualNotice.bytes -ne $notice.bytes) { throw "Runtime redistribution notice mismatch: $($notice.path)" }
             }
