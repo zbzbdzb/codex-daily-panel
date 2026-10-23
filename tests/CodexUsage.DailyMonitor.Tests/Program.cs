@@ -2,6 +2,9 @@ using System.Text;
 using System.Text.Json;
 using CodexUsage.DailyPanel;
 
+if (args is ["--observed-evidence", var group]) { await ObservedEvidenceTests.RunAsync(group); return; }
+if (args is ["--monitor-disposal"]) { await MonitorDisposalTests.RunAsync(); return; }
+
 var directory = Path.Combine(Path.GetTempPath(), "CodexDaily-tests-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);
 var now = new DateTimeOffset(2026, 10, 20, 12, 0, 0, TimeSpan.FromHours(8));
@@ -63,10 +66,18 @@ try
     using var dstMonitor = new SessionLogMonitor(directory, TimeZoneInfo.FindSystemTimeZoneById("Pacific SA Standard Time"));
     var dst = await dstMonitor.RefreshAsync(new DateTimeOffset(2026, 9, 6, 12, 0, 0, TimeSpan.FromHours(-3)));
     Check(dst.InputTokens is null, "skipped midnight does not break refresh");
+    await CoverageLossTests.RunAsync();
+    await ExclusionCoverageTests.RunAsync();
+    await HistoricalDecisionTests.RunAsync();
+    await ClosureCoverageTests.RunAsync();
     await ToolTimingTests.RunAsync();
     await OversizedLineTests.RunAsync();
     EnvelopeValidatorTests.Run();
     await LifecycleHistoryTests.RunAsync();
+    await LegacyIntegrityMonitorTests.RunAsync();
+    await ObservedEvidenceTests.RunAsync();
+    await HistoricalDurationMonitorTests.RunAsync();
+    await MonitorDisposalTests.RunAsync();
     Console.WriteLine($"RESULT: {passes} passed, 0 failed");
 }
 finally { Directory.Delete(directory, true); }

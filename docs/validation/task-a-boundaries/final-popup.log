@@ -1,0 +1,27 @@
+PASS Bottom taskbar opens above
+PASS Top taskbar opens below
+PASS Left taskbar opens right
+PASS Right taskbar opens left
+PASS Bottom right clamps to work area
+PASS Right taskbar near bottom stays on its left side
+PASS Bottom taskbar near left stays above
+PASS Negative monitor origin remains negative
+PASS Inside anchor chooses nearest edge
+PASS Auto hidden taskbar cursor inside work chooses bottom
+PASS Tiny work area reduces size without escaping
+PASS Narrow work area removes impossible margins
+PASS 96 DPI physical size
+PASS 144 DPI physical size
+PASS 192 DPI physical size
+PASS 150 percent popup is placed in physical pixels
+PASS First tray click opens
+PASS Tray click while visible toggles closed
+PASS Next distinct click reopens
+PASS Tray mouse down deactivation consumes its pending click
+PASS Suppressed click does not consume the next distinct click
+PASS Outside dismissal allows next tray click immediately
+PASS Stale tray suppression expires
+PASS Ordinary dismissal clears previous suppression
+PASS Suppression includes the 500ms boundary
+PASS Clock reversal does not suppress a later click
+26/26 passed

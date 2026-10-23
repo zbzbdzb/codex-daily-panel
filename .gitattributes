@@ -1,0 +1,2 @@
+# Preserve the recovered Core source bytes and their provenance checksums.
+src/CodexUsage.Core/*.cs -text

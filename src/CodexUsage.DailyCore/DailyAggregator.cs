@@ -7,7 +7,14 @@ public static class DailyAggregator
     private static readonly TimeSpan RecentObservation = TimeSpan.FromMinutes(15);
 
     public static DailySnapshot Summarize(IEnumerable<StatsEvent> events, DateOnly day, TimeZoneInfo zone,
-        DateTimeOffset now, bool partial = false)
+        DateTimeOffset now, bool partial = false, ISet<StatsEvent>? coverageProof = null,
+        ISet<StatsEvent>? exclusionProof = null,
+        IReadOnlyDictionary<(string Session, string Request), DateTimeOffset>? requestOrigins = null,
+        IEnumerable<StartEvent>? startHistory = null,
+        IEnumerable<(string Session, string Turn, DateTimeOffset At)>? closureHistory = null,
+        IEnumerable<DailyClosureFact>? closureFacts = null,
+        IReadOnlySet<(string Session, string Request)>? requestConflicts = null,
+        ISet<(string Session, string Request)>? requestConflictProof = null)
     {
         ArgumentNullException.ThrowIfNull(events);
         ArgumentNullException.ThrowIfNull(zone);
@@ -59,7 +66,7 @@ public static class DailyAggregator
             && !string.IsNullOrWhiteSpace(x.RootTurnKey)).GroupBy(x => x.RequestKey!, StringComparer.Ordinal))
         {
             var versions = group.Distinct().OrderBy(x => x.Timestamp).ThenBy(x => x.Ordinal).ToArray();
-            var conflict = RequestConflict(versions);
+            var conflict = RequestConflict(versions) || versions.Any(x => requestConflicts?.Contains((x.SessionKey, x.RequestKey!)) == true);
             var invalid = versions.Any(x => x.Usage is null || !x.Usage.IsValid);
             var missingTime = versions.Any(x => x.Timestamp == DateTimeOffset.MinValue);
             if (conflict || invalid || missingTime)
@@ -75,6 +82,8 @@ public static class DailyAggregator
             // arrival time must neither move it to another day nor outside its turn.
             // Keep latest counters separately, with their original revision ordering.
             var evidence = versions[0];
+            var coverageEvidence = versions[0];
+            var coverageHistory = new List<UsageEvent> { versions[0] };
             foreach (var version in versions.Skip(1))
             {
                 // Exact replays must not promote an intermediate cumulative snapshot
@@ -82,16 +91,33 @@ public static class DailyAggregator
                 // correction advances evidence order; a thread-only change does not.
                 if (version.Usage != evidence.Usage || version.TurnSnapshot != evidence.TurnSnapshot)
                     evidence = version;
+                // Aggregate legacy coverage also depends on the thread snapshot.
+                // Keep its revision order separate from unchanged TPS evidence.
+                if (!SamePayload(version, coverageEvidence))
+                {
+                    coverageEvidence = version;
+                    coverageHistory.Add(version);
+                }
             }
-            accepted.Add(new(selected, versions[0].Timestamp, evidence));
+            var occurredAt = versions[0].Timestamp;
+            // A remembered identity/date is a classification fact, not an old token
+            // sample. Current counters still come exclusively from selected.
+            if (requestOrigins is not null && requestOrigins.TryGetValue((selected.SessionKey, selected.RequestKey!), out var origin) && origin < occurredAt)
+                occurredAt = origin;
+            accepted.Add(new(selected, occurredAt, evidence, coverageEvidence, versions[0].Ordinal, [.. coverageHistory]));
         }
 
         var dayRequests = accepted.Where(x => InDay(x.OccurredAt)).ToArray();
         TokenVector? totals = dayRequests.Length == 0 ? null : Sum(dayRequests);
         if (dayRequests.Any(x => !x.Latest.Usage!.IsComplete)) issues.Add("部分 token 字段未提供");
         if (totals is { IsComplete: false } && dayRequests.All(x => x.Latest.Usage!.IsComplete)) issues.Add("累计数值超出范围");
-        var legacyOnly = dayRequests.Length == 0 && today.OfType<UsageEvent>().Any(x => x.Legacy);
-        if (legacyOnly) issues.Add("仅有旧格式快照，不能还原今日请求");
+        var legacy = today.OfType<UsageEvent>().Where(x => x.Legacy).ToArray();
+        if (legacy.Length > 0)
+        {
+            var covered = BuildLegacyCoverage(accepted);
+            if (legacy.Any(x => !LegacyCovered(x, covered)))
+                issues.Add("旧格式快照覆盖关系未知，无法还原全部今日用量");
+        }
         // Revision arrival alone is not a new daily chat or turn. Lifecycle rows
         // and legacy snapshots establish observed chat/turn presence on their own
         // event dates; modern usage follows its request occurrence. Legacy presence
@@ -141,14 +167,29 @@ public static class DailyAggregator
             }
         }
         foreach (var request in accepted) Get(request.Latest.SessionKey, request.Latest.TurnKey!).Requests.Add(request);
-        var lastStarts = observed.OfType<StartEvent>().GroupBy(x => x.SessionKey)
-            .ToDictionary(x => x.Key, x =>
+        Dictionary<string, (DateTimeOffset At, string? Key)> LatestStarts(IEnumerable<StartEvent> values, bool reportConflicts) =>
+            values.GroupBy(x => x.SessionKey).ToDictionary(x => x.Key, x =>
             {
                 var timestamp = x.Max(start => start.Timestamp);
                 var keys = x.Where(start => start.Timestamp == timestamp).Select(start => start.TurnKey).Distinct().ToArray();
-                if (keys.Length > 1 && InDay(timestamp)) issues.Add("当前回合启动关系冲突");
+                if (reportConflicts && keys.Length > 1 && InDay(timestamp)) issues.Add("当前回合启动关系冲突");
                 return (At: timestamp, Key: keys.Length == 1 ? keys[0] : null);
             }, StringComparer.Ordinal);
+        var rawLastStarts = LatestStarts(observed.OfType<StartEvent>(), true);
+        // Retired starts constrain ordering and timing eligibility. They never create a turn,
+        // an interval, or a replacement completion duration in the current view.
+        var lastStarts = startHistory is null ? rawLastStarts : LatestStarts(observed.OfType<StartEvent>()
+            .Concat(startHistory.Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now)), false);
+        // A retired closure may disqualify activity, but cannot supply an old
+        // completion, duration, TTFT or interval to the current statistics.
+        var historicalClosedTurns = closureHistory?.Where(x => x.At != DateTimeOffset.MinValue && x.At <= now
+            && !string.IsNullOrWhiteSpace(x.Session) && !string.IsNullOrWhiteSpace(x.Turn))
+            .Select(x => (x.Session, x.Turn)).ToHashSet() ?? [];
+        var knownClosures = (closureFacts ?? []).Where(x => x.At != DateTimeOffset.MinValue && x.At <= now)
+            .GroupBy(x => (x.Session, x.Turn)).ToDictionary(x => x.Key, x => x.Distinct().ToArray());
+        historicalClosedTurns.UnionWith(knownClosures.Keys);
+        var knownStarts = (startHistory ?? []).Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now)
+            .GroupBy(x => (x.SessionKey, x.TurnKey)).ToDictionary(x => x.Key, x => x.Select(s => s.Timestamp).Distinct().ToArray());
         var intervals = new List<(DateTimeOffset Start, DateTimeOffset End)>();
         void AddInterval(DateTimeOffset start, DateTimeOffset finish)
         {
@@ -164,6 +205,7 @@ public static class DailyAggregator
         var timedTurns = 0;
         var unavailableTiming = 0;
         var active = 0;
+        var coverageTurns = coverageProof is null ? null : new HashSet<(string Session, string Turn)>();
         foreach (var turn in turns.Values)
         {
             var starts = turn.Starts.Distinct().Order().ToArray();
@@ -171,8 +213,14 @@ public static class DailyAggregator
             var aborts = turn.Aborts.Distinct().Order().ToArray();
             var relevantTurn = starts.Any(InDay) || completions.Any(x => InDay(x.Timestamp))
                 || aborts.Any(InDay) || turn.Requests.Any(x => InDay(x.OccurredAt));
-            var timingConflict = starts.Length > 1 || completions.Length > 1 || aborts.Length > 1
-                || (completions.Length > 0 && aborts.Length > 0);
+            if (relevantTurn) coverageTurns?.Add((turn.Session, turn.Key));
+            var retiredClosures = knownClosures.GetValueOrDefault((turn.Session, turn.Key)) ?? [];
+            var completionCount = completions.Select(x => DailyClosureFact.From(x).Fingerprint)
+                .Concat(retiredClosures.Where(x => x.Kind == DailyClosureKind.Completed).Select(x => x.Fingerprint)).Distinct().Count();
+            var abortCount = aborts.Concat(retiredClosures.Where(x => x.Kind == DailyClosureKind.Aborted).Select(x => x.At)).Distinct().Count();
+            var startEvidence = starts.Concat(knownStarts.GetValueOrDefault((turn.Session, turn.Key)) ?? []).Distinct().ToArray();
+            var timingConflict = startEvidence.Length > 1 || completionCount > 1 || abortCount > 1
+                || (completionCount > 0 && abortCount > 0);
             if (timingConflict)
             {
                 if (relevantTurn) issues.Add("回合时间事件冲突");
@@ -190,10 +238,17 @@ public static class DailyAggregator
                 // A log start is only an observation, not proof the process is alive.
                 // Require the latest start in its root session and a short age limit.
                 if (explicitStart is { } began && InDay(now) && now - began <= RecentObservation
-                    && lastStarts.TryGetValue(turn.Session, out var latest) && began == latest.At && turn.Key == latest.Key)
+                    && rawLastStarts.TryGetValue(turn.Session, out var rawLatest) && began == rawLatest.At && turn.Key == rawLatest.Key)
                 {
-                    active++;
-                    AddInterval(began, now);
+                    if (historicalClosedTurns.Contains((turn.Session, turn.Key)))
+                        issues.Add("历史回合闭合依据缺失，活动状态无法确认");
+                    else if (lastStarts.TryGetValue(turn.Session, out var latest) && began == latest.At && turn.Key == latest.Key)
+                    {
+                        coverageTurns?.Add((turn.Session, turn.Key));
+                        active++;
+                        AddInterval(began, now);
+                    }
+                    else issues.Add("历史回合启动依据缺失，活动状态无法确认");
                 }
                 continue;
             }
@@ -213,8 +268,10 @@ public static class DailyAggregator
             // independent evidence for the same turn. Allow modest write/scheduling
             // skew, but never use a grossly shorter duration to inflate throughput.
             // The larger of one second and five percent is deliberately symmetric.
-            var durationMismatch = explicitStart is { } loggedStart && duration is { } declared
-                && Math.Abs((completed.Timestamp - loggedStart).TotalMilliseconds - declared)
+            // A retained start can still disprove the declared duration after its
+            // source disappears. It is not an explicitStart or an interval source.
+            var durationMismatch = startEvidence.Length == 1 && duration is { } declared
+                && Math.Abs((completed.Timestamp - startEvidence[0]).TotalMilliseconds - declared)
                     > Math.Max(1000d, declared * .05d);
             if (durationMismatch) issues.Add("回合声明耗时与起止时间不一致");
             var reconciliation = Reconcile(turn.Requests, rejectedTurns.Contains((turn.Session, turn.Key)));
@@ -257,6 +314,91 @@ public static class DailyAggregator
         if (issues.Count > 0) status += "；统计不完整：" + string.Join("、", issues.Order(StringComparer.Ordinal));
         var weekly = LatestWeekly(rows.OfType<QuotaEvent>(), now, out var multipleWeekly);
         if (multipleWeekly) status += "；日志报告多个独立周额度窗口，未合并显示";
+        if (exclusionProof is not null)
+        {
+            // These dependencies can be dormant: a request's first occurrence,
+            // a child relation, or historical timing may govern later input today.
+            // The caller retains only identity/date/scope facts and replay hashes.
+            // Today's child/unknown scope may later become root. Classification
+            // dependencies therefore come from raw identities, before Root filters.
+            foreach (var group in rows.OfType<UsageEvent>().Where(x => !x.Legacy && !string.IsNullOrWhiteSpace(x.RequestKey))
+                .GroupBy(x => (x.SessionKey, x.RequestKey)))
+            {
+                var versions = group.Distinct().OrderBy(x => x.Timestamp).ThenBy(x => x.Ordinal).ToArray();
+                if (RequestConflict(versions) || versions.Any(x => requestConflicts?.Contains((x.SessionKey, x.RequestKey!)) == true))
+                {
+                    // A contradictory identity observed in child scope may later
+                    // become root. Export its dependencies without retaining any
+                    // of their counters as historical samples.
+                    requestConflictProof?.Add((group.Key.SessionKey, group.Key.RequestKey!));
+                    foreach (var version in versions) exclusionProof.Add(version);
+                    continue;
+                }
+                if (versions.Any(x => string.IsNullOrWhiteSpace(x.SessionKey) || string.IsNullOrWhiteSpace(x.TurnKey)
+                    || string.IsNullOrWhiteSpace(x.RootTurnKey) || x.Timestamp == DateTimeOffset.MinValue
+                    || x.Usage is not { IsValid: true })) continue;
+                // Same-day occurrence time also governs whether a request lies
+                // inside its turn's interval and may contribute to adjusted TPS.
+                if (versions[0].Timestamp <= now) exclusionProof.Add(versions[0]);
+            }
+            foreach (var group in rows.OfType<MetadataEvent>().Where(x => children.Contains(x.SessionKey)).GroupBy(x => x.SessionKey))
+            {
+                var latestTime = group.Max(x => x.Timestamp);
+                foreach (var metadata in group.Where(x => x.Timestamp == latestTime)) exclusionProof.Add(metadata);
+            }
+            foreach (var timing in rows.Where(x => x is DailyToolEvent or DailyTimingUnavailableEvent)) exclusionProof.Add(timing);
+            foreach (var closure in rows.Where(x => x is CompletionEvent or DailyTurnAbortedEvent
+                && x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now))
+                if (TurnKey(closure) is { } identity && !string.IsNullOrWhiteSpace(identity.Session)
+                    && !string.IsNullOrWhiteSpace(identity.Turn)) exclusionProof.Add(closure);
+            // Older starts may contradict another start of the same turn after a
+            // child session becomes root. Keep their ordering facts as well.
+            foreach (var start in rows.OfType<StartEvent>().Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now
+                && !string.IsNullOrWhiteSpace(x.SessionKey) && !string.IsNullOrWhiteSpace(x.TurnKey))) exclusionProof.Add(start);
+        }
+        if (coverageProof is not null)
+        {
+            // Export proof dependencies from the same projection that produced the
+            // statistics. Independent prior-day requests and no-op arrival copies
+            // are not today's coverage; original occurrence/revision evidence is.
+            var legacySessions = legacy.Select(x => x.SessionKey).ToHashSet(StringComparer.Ordinal);
+            foreach (var request in accepted.Where(x => InDay(x.OccurredAt) || legacySessions.Contains(x.Latest.SessionKey)
+                || coverageTurns!.Contains((x.Latest.SessionKey, x.Latest.TurnKey!))))
+                foreach (var evidence in request.CoverageHistory) coverageProof.Add(evidence);
+            var acceptedKeys = accepted.Select(x => x.Latest.RequestKey!).ToHashSet(StringComparer.Ordinal);
+            foreach (var group in modern.Where(x => x.RequestKey is not null && !acceptedKeys.Contains(x.RequestKey)).GroupBy(x => x.RequestKey))
+                if (group.Any(Relevant)) foreach (var evidence in group) coverageProof.Add(evidence);
+            foreach (var row in rows.Where(x => x is not (MetadataEvent or QuotaEvent)))
+            {
+                if (!Root(row))
+                {
+                    if (!children.Contains(row.SessionKey) && Relevant(row)) coverageProof.Add(row);
+                    continue;
+                }
+                if (row is UsageEvent { Legacy: false } usage)
+                {
+                    if (usage.RequestKey is null && Relevant(usage)) coverageProof.Add(row);
+                    continue;
+                }
+                var turn = row switch
+                {
+                    DailyToolEvent tool => tool.TurnKey is { } key ? (tool.SessionKey, key) : ((string, string)?)null,
+                    DailyTimingUnavailableEvent timing => timing.TurnKey is { } key ? (timing.SessionKey, key) : ((string, string)?)null,
+                    _ => TurnKey(row)
+                };
+                if (Relevant(row) || turn is { } keyTurn && coverageTurns!.Contains(keyTurn)
+                    || (row is DailyTimingUnavailableEvent missing && string.IsNullOrWhiteSpace(missing.TurnKey)
+                        || row is DailyToolEvent unpaired && string.IsNullOrWhiteSpace(unpaired.TurnKey))
+                        && coverageTurns!.Any(x => x.Session == row.SessionKey))
+                    coverageProof.Add(row);
+            }
+            var sessions = coverageProof.Select(x => x.SessionKey).ToHashSet(StringComparer.Ordinal);
+            foreach (var group in rows.OfType<MetadataEvent>().Where(x => sessions.Contains(x.SessionKey)).GroupBy(x => x.SessionKey))
+            {
+                var latestTime = group.Max(x => x.Timestamp);
+                foreach (var metadata in group.Where(x => x.Timestamp == latestTime)) coverageProof.Add(metadata);
+            }
+        }
         return new(day, now, totals?.Input, totals?.CachedInput, totals?.Output, totals?.ReasoningOutput,
             timedTurns > 0 ? (double)(processingMs / 1000m) : null, UnionSeconds(intervals),
             timedTurns > 0 ? (double)(matchedOutput / (processingMs / 1000m)) : null,
@@ -278,7 +420,143 @@ public static class DailyAggregator
         public List<AcceptedRequest> Requests { get; } = [];
     }
 
-    private sealed record AcceptedRequest(UsageEvent Latest, DateTimeOffset OccurredAt, UsageEvent SnapshotEvidence);
+    private sealed record AcceptedRequest(UsageEvent Latest, DateTimeOffset OccurredAt, UsageEvent SnapshotEvidence,
+        UsageEvent CoverageEvidence, long? FirstOrdinal, UsageEvent[] CoverageHistory);
+
+    private sealed record LegacyCheckpoint(UsageEvent Evidence, long? PrefixMaxKnownOrdinal);
+
+    private sealed class LegacyCheckpoints
+    {
+        public LegacyCheckpoint? KnownOrdinal { get; private set; }
+        public LegacyCheckpoint? UnknownOrdinal { get; private set; }
+
+        public void Include(UsageEvent checkpoint, long? prefixMaxKnownOrdinal)
+        {
+            // Both position and the prefix's known ordinal bound must survive a
+            // later missing ordinal. Missing evidence never erases a contradiction.
+            if (checkpoint.Ordinal.HasValue) KnownOrdinal ??= new(checkpoint, prefixMaxKnownOrdinal);
+            else UnknownOrdinal ??= new(checkpoint, prefixMaxKnownOrdinal);
+        }
+
+        public bool Covers(UsageEvent legacy)
+        {
+            bool Matches(LegacyCheckpoint? checkpoint) => checkpoint is { } value
+                && !(value.PrefixMaxKnownOrdinal > legacy.Ordinal)
+                && AtOrBefore(value.Evidence.Timestamp, value.Evidence.Ordinal, legacy.Timestamp, legacy.Ordinal) == true;
+            return Matches(KnownOrdinal) || Matches(UnknownOrdinal);
+        }
+    }
+
+    private static bool LegacyCovered(UsageEvent legacy,
+        Dictionary<(string Session, string Turn, TokenVector Snapshot), LegacyCheckpoints> covered)
+    {
+        // The frozen parser supplies no native legacy request/turn identity. A
+        // contextual turn constrains scope; it does not turn last_token_usage
+        // into a request. Only a fully reconciled cumulative checkpoint can
+        // prove aggregate coverage, and no legacy value enters the sum.
+        if (string.IsNullOrWhiteSpace(legacy.TurnKey)
+            || legacy.Usage is not { IsComplete: true, IsValid: true } last
+            || legacy.ThreadSnapshot is not { IsComplete: true, IsValid: true } snapshot
+            || last.Input > snapshot.Input || last.CachedInput > snapshot.CachedInput
+            || last.Output > snapshot.Output || last.ReasoningOutput > snapshot.ReasoningOutput
+            || last.Total > snapshot.Total) return false;
+
+        return covered.TryGetValue((legacy.SessionKey, legacy.TurnKey, snapshot), out var checkpoints)
+            && checkpoints.Covers(legacy);
+    }
+
+    private static Dictionary<(string Session, string Turn, TokenVector Snapshot), LegacyCheckpoints> BuildLegacyCoverage(
+        List<AcceptedRequest> accepted)
+    {
+        var covered = new Dictionary<(string Session, string Turn, TokenVector Snapshot), LegacyCheckpoints>();
+        foreach (var session in accepted.GroupBy(x => x.Latest.SessionKey))
+        {
+            // Sweep final meaningful revisions once. A still-pending request
+            // whose first occurrence belongs to this prefix makes it unknown;
+            // its revised counters must not be backdated into the checkpoint.
+            var ordered = session.OrderBy(x => x.CoverageEvidence.Timestamp).ThenBy(x => x.CoverageEvidence.Ordinal).ToArray();
+            var pendingFirst = new AcceptedRequest?[ordered.Length + 1];
+            var pendingOrdinal = new long?[ordered.Length + 1];
+            for (var i = ordered.Length - 1; i >= 0; i--)
+            {
+                var next = pendingFirst[i + 1];
+                var request = ordered[i];
+                pendingFirst[i] = next is null || request.OccurredAt < next.OccurredAt
+                    || (request.OccurredAt == next.OccurredAt && Nullable.Compare(request.FirstOrdinal, next.FirstOrdinal) < 0)
+                    ? request : next;
+                pendingOrdinal[i] = request.FirstOrdinal is { } ordinal
+                    ? Math.Min(ordinal, pendingOrdinal[i + 1] ?? long.MaxValue) : pendingOrdinal[i + 1];
+            }
+            var firstTimes = session.GroupBy(x => x.OccurredAt)
+                .ToDictionary(x => x.Key, x => (Count: x.Count(), MissingOrdinal: x.Count(r => r.FirstOrdinal is null)));
+            var revisionTimes = session.GroupBy(x => x.CoverageEvidence.Timestamp)
+                .ToDictionary(x => x.Key, x => (Count: x.Count(), MissingOrdinal: x.Count(r => r.CoverageEvidence.Ordinal is null)));
+            // Preserve ordering evidence from every meaningful version, including
+            // intermediate corrections. Replays do not become new positions.
+            var history = session.SelectMany(x => x.CoverageHistory)
+                .OrderBy(x => x.Timestamp).ThenBy(x => x.Ordinal).ToArray();
+            var historyIndex = 0;
+            long? maxHistoryOrdinal = null;
+            var historyConflict = false;
+            var total = TokenVector.Zero;
+            long? maxFirstOrdinal = null, maxRevisionOrdinal = null;
+            for (var index = 0; index < ordered.Length;)
+            {
+                var evidence = ordered[index].CoverageEvidence;
+                var end = index;
+                while (end < ordered.Length && ordered[end].CoverageEvidence.Timestamp == evidence.Timestamp
+                    && ordered[end].CoverageEvidence.Ordinal == evidence.Ordinal)
+                {
+                    var request = ordered[end++];
+                    total += request.Latest.Usage!;
+                    if (request.FirstOrdinal is { } first) maxFirstOrdinal = Math.Max(first, maxFirstOrdinal ?? long.MinValue);
+                    if (request.CoverageEvidence.Ordinal is { } revision) maxRevisionOrdinal = Math.Max(revision, maxRevisionOrdinal ?? long.MinValue);
+                }
+                while (historyIndex < history.Length && (history[historyIndex].Timestamp < evidence.Timestamp
+                    || (history[historyIndex].Timestamp == evidence.Timestamp
+                        && Nullable.Compare(history[historyIndex].Ordinal, evidence.Ordinal) <= 0)))
+                {
+                    if (history[historyIndex++].Ordinal is not { } ordinal) continue;
+                    historyConflict |= maxHistoryOrdinal > ordinal;
+                    maxHistoryOrdinal = Math.Max(ordinal, maxHistoryOrdinal ?? long.MinValue);
+                }
+                var pending = pendingFirst[end];
+                var completePrefix = total.IsComplete && total.IsValid && !historyConflict
+                    && (pending is null || AtOrBefore(pending.OccurredAt, pending.FirstOrdinal, evidence.Timestamp, evidence.Ordinal) == false)
+                    && !(pendingOrdinal[end] < maxHistoryOrdinal)
+                    && !(evidence.Ordinal is { } boundary && (maxFirstOrdinal > boundary
+                        || maxRevisionOrdinal > boundary || pendingOrdinal[end] < boundary));
+                var revisionsAtTime = revisionTimes[evidence.Timestamp];
+                completePrefix &= revisionsAtTime.Count == 1 || revisionsAtTime.MissingOrdinal == 0;
+                for (var i = index; completePrefix && i < end; i++)
+                {
+                    var request = ordered[i];
+                    var checkpoint = request.CoverageEvidence;
+                    var firstAtTime = firstTimes.GetValueOrDefault(evidence.Timestamp);
+                    if (evidence.Ordinal.HasValue ? firstAtTime.MissingOrdinal > 0
+                        : firstAtTime.Count > (request.OccurredAt == evidence.Timestamp ? 1 : 0)) continue;
+                    if (checkpoint.ThreadSnapshot is { IsComplete: true, IsValid: true } snapshot && snapshot == total
+                        && !string.IsNullOrWhiteSpace(checkpoint.TurnKey))
+                    {
+                        var key = (session.Key, checkpoint.TurnKey, snapshot);
+                        if (!covered.TryGetValue(key, out var checkpoints)) covered.Add(key, checkpoints = new());
+                        checkpoints.Include(checkpoint, maxHistoryOrdinal);
+                    }
+                }
+                index = end;
+            }
+        }
+        return covered;
+    }
+
+    private static bool? AtOrBefore(DateTimeOffset at, long? ordinal, DateTimeOffset boundary, long? boundaryOrdinal)
+    {
+        if (at == boundary)
+            return ordinal is { } same && boundaryOrdinal is { } other ? same <= other : null;
+        if (ordinal is { } known && boundaryOrdinal is { } limit
+            && (at < boundary ? known > limit : known < limit)) return null;
+        return at < boundary;
+    }
 
     private static (string Session, string Turn)? TurnKey(StatsEvent row) => row switch
     {

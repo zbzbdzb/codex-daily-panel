@@ -1,0 +1,3 @@
+# Preserve captured bytes and recognize original Windows line endings.
+* -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+capture-run.ps1.txt whitespace=blank-at-eol,-blank-at-eof,space-before-tab,cr-at-eol

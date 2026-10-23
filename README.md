@@ -7,31 +7,41 @@ Windows 托盘统计面板：查看本机 Codex 今日根会话的 token 用量�
 ## 环境要求
 
 - Windows x64。
-- 构建：PowerShell 7 与 .NET SDK 9.0.318（允许同系列更新补丁），需具备 .NET / Windows Desktop targeting packs。
+- 构建：PowerShell 7 与固定的 .NET SDK 9.0.318，需具备 .NET / Windows Desktop targeting packs。
 - 运行：.NET 9 Windows Desktop Runtime。
 
-项目不依赖外部 NuGet 包，`NuGet.Config` 清空包源。当前版本为 `0.1.0-daily.20261021-r5`。
+项目不依赖外部 NuGet 包，`NuGet.Config` 清空包源。当前 InformationalVersion（构建信息版本）为 `0.1.0-daily.20261021-r5`；本次修复的准确版本以 Git 提交及完整构建记录为准，不能仅凭该标识或 EXE 文件名识别。
 
-## 构建与完整验证
+## 构建与分层验证
 
 在仓库根目录执行，输出目录必须尚不存在：
 
 ```powershell
+$env:DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'
 pwsh -NoProfile -File scripts/build-daily-panel.ps1 -OutputDirectory artifacts/CodexDaily-local-win-x64
 ```
 
-脚本运行聚合、日志读取、格式和弹窗测试，再发布程序，并针对发布后的 DLL 运行真实 WPF 控件验收。它在相邻的 `.verification` 目录保存测试、界面渲染与文件哈希证据，最后生成 ZIP。已有交付不会被覆盖。
+脚本先在两个全新输出路径重建 Core，并逐字节核对冻结基准，再运行聚合、日志读取、格式和弹窗测试，生成发布目录，并针对其中的 DLL 运行合成数据驱动的 WPF 控件夹具。它在相邻的 `.verification` 目录保存构建、测试、界面渲染与文件哈希证据，最后生成 ZIP。已有交付不会被覆盖。控件夹具不替代普通 EXE 的同实例日志读取、托盘和退出验收。
+
+只检查 Core 的源码构建与字节一致性，不运行面板、业务测试或发布流程：
+
+```powershell
+$env:DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'
+pwsh -NoProfile -File scripts/verify-core-build.ps1 -OutputDirectory artifacts/Core-rebuild-local
+```
+
+该目录也必须尚不存在。源码来源、全部文件哈希、构建配置及本次实际验证结果见[Core 源码与可复现构建](docs/core-source-build.md)。
 
 ## 运行
 
-解压 ZIP，运行 `CodexDaily.exe`。默认读取 `CODEX_HOME` 下的 `sessions` 和 `archived_sessions`；未设置时使用用户目录的 `.codex`。
+解压 ZIP，运行 `CodexDaily.exe`。路径优先级为显式 `--codex-home`、非空白的 `CODEX_HOME`、用户目录的 `.codex`；读取选定目录下的 `sessions` 和 `archived_sessions`。
 
 ```powershell
 ./CodexDaily.exe --codex-home <目录>
 ./CodexDaily.exe --demo
 ```
 
-面板提供复制统计、刷新、打开日志目录和退出操作，每 10 秒自动刷新。详细参数见[使用说明](docs/daily-panel-usage.md)。
+面板提供复制统计、刷新、打开日志目录和退出操作，通常每 10 秒自动刷新，读取积压时每秒继续。托盘菜单的暂停只停止自动触发，不取消在途刷新；手动刷新仍可用，恢复会请求刷新。隔离验收应显式指定仅含合成日志的新目录。详细参数、容量和历史证据边界见[使用说明](docs/daily-panel-usage.md)。
 
 ## TPS 口径
 
@@ -50,18 +60,20 @@ TTFT 直接读取整轮日志字段，工具等待以调用与返回的时间戳
 
 仅统计本机日志中可识别的根会话，不汇总子代理、云任务、其他机器或账号完整账单。周额度是本地日志中的历史快照。
 
-程序只读打开日志，只保留允许的数值、时间戳和哈希身份，不读取认证文件、不进行账号查询、不保存聊天正文或工具参数/输出，也不写回 Codex。仓库不包含真实日志、快照、认证配置或本机诊断证据。
+程序只读打开日志，只保留允许的数值、时间戳和哈希身份，不读取认证文件、不进行账号查询、不保存聊天正文或工具参数/输出，也不写回 Codex。仓库包含合成测试输入、执行记录及部分本地路径和环境信息；产品的只读行为与这些验证材料的内容分别核对。
 
-## 冻结引擎依赖
+未知统计显示 `—`，已知为零才显示 `0`。`No data` 不代表没有用量；`Partial=false` 只表示当前可见范围没有触发对应完整性提示，不能证明账号账单完整。历史证据只在当前 monitor 实例中保留，无法识别启动前已经丢失的全部来源。
 
-构建使用仓库内的 `frozen-core/CodexUsage.Core.dll`，SHA-256：
+## Core 源码与冻结基准
+
+面板和合成测试通过 `ProjectReference` 编译仓库内的 `src/CodexUsage.Core`。`frozen-core/CodexUsage.Core.dll` 保留为不变的历史核对基准，SHA-256：
 
 ```text
 6B3D5C61F342C68D3C356DE726341AE93DD1C7321E7384C3892D42618A363EEE
 ```
 
-本仓库可以独立构建面板及新增统计逻辑，冻结引擎以固定 DLL 形式提供，不包含该引擎的完整源码重建。第三方参考与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 `licenses/`；其中旧集成参考的署名一并保留，不代表本面板启用那些集成。
+恢复的 9 份原始 C# 文件在固定 SDK 和 Release 配置下可重建出与该 DLL 字节一致的产物。源码逐字节保留；Core 的 Release 配置关闭调试信息，构建核验脚本会检查两次输出及历史基准。该结论限于 Core DLL，不代表发布 ZIP、WPF 程序或其他环境的全部产物均已证明可复现。第三方参考与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 `licenses/`；其中旧集成参考的署名一并保留，不代表本面板启用那些集成。
 
 ## 验证范围
 
-发布脚本验证统计、读取边界、超大 JSON/UTF-8、时间归属、重叠等待、托盘几何与点击状态、发布版 WPF 布局和显示。它不替代真实多屏混合 DPI、拔屏或长时间运行验收。
+构建脚本验证统计、读取边界、超大 JSON/UTF-8、时间归属、重叠等待、托盘几何与点击状态及合成 WPF 控件布局。普通 EXE、实际 DPI 与资源观察的版本和结果另行记录；上述自动化不替代真实多屏混合 DPI、拔屏或长期稳定性验收。本次 PR 的修复、回归与证据边界见[PR #1 最终验证记录](docs/pr1-final-validation.md)。

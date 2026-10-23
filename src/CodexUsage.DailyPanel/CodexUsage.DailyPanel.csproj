@@ -14,6 +14,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../CodexUsage.DailyCore/CodexUsage.DailyCore.csproj" />
-    <Reference Include="CodexUsage.Core"><HintPath>../../frozen-core/CodexUsage.Core.dll</HintPath><Private>true</Private></Reference>
+    <ProjectReference Include="../CodexUsage.Core/CodexUsage.Core.csproj" />
   </ItemGroup>
 </Project>

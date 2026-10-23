@@ -1,4 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net9.0</TargetFramework><RootNamespace>CodexUsage.Daily</RootNamespace></PropertyGroup>
-  <ItemGroup><Reference Include="CodexUsage.Core"><HintPath>../../frozen-core/CodexUsage.Core.dll</HintPath><Private>true</Private></Reference></ItemGroup>
+  <ItemGroup><ProjectReference Include="../CodexUsage.Core/CodexUsage.Core.csproj" /></ItemGroup>
 </Project>

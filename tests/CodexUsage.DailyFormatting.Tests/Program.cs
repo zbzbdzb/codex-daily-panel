@@ -59,5 +59,20 @@ Test("copy preserves unknown total on overflow", () =>
     if (!text.Contains("Total tokens: 暂无数据", StringComparison.Ordinal))
         throw new Exception("overflow must not wrap or become a count");
 });
+Test("copy preserves known partial totals and an explicit legacy incompleteness reason", () =>
+{
+    const string reason = "旧格式统计无法还原今日请求（synthetic coverage fixture）";
+    var snapshot = Snapshot(100, 40) with
+    {
+        CachedInputTokens = 60, ReasoningTokens = 10, IsPartial = true, Status = reason
+    };
+    var text = DailyFormatting.CopyText(snapshot, false);
+    foreach (var line in new[] { "Total input: 100", "Total output: 40", "Total tokens: 140",
+        "Cached input: 60", "Reasoning output: 10", "Status: " + reason + " (partial data)" })
+    {
+        if (!text.Split('\n').Any(actual => actual.TrimEnd('\r') == line))
+            throw new Exception("copy omitted known subtotal or partial reason: " + line);
+    }
+});
 Console.WriteLine($"{checks - failures}/{checks} passed");
 return failures == 0 ? 0 : 1;
