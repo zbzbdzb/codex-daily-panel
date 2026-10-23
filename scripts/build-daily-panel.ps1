@@ -126,7 +126,11 @@ try {
             $null = Invoke-BuildCommand $state.Executable $buildArgs $source "$testLabel-build" $commands
             $dll = Join-Path $artifacts "bin/$testLabel/release/$testLabel.dll"
             if (-not (Test-Path -LiteralPath $dll)) { throw "Missing built test DLL: $dll" }
-            $null = Invoke-BuildCommand $state.Executable @($dll) $source "$testLabel-run" $commands
+            $testArguments = @($dll)
+            if ($testLabel -ceq 'CodexUsage.DailySettings.Tests') {
+                $testArguments += @('--test-root',(Join-Path $output 'settings-test-fixtures'))
+            }
+            $null = Invoke-BuildCommand $state.Executable $testArguments $source "$testLabel-run" $commands
         }
         $harness = Join-Path $source 'tests/CodexUsage.Daily.GuiHarness/CodexUsage.Daily.GuiHarness.csproj'
         $harnessCommon = @($common | Where-Object { $_ -notlike '-p:CodexEvidenceDirectory=*' }) + @("-p:CodexEvidenceDirectory=$(Join-Path $output 'compile-tests/gui-harness')")
