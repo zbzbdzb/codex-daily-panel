@@ -76,6 +76,7 @@ try
     await LifecycleHistoryTests.RunAsync();
     await LegacyIntegrityMonitorTests.RunAsync();
     await ObservedEvidenceTests.RunAsync();
+    await HistoricalDurationMonitorTests.RunAsync();
     await MonitorDisposalTests.RunAsync();
     Console.WriteLine($"RESULT: {passes} passed, 0 failed");
 }

@@ -176,7 +176,7 @@ public static class DailyAggregator
                 return (At: timestamp, Key: keys.Length == 1 ? keys[0] : null);
             }, StringComparer.Ordinal);
         var rawLastStarts = LatestStarts(observed.OfType<StartEvent>(), true);
-        // Retired starts constrain ordering only. They must never create a turn,
+        // Retired starts constrain ordering and timing eligibility. They never create a turn,
         // an interval, or a replacement completion duration in the current view.
         var lastStarts = startHistory is null ? rawLastStarts : LatestStarts(observed.OfType<StartEvent>()
             .Concat(startHistory.Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now)), false);
@@ -218,8 +218,8 @@ public static class DailyAggregator
             var completionCount = completions.Select(x => DailyClosureFact.From(x).Fingerprint)
                 .Concat(retiredClosures.Where(x => x.Kind == DailyClosureKind.Completed).Select(x => x.Fingerprint)).Distinct().Count();
             var abortCount = aborts.Concat(retiredClosures.Where(x => x.Kind == DailyClosureKind.Aborted).Select(x => x.At)).Distinct().Count();
-            var startCount = starts.Concat(knownStarts.GetValueOrDefault((turn.Session, turn.Key)) ?? []).Distinct().Count();
-            var timingConflict = startCount > 1 || completionCount > 1 || abortCount > 1
+            var startEvidence = starts.Concat(knownStarts.GetValueOrDefault((turn.Session, turn.Key)) ?? []).Distinct().ToArray();
+            var timingConflict = startEvidence.Length > 1 || completionCount > 1 || abortCount > 1
                 || (completionCount > 0 && abortCount > 0);
             if (timingConflict)
             {
@@ -268,8 +268,10 @@ public static class DailyAggregator
             // independent evidence for the same turn. Allow modest write/scheduling
             // skew, but never use a grossly shorter duration to inflate throughput.
             // The larger of one second and five percent is deliberately symmetric.
-            var durationMismatch = explicitStart is { } loggedStart && duration is { } declared
-                && Math.Abs((completed.Timestamp - loggedStart).TotalMilliseconds - declared)
+            // A retained start can still disprove the declared duration after its
+            // source disappears. It is not an explicitStart or an interval source.
+            var durationMismatch = startEvidence.Length == 1 && duration is { } declared
+                && Math.Abs((completed.Timestamp - startEvidence[0]).TotalMilliseconds - declared)
                     > Math.Max(1000d, declared * .05d);
             if (durationMismatch) issues.Add("回合声明耗时与起止时间不一致");
             var reconciliation = Reconcile(turn.Requests, rejectedTurns.Contains((turn.Session, turn.Key)));
