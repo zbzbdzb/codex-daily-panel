@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <CodexTargetFramework Condition="'$(CodexTargetFramework)' == ''">net9.0</CodexTargetFramework>
+    <TargetFramework>$(CodexTargetFramework)</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/CodexUsage.DailyPanel/PanelSettings.cs" Link="PanelSettings.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/DailyOptions.cs" Link="DailyOptions.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/SingleInstanceCoordinator.cs" Link="SingleInstanceCoordinator.cs" />
+  </ItemGroup>
+</Project>

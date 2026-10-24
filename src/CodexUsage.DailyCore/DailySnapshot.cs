@@ -9,6 +9,7 @@ public sealed record DailySnapshot(DateOnly Day, DateTimeOffset UpdatedAt, long?
     double? ActiveSeconds, double? AverageTps, int ChatCount, int TurnCount, int ActiveTurns,
     int SourceCount, bool IsPartial, string Status, WeeklyAllowance? Weekly)
 {
+    public IReadOnlyList<DailyIssue> Issues { get; init; } = [];
     public int TimedTurnCount { get; init; }
     public int ExcludedTimingTurnCount { get; init; }
     public double? ExcludedWaitSeconds { get; init; }

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>$(CodexTargetFramework)</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/CodexUsage.DailyCore/CodexUsage.DailyCore.csproj" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/DailyPresentationState.cs" Link="DailyPresentationState.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/RefreshCoordinator.cs" Link="RefreshCoordinator.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/SessionLogMonitor.cs" Link="SessionLogMonitor.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/DailyLogReader.cs" Link="DailyLogReader.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/OversizedEnvelopeValidator.cs" Link="OversizedEnvelopeValidator.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/DailyToolTimingParser.cs" Link="DailyToolTimingParser.cs" />
+  </ItemGroup>
+</Project>

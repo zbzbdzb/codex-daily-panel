@@ -20,7 +20,13 @@ public static class DailyAggregator
         ArgumentNullException.ThrowIfNull(zone);
         var rows = events.ToArray();
         var issues = new HashSet<string>(StringComparer.Ordinal);
-        if (partial) issues.Add("来源仍在读取或部分来源不可用");
+        var diagnostics = new Dictionary<string, DailyIssue>(StringComparer.Ordinal);
+        void Issue(string code, string compatibilityReason)
+        {
+            issues.Add(compatibilityReason);
+            diagnostics.TryAdd(code, new(code));
+        }
+        if (partial) Issue(DailyIssueCodes.SourcePartial, "来源仍在读取或部分来源不可用");
         var lower = DayBoundary(day, zone);
         var upper = DayBoundary(day.AddDays(1), zone);
         bool InDay(DateTimeOffset value) => value != DateTimeOffset.MinValue && value >= lower && value < upper;
@@ -41,13 +47,13 @@ public static class DailyAggregator
             else roots.Add(group.Key);
         }
         bool Root(StatsEvent value) => roots.Contains(value.SessionKey);
-        if (rows.Any(x => metadataConflicts.Contains(x.SessionKey) && Relevant(x))) issues.Add("会话关系冲突");
+        if (rows.Any(x => metadataConflicts.Contains(x.SessionKey) && Relevant(x))) Issue(DailyIssueCodes.MetadataConflict, "会话关系冲突");
         if (rows.Any(x => x is not MetadataEvent && x is not QuotaEvent && Relevant(x)
             && !roots.Contains(x.SessionKey) && !children.Contains(x.SessionKey) && !metadataConflicts.Contains(x.SessionKey)))
-            issues.Add("缺少会话元数据，无法确认根会话范围");
+            Issue(DailyIssueCodes.MetadataMissing, "缺少会话元数据，无法确认根会话范围");
         var usable = rows.Where(Root).Where(x => x is not MetadataEvent && x is not QuotaEvent).ToArray();
-        if (usable.Any(x => x.Timestamp == DateTimeOffset.MinValue)) issues.Add("统计事件缺少时间");
-        if (usable.Any(x => x.Timestamp > now && InDay(x.Timestamp))) issues.Add("统计事件时间超前");
+        if (usable.Any(x => x.Timestamp == DateTimeOffset.MinValue)) Issue(DailyIssueCodes.TimestampMissing, "统计事件缺少时间");
+        if (usable.Any(x => x.Timestamp > now && InDay(x.Timestamp))) Issue(DailyIssueCodes.TimestampFuture, "统计事件时间超前");
         var observed = usable.Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now).ToArray();
         var today = observed.Where(x => InDay(x.Timestamp)).ToArray();
 
@@ -58,7 +64,7 @@ public static class DailyAggregator
             || string.IsNullOrWhiteSpace(x.SessionKey) || string.IsNullOrWhiteSpace(x.TurnKey)
             || string.IsNullOrWhiteSpace(x.RootTurnKey)))
         {
-            if (Relevant(missing)) issues.Add("请求身份缺失");
+            if (Relevant(missing)) Issue(DailyIssueCodes.RequestIdentityMissing, "请求身份缺失");
             if (missing.TurnKey is { } turn) rejectedTurns.Add((missing.SessionKey, turn));
         }
         foreach (var group in modern.Where(x => !string.IsNullOrWhiteSpace(x.RequestKey)
@@ -71,7 +77,9 @@ public static class DailyAggregator
             var missingTime = versions.Any(x => x.Timestamp == DateTimeOffset.MinValue);
             if (conflict || invalid || missingTime)
             {
-                if (versions.Any(Relevant)) issues.Add(conflict ? "请求修订冲突" : invalid ? "请求 token 字段无效" : "统计事件缺少时间");
+                if (versions.Any(Relevant)) Issue(conflict ? DailyIssueCodes.RequestRevisionConflict
+                    : invalid ? DailyIssueCodes.RequestTokensInvalid : DailyIssueCodes.TimestampMissing,
+                    conflict ? "请求修订冲突" : invalid ? "请求 token 字段无效" : "统计事件缺少时间");
                 foreach (var value in versions) rejectedTurns.Add((value.SessionKey, value.TurnKey!));
                 continue;
             }
@@ -109,14 +117,14 @@ public static class DailyAggregator
 
         var dayRequests = accepted.Where(x => InDay(x.OccurredAt)).ToArray();
         TokenVector? totals = dayRequests.Length == 0 ? null : Sum(dayRequests);
-        if (dayRequests.Any(x => !x.Latest.Usage!.IsComplete)) issues.Add("部分 token 字段未提供");
-        if (totals is { IsComplete: false } && dayRequests.All(x => x.Latest.Usage!.IsComplete)) issues.Add("累计数值超出范围");
+        if (dayRequests.Any(x => !x.Latest.Usage!.IsComplete)) Issue(DailyIssueCodes.TokenFieldsMissing, "部分 token 字段未提供");
+        if (totals is { IsComplete: false } && dayRequests.All(x => x.Latest.Usage!.IsComplete)) Issue(DailyIssueCodes.TokenOverflow, "累计数值超出范围");
         var legacy = today.OfType<UsageEvent>().Where(x => x.Legacy).ToArray();
         if (legacy.Length > 0)
         {
             var covered = BuildLegacyCoverage(accepted);
             if (legacy.Any(x => !LegacyCovered(x, covered)))
-                issues.Add("旧格式快照覆盖关系未知，无法还原全部今日用量");
+                Issue(DailyIssueCodes.LegacyCoverageUnknown, "旧格式快照覆盖关系未知，无法还原全部今日用量");
         }
         // Revision arrival alone is not a new daily chat or turn. Lifecycle rows
         // and legacy snapshots establish observed chat/turn presence on their own
@@ -172,7 +180,7 @@ public static class DailyAggregator
             {
                 var timestamp = x.Max(start => start.Timestamp);
                 var keys = x.Where(start => start.Timestamp == timestamp).Select(start => start.TurnKey).Distinct().ToArray();
-                if (reportConflicts && keys.Length > 1 && InDay(timestamp)) issues.Add("当前回合启动关系冲突");
+                if (reportConflicts && keys.Length > 1 && InDay(timestamp)) Issue(DailyIssueCodes.CurrentStartConflict, "当前回合启动关系冲突");
                 return (At: timestamp, Key: keys.Length == 1 ? keys[0] : null);
             }, StringComparer.Ordinal);
         var rawLastStarts = LatestStarts(observed.OfType<StartEvent>(), true);
@@ -223,7 +231,7 @@ public static class DailyAggregator
                 || (completionCount > 0 && abortCount > 0);
             if (timingConflict)
             {
-                if (relevantTurn) issues.Add("回合时间事件冲突");
+                if (relevantTurn) Issue(DailyIssueCodes.TurnTimeConflict, "回合时间事件冲突");
                 if (completions.Any(x => InDay(x.Timestamp))) unavailableTiming++;
                 continue;
             }
@@ -241,14 +249,14 @@ public static class DailyAggregator
                     && rawLastStarts.TryGetValue(turn.Session, out var rawLatest) && began == rawLatest.At && turn.Key == rawLatest.Key)
                 {
                     if (historicalClosedTurns.Contains((turn.Session, turn.Key)))
-                        issues.Add("历史回合闭合依据缺失，活动状态无法确认");
+                        Issue(DailyIssueCodes.HistoricalClosureMissing, "历史回合闭合依据缺失，活动状态无法确认");
                     else if (lastStarts.TryGetValue(turn.Session, out var latest) && began == latest.At && turn.Key == latest.Key)
                     {
                         coverageTurns?.Add((turn.Session, turn.Key));
                         active++;
                         AddInterval(began, now);
                     }
-                    else issues.Add("历史回合启动依据缺失，活动状态无法确认");
+                    else Issue(DailyIssueCodes.HistoricalStartMissing, "历史回合启动依据缺失，活动状态无法确认");
                 }
                 continue;
             }
@@ -273,9 +281,9 @@ public static class DailyAggregator
             var durationMismatch = startEvidence.Length == 1 && duration is { } declared
                 && Math.Abs((completed.Timestamp - startEvidence[0]).TotalMilliseconds - declared)
                     > Math.Max(1000d, declared * .05d);
-            if (durationMismatch) issues.Add("回合声明耗时与起止时间不一致");
+            if (durationMismatch) Issue(DailyIssueCodes.DurationMismatch, "回合声明耗时与起止时间不一致");
             var reconciliation = Reconcile(turn.Requests, rejectedTurns.Contains((turn.Session, turn.Key)));
-            if (!reconciliation && relevantTurn) issues.Add("完成回合快照缺失或对账不一致");
+            if (!reconciliation && relevantTurn) Issue(DailyIssueCodes.CompletionReconciliation, "完成回合快照缺失或对账不一致");
             var sameDay = durationStart is { } inferred && InDay(inferred) && beganAt is { } beganSameDay
                 && InDay(beganSameDay) && beganSameDay <= completed.Timestamp
                 && turn.Requests.All(x => InDay(x.OccurredAt) && x.OccurredAt >= beganSameDay && x.OccurredAt <= completed.Timestamp);
@@ -314,6 +322,21 @@ public static class DailyAggregator
         if (issues.Count > 0) status += "；统计不完整：" + string.Join("、", issues.Order(StringComparer.Ordinal));
         var weekly = LatestWeekly(rows.OfType<QuotaEvent>(), now, out var multipleWeekly);
         if (multipleWeekly) status += "；日志报告多个独立周额度窗口，未合并显示";
+        // Informational diagnostics share the transport but do not alter the
+        // established partial reasons or compatibility Status string above.
+        var invariant = System.Globalization.CultureInfo.InvariantCulture;
+        var scopeCode = dayRequests.Length > 0 ? DailyIssueCodes.LocalRootScope : DailyIssueCodes.NoTokens;
+        diagnostics.Add(scopeCode, new(scopeCode));
+        if (active > 0) diagnostics.Add(DailyIssueCodes.ObservedActive,
+            DailyIssue.With(DailyIssueCodes.ObservedActive, ("count", active.ToString(invariant))));
+        if (timedTurns > 0) diagnostics.Add(DailyIssueCodes.EstimatedTps, new(DailyIssueCodes.EstimatedTps));
+        if (unavailableTiming > 0)
+        {
+            var code = timedTurns > 0 ? DailyIssueCodes.TimingCoveragePartial : DailyIssueCodes.TimingUnavailable;
+            diagnostics.Add(code, DailyIssue.With(code, ("included", timedTurns.ToString(invariant)),
+                ("excluded", unavailableTiming.ToString(invariant))));
+        }
+        if (multipleWeekly) diagnostics.Add(DailyIssueCodes.MultipleWeekly, new(DailyIssueCodes.MultipleWeekly));
         if (exclusionProof is not null)
         {
             // These dependencies can be dormant: a request's first occurrence,
@@ -404,6 +427,7 @@ public static class DailyAggregator
             timedTurns > 0 ? (double)(matchedOutput / (processingMs / 1000m)) : null,
             chats, turnKeys, active, 0, issues.Count > 0, status, weekly)
         {
+            Issues = Array.AsReadOnly(diagnostics.Values.OrderBy(x => x.Code, StringComparer.Ordinal).ToArray()),
             TimedTurnCount = timedTurns,
             ExcludedTimingTurnCount = unavailableTiming,
             ExcludedWaitSeconds = timedTurns > 0 ? (double)(excludedWaitMs / 1000m) : null
