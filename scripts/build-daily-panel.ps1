@@ -100,6 +100,30 @@ try {
     $publish = @('publish',(Join-Path $source 'src/CodexUsage.DailyPanel/CodexUsage.DailyPanel.csproj')) + $common + $restore + @('--output',$payload,'--self-contained',$([bool]$Package).ToString().ToLowerInvariant(),'-p:DisableTransitiveFrameworkReferenceDownloads=true',"-bl:$(Join-Path $commands 'product.binlog')")
     if ($Package) { $publish += @('--runtime','win-x64','-p:RuntimeFrameworkVersion=10.0.13','-p:PublishSingleFile=false','-p:PublishTrimmed=false','-p:PublishReadyToRun=false') }
     $null = Invoke-BuildCommand $state.Executable $publish $source 'product-publish' $commands
+    # Later test restores share the artifacts tree and can replace project.assets.
+    # Preserve and check the actual publish closure before running those builds.
+    $publishAssets = Join-Path $output 'publish-assets'
+    [void][IO.Directory]::CreateDirectory($publishAssets)
+    $record.publishRestoreInputs = @()
+    foreach ($productProject in @('CodexUsage.Core','CodexUsage.DailyCore','CodexUsage.DailyPanel')) {
+        $assetsPath = Join-Path $artifacts "obj/$productProject/project.assets.json"
+        $savedAssets = Join-Path $publishAssets "$productProject.project.assets.json"
+        Copy-Item -LiteralPath $assetsPath -Destination $savedAssets
+        $assetsData = Get-Content -LiteralPath $savedAssets -Raw | ConvertFrom-Json
+        foreach ($framework in $assetsData.project.frameworks.PSObject.Properties) {
+            $frameworkNames = @($framework.Value.frameworkReferences.PSObject.Properties.Name | Sort-Object)
+            $downloads = @()
+            if ($framework.Value.PSObject.Properties['downloadDependencies']) { $downloads = @($framework.Value.downloadDependencies) }
+            $expectedFrameworks = @('Microsoft.NETCore.App')
+            if ($productProject -ceq 'CodexUsage.DailyPanel') { $expectedFrameworks += 'Microsoft.WindowsDesktop.App' }
+            if (($frameworkNames -join '|') -cne (($expectedFrameworks | Sort-Object) -join '|')) { throw "Unexpected product framework closure: $productProject" }
+            if ($Package) {
+                $expectedDownloads = @($expectedFrameworks | ForEach-Object { "$_" + '.Runtime.win-x64' } | Sort-Object)
+                if ((@($downloads.name | Sort-Object) -join '|') -cne ($expectedDownloads -join '|') -or ($downloads | Where-Object { $_.version -cne '[10.0.13, 10.0.13]' })) { throw "Unexpected product runtime downloads: $productProject" }
+            }
+            $record.publishRestoreInputs += [ordered]@{project=$productProject;framework=$framework.Name;file=(Get-BuildFileEvidence $savedAssets $output);frameworkReferences=$frameworkNames;downloadDependencies=$downloads}
+        }
+    }
     $record.productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $payload 'CodexDaily.dll')).ProductVersion
     if ($record.productVersion -cne "0.2.0+$revision") { throw "Product version does not identify the exported source commit: $($record.productVersion)" }
     $runtimeConfig = Get-Content -LiteralPath (Join-Path $payload 'CodexDaily.runtimeconfig.json') -Raw | ConvertFrom-Json

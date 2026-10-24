@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO.Pipes;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
@@ -28,6 +29,45 @@ void Test(string name, Action body)
     catch (Exception e) { failed++; Console.WriteLine("FAIL " + name + ": " + e.Message); }
 }
 PanelSettingsStore Store(string name) => new(Path.Combine(root, name));
+string Endpoint(string home)
+{
+    if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
+    using var identity = WindowsIdentity.GetCurrent();
+    return "CodexDaily-v2-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity.User!.Value + "\n" + DailyOptions.NormalizePath(home).ToUpperInvariant())));
+}
+void CheckClientReleases(string name, byte[]? reply = null, bool cancelAfterRequest = false)
+{
+    if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
+    var home = Path.Combine(root, name);
+    using var identity = WindowsIdentity.GetCurrent();
+    using var server = NamedPipeServerStreamAcl.Create(Endpoint(home), PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+        PipeOptions.Asynchronous, 64, 64, SingleInstanceCoordinator.CreatePipeSecurity(identity.User!), HandleInheritability.None, (PipeAccessRights)0);
+    using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+    using var cancellation = new CancellationTokenSource();
+    var peer = Task.Run(async () =>
+    {
+        await server.WaitForConnectionAsync(budget.Token);
+        var request = new byte[9];
+        await server.ReadExactlyAsync(request, budget.Token);
+        Check(request.AsSpan().SequenceEqual("activate\n"u8), "Client sent an unexpected command.");
+        if (cancelAfterRequest) cancellation.Cancel();
+        if (reply is not null)
+        {
+            await server.WriteAsync(reply, budget.Token);
+            await server.FlushAsync(budget.Token);
+        }
+        return await server.ReadAsync(new byte[1], budget.Token);
+    });
+    using var secondary = SingleInstanceCoordinator.Acquire(home);
+    Check(!secondary.IsPrimary, "Synthetic reply fixture did not own the endpoint.");
+    var timer = Stopwatch.StartNew();
+    Check(!secondary.TryActivateAsync(cancelAfterRequest ? TimeSpan.FromSeconds(2) : TimeSpan.FromMilliseconds(200), cancellation.Token).GetAwaiter().GetResult(), "Unacknowledged activation succeeded.");
+    Check(timer.Elapsed < TimeSpan.FromSeconds(3), "Unacknowledged activation exceeded its bound.");
+    Check(peer.GetAwaiter().GetResult() == 0, "Client retained the connection after failure.");
+    server.Dispose();
+    using var replacement = SingleInstanceCoordinator.Acquire(home);
+    Check(replacement.IsPrimary, "Failed client or disposed fixture retained endpoint ownership.");
+}
 void Fixture(string name, string text)
 {
     var directory = Path.Combine(root, name);
@@ -145,6 +185,49 @@ Test("same normalized home owns one local instance and bounded activation", () =
     using var distinct = SingleInstanceCoordinator.Acquire(Path.Combine(root, "other-home"));
     Check(distinct.IsPrimary, "Distinct home collided.");
 });
+Test("isolated pipe exposes protected exact-user ACL with explicit network denial", () =>
+{
+    if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
+    using var identity = WindowsIdentity.GetCurrent();
+    var user = identity.User!;
+    var home = Path.Combine(root, "acl-readback");
+    using var primary = SingleInstanceCoordinator.Acquire(home);
+    Check(primary.IsPrimary, "ACL fixture did not own the endpoint.");
+    using var client = new NamedPipeClientStream(".", Endpoint(home), PipeDirection.InOut, PipeOptions.Asynchronous);
+    client.Connect(2000);
+    var actual = client.GetAccessControl();
+    var rules = actual.GetAccessRules(true, true, typeof(SecurityIdentifier)).Cast<PipeAccessRule>().ToArray();
+    var network = new SecurityIdentifier(WellKnownSidType.NetworkSid, null);
+    var networkDenied = false;
+    var userAllowed = false;
+    foreach (var rule in rules)
+    {
+        Check(!rule.IsInherited, "Real pipe contains an inherited ACE.");
+        if (rule.IdentityReference.Equals(network) && rule.AccessControlType == AccessControlType.Deny && rule.PipeAccessRights == PipeAccessRights.FullControl) networkDenied = true;
+        if (rule.IdentityReference.Equals(user) && rule.AccessControlType == AccessControlType.Allow && rule.PipeAccessRights == (PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance | PipeAccessRights.Synchronize)) userAllowed = true;
+    }
+    Check(networkDenied, "Missing explicit NETWORK denial on the real pipe.");
+    Check(user.Equals(actual.GetOwner(typeof(SecurityIdentifier))), "Real pipe owner differs from the current User SID.");
+    Check(actual.AreAccessRulesProtected, "Real pipe ACL allows inheritance.");
+    Check(rules.Length == 2, "Unexpected pipe ACEs.");
+    Check(userAllowed, "Real pipe grants unexpected user or permissions.");
+    Console.WriteLine("ACL-READBACK owner=user; protected=true; NETWORK=deny-full; user=read-write/create-instance/synchronize; inherited=false");
+});
+Test("synthetic unequal User and token Owner SIDs retain exact-user ownership and match branches", () =>
+{
+    if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
+    // Constructed identifiers only: this is not a cross-user or token impersonation test.
+    var user = new SecurityIdentifier("S-1-5-21-111111111-222222222-333333333-1001");
+    var tokenOwner = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+    Check(!user.Equals(tokenOwner), "Synthetic User and Owner must differ.");
+    var security = SingleInstanceCoordinator.CreatePipeSecurity(user);
+    Check(user.Equals(security.GetOwner(typeof(SecurityIdentifier))) && !tokenOwner.Equals(security.GetOwner(typeof(SecurityIdentifier))), "ACL selected token Owner instead of User.");
+    Check(SingleInstanceCoordinator.IsOwnedByUser(security, user), "Matching User owner rejected.");
+    Check(!SingleInstanceCoordinator.IsOwnedByUser(security, tokenOwner), "Different User owner accepted.");
+    security.SetOwner(tokenOwner);
+    Check(!SingleInstanceCoordinator.IsOwnedByUser(security, user), "Token Owner was accepted for a different User.");
+    Console.WriteLine("SYNTHETIC-SIDS User!=token-Owner; match=accepted; mismatch=rejected; no cross-user execution");
+});
 Test("primary exit releases ownership for next launch", () =>
 {
     var home = Path.Combine(root, "reopen");
@@ -163,10 +246,20 @@ Test("separate process activates the existing primary without duplicate ownershi
     if (string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), "dotnet", StringComparison.OrdinalIgnoreCase))
         start.ArgumentList.Add(typeof(PanelSettings).Assembly.Location);
     start.ArgumentList.Add("--activation-worker"); start.ArgumentList.Add(home.ToLowerInvariant());
-    using var worker = Process.Start(start)!;
-    Check(worker.WaitForExit(5000), "Secondary process did not return within bounded activation interval.");
-    var diagnostics = $"exit={worker.ExitCode}; calls={Volatile.Read(ref calls)}; stdout={worker.StandardOutput.ReadToEnd()}; stderr={worker.StandardError.ReadToEnd()}";
-    Check(worker.ExitCode == 0 && Volatile.Read(ref calls) == 1, "Separate process failed activation: " + diagnostics);
+    using var firstWorker = Process.Start(start)!;
+    using var secondWorker = Process.Start(start)!;
+    try
+    {
+        Check(firstWorker.WaitForExit(5000) && secondWorker.WaitForExit(5000), "Secondary processes did not return within bounded activation interval.");
+        var diagnostics = $"exit={firstWorker.ExitCode},{secondWorker.ExitCode}; calls={Volatile.Read(ref calls)}; stdout={firstWorker.StandardOutput.ReadToEnd()}{secondWorker.StandardOutput.ReadToEnd()}; stderr={firstWorker.StandardError.ReadToEnd()}{secondWorker.StandardError.ReadToEnd()}";
+        Check(firstWorker.ExitCode == 0 && secondWorker.ExitCode == 0 && Volatile.Read(ref calls) == 2, "Separate processes failed activation: " + diagnostics);
+        Console.WriteLine("ACTIVATION-WORKERS exits=0,0; calls=2");
+    }
+    finally
+    {
+        foreach (var worker in new[] { firstWorker, secondWorker })
+            if (!worker.HasExited) { worker.Kill(); Check(worker.WaitForExit(3000), "Synthetic worker did not exit after termination."); }
+    }
 });
 Test("nonlistening primary activation timeout is bounded", () =>
 {
@@ -177,22 +270,77 @@ Test("nonlistening primary activation timeout is bounded", () =>
     Check(!second.TryActivateAsync(TimeSpan.FromMilliseconds(200)).GetAwaiter().GetResult(), "Unserved activation acknowledged.");
     Check(timer.Elapsed < TimeSpan.FromSeconds(2), "Activation hung.");
 });
+Test("absent acknowledgement times out and releases the client connection", () => CheckClientReleases("no-ack"));
+Test("partial acknowledgement times out and releases the client connection", () => CheckClientReleases("partial-ack", "o"u8.ToArray()));
+Test("incorrect acknowledgement fails and releases the client connection", () => CheckClientReleases("incorrect-ack", "no\n"u8.ToArray()));
+Test("cancellation after connection releases the client connection", () => CheckClientReleases("cancelled-ack", cancelAfterRequest: true));
+Test("activation timeout limits and pre-cancelled requests fail promptly", () =>
+{
+    var home = Path.Combine(root, "invalid-timeout");
+    using var primary = SingleInstanceCoordinator.Acquire(home);
+    using var secondary = SingleInstanceCoordinator.Acquire(home);
+    using var cancellation = new CancellationTokenSource();
+    cancellation.Cancel();
+    var timer = Stopwatch.StartNew();
+    foreach (var timeout in new[] { TimeSpan.Zero, TimeSpan.FromMilliseconds(-1), TimeSpan.FromSeconds(5) + TimeSpan.FromTicks(1) })
+        Check(!secondary.TryActivateAsync(timeout).GetAwaiter().GetResult(), "Invalid timeout was accepted.");
+    Check(!secondary.TryActivateAsync(TimeSpan.FromSeconds(5), cancellation.Token).GetAwaiter().GetResult(), "Pre-cancelled activation succeeded.");
+    Check(timer.Elapsed < TimeSpan.FromSeconds(1), "Invalid or cancelled activation did not fail promptly.");
+});
+Test("missing receipt releases the server slot within its request deadline", () =>
+{
+    var home = Path.Combine(root, "missing-receipt");
+    using var primary = SingleInstanceCoordinator.Acquire(home);
+    var calls = 0;
+    primary.StartListening(() => Interlocked.Increment(ref calls));
+    using (var client = new NamedPipeClientStream(".", Endpoint(home), PipeDirection.InOut, PipeOptions.Asynchronous))
+    {
+        client.Connect(2000);
+        client.Write("activate\n"u8);
+        client.Flush();
+        using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var acknowledgement = new byte[3];
+        client.ReadExactlyAsync(acknowledgement, budget.Token).AsTask().GetAwaiter().GetResult();
+        Check(acknowledgement.AsSpan().SequenceEqual("ok\n"u8), "Fixture did not receive the fixed acknowledgement.");
+        var timer = Stopwatch.StartNew();
+        Check(client.ReadAsync(new byte[1], budget.Token).AsTask().GetAwaiter().GetResult() == 0, "Server did not close a client withholding its receipt.");
+        Check(timer.Elapsed < TimeSpan.FromSeconds(2), "Missing receipt retained the server slot.");
+    }
+    using var secondary = SingleInstanceCoordinator.Acquire(home);
+    Check(!secondary.IsPrimary && secondary.TryActivateAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult(), "Missing receipt prevented the next valid activation.");
+    Check(Volatile.Read(ref calls) == 2, "Callback count changed after missing receipt recovery.");
+});
+Test("dispose cancels an incomplete request and releases endpoint ownership promptly", () =>
+{
+    var home = Path.Combine(root, "dispose-incomplete");
+    using var primary = SingleInstanceCoordinator.Acquire(home);
+    primary.StartListening(() => throw new InvalidOperationException("Incomplete request activated."));
+    using var client = new NamedPipeClientStream(".", Endpoint(home), PipeDirection.InOut, PipeOptions.Asynchronous);
+    client.Connect(2000);
+    client.WriteByte((byte)'a');
+    client.Flush();
+    var timer = Stopwatch.StartNew();
+    primary.Dispose();
+    Check(timer.Elapsed < TimeSpan.FromSeconds(2), "Dispose exceeded its cancellation bound.");
+    client.Dispose();
+    using var replacement = SingleInstanceCoordinator.Acquire(home);
+    Check(replacement.IsPrimary, "Dispose retained the endpoint after an incomplete request.");
+});
 Test("malformed and incomplete local requests do not activate and do not block later valid requests", () =>
 {
     if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
     var home = Path.Combine(root, "malformed");
-    using var identity = WindowsIdentity.GetCurrent();
-    var endpoint = "CodexDaily-v2-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity.User!.Value + "\n" + home.ToUpperInvariant())));
+    var endpoint = Endpoint(home);
     using var primary = SingleInstanceCoordinator.Acquire(home);
     var calls = 0;
     primary.StartListening(() => Interlocked.Increment(ref calls));
-    using (var malformed = new NamedPipeClientStream(".", endpoint, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly))
+    using (var malformed = new NamedPipeClientStream(".", endpoint, PipeDirection.InOut, PipeOptions.Asynchronous))
     {
         malformed.Connect(2000);
         malformed.Write("shutdown\n"u8);
         malformed.Flush();
     }
-    using (var incomplete = new NamedPipeClientStream(".", endpoint, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly))
+    using (var incomplete = new NamedPipeClientStream(".", endpoint, PipeDirection.InOut, PipeOptions.Asynchronous))
     {
         incomplete.Connect(2000);
         incomplete.WriteByte((byte)'a'); incomplete.Flush();

@@ -45,9 +45,13 @@ pwsh -NoProfile -File scripts/build-daily-panel.ps1 `
 
 产品 publish 显式设置 `DisableTransitiveFrameworkReferenceDownloads=true`，避免 SDK 为未引用的框架预备下载 runtime pack；该属性传给产品的项目引用。产品仍需恢复其真实声明的 NETCore 与 WindowsDesktop 框架及运行时包，不关闭正常 runtime pack 下载，也不增加 ASP.NET 产品引用。核对恢复闭包时分别检查三项目 `project.assets.json` 的 `frameworkReferences` 和 `downloadDependencies`，并结合 runtimeconfig、deps 及实际载荷，不能把一次 restore 成功单独解释为依赖完整。
 
+脚本在 publish 返回后立即复制三项目的实际 assets 到载荷外 `publish-assets/` 并核对框架和固定运行时下载集合，写入 `build-result.json` 的 `publishRestoreInputs`。后续测试项目恢复可能覆盖共享 artifacts 目录中的 assets，不能拿覆盖后的文件代替实际发布阶段的恢复证据。
+
 SDK10 产品及测试编译使用 `<本轮输出根>=/_/codexdaily` 的稳定 `PathMap`，同时覆盖导出的源文件、生成源码及托管 CodeView PDB 路径。SDK9 历史重建调用不传此属性。`scripts/verify-artifact-privacy.ps1` 在载荷文档和公开 provenance 生成后、清单和 ZIP 封存前读取实际 Portable PDB 文档及产品托管 DLL CodeView，要求它们使用映射路径；同时检查公开文本中的当前本机源码/输出根及 Windows 用户目录。Microsoft 原生 apphost 已知的上游构建路径单独记账，不能当作本机路径被消除的证据。报告保存在载荷外的 `artifact-privacy.json`；检查失败会阻止封包。此门禁针对上述可检查路径范围，并非对任意内容隐私的无条件保证。
 
 完整构建还实际运行 `scripts/test-artifact-privacy.ps1`：编译带原始路径和映射路径的合成 DLL/PDB，确认门禁拒绝原始文档/CodeView、即使省略 PDB 也拒绝泄露的 DLL，并拒绝公开 JSON/说明中的合成私人路径、损坏 PDB 和缺失程序集。该脚本验证门禁行为，不运行产品或读取会话。
+
+单实例激活使用运行时自带的管道 ACL API：端点归当前 User SID 所有，使用受保护、不继承的权限表，仅向该 SID 允许必要读写/实例权限，并明确拒绝 NETWORK 身份。客户端连接本机 `.`，在发送固定激活消息前核对实际端点 owner。Settings/IPC 测试会读回自建管道 ACL，并验证双 worker、超时、异常回执、取消和释放；构造 SID 的匹配测试不等于真实跨用户、跨机或混合提升环境验收。
 
 ## 保存的来源证据
 

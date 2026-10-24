@@ -1,6 +1,9 @@
 using System;
 using System.IO;
 using System.IO.Pipes;
+using System.Runtime.Versioning;
+using System.Security;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
@@ -23,20 +26,38 @@ public sealed class SingleInstanceCoordinator : IDisposable
     {
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("CodexDaily requires Windows.");
         using var identity = WindowsIdentity.GetCurrent();
-        var user = identity.User?.Value ?? throw new InvalidOperationException("Current user is unavailable.");
+        var user = identity.User ?? throw new InvalidOperationException("Current user is unavailable.");
         var normalized = DailyOptions.NormalizePath(home).ToUpperInvariant();
-        var name = "CodexDaily-v2-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(user + "\n" + normalized)));
+        var name = "CodexDaily-v2-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(user.Value + "\n" + normalized)));
         NamedPipeServerStream? server;
         try
         {
             // One server handle owns the endpoint throughout its lifetime, including
-            // disconnect/reconnect. CurrentUserOnly enforces identity at the OS boundary.
-            server = new NamedPipeServerStream(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
-                PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly, 64, 64);
+            // disconnect/reconnect. The protected ACL admits this User SID and rejects
+            // network tokens, including ones carrying that same User SID.
+            server = NamedPipeServerStreamAcl.Create(name, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous, 64, 64, CreatePipeSecurity(user), HandleInheritability.None, (PipeAccessRights)0);
         }
-        catch (IOException) { server = null; }
+        // ACL-aware creation can report an existing endpoint as access denied.
+        // Failed ownership still uses the bounded, owner-verified client path.
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { server = null; }
         return new(name, server);
     }
+
+    [SupportedOSPlatform("windows")]
+    internal static PipeSecurity CreatePipeSecurity(SecurityIdentifier user)
+    {
+        var security = new PipeSecurity();
+        security.SetAccessRuleProtection(true, false);
+        security.SetOwner(user);
+        security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.NetworkSid, null), PipeAccessRights.FullControl, AccessControlType.Deny));
+        security.AddAccessRule(new PipeAccessRule(user, PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance, AccessControlType.Allow));
+        return security;
+    }
+
+    [SupportedOSPlatform("windows")]
+    internal static bool IsOwnedByUser(PipeSecurity security, SecurityIdentifier user) =>
+        user.Equals(security.GetOwner(typeof(SecurityIdentifier)));
 
     public void StartListening(Action activate)
     {
@@ -82,13 +103,19 @@ public sealed class SingleInstanceCoordinator : IDisposable
     public async Task<bool> TryActivateAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (IsPrimary || timeout <= TimeSpan.Zero || timeout > TimeSpan.FromSeconds(5)) return false;
+        if (!OperatingSystem.IsWindows() || IsPrimary || timeout <= TimeSpan.Zero || timeout > TimeSpan.FromSeconds(5)) return false;
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         lifetime.CancelAfter(timeout);
         try
         {
-            using var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+            using var identity = WindowsIdentity.GetCurrent();
+            var user = identity.User;
+            if (user is null) return false;
+            using var pipe = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
             await pipe.ConnectAsync(lifetime.Token).ConfigureAwait(false);
+            // Check the actual local endpoint before sending even the fixed command.
+            // CurrentUserOnly compares the token Owner, which can differ from User.
+            if (!IsOwnedByUser(pipe.GetAccessControl(), user)) return false;
             await pipe.WriteAsync(Activation, lifetime.Token).ConfigureAwait(false);
             await pipe.FlushAsync(lifetime.Token).ConfigureAwait(false);
             var reply = new byte[Acknowledgement.Length];
@@ -98,7 +125,7 @@ public sealed class SingleInstanceCoordinator : IDisposable
             await pipe.FlushAsync(lifetime.Token).ConfigureAwait(false);
             return true;
         }
-        catch (Exception e) when (e is IOException or OperationCanceledException or UnauthorizedAccessException) { return false; }
+        catch (Exception e) when (e is IOException or OperationCanceledException or UnauthorizedAccessException or InvalidOperationException or SecurityException) { return false; }
     }
 
     public void Dispose()
