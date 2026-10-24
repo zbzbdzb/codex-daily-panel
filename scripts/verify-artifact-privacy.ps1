@@ -69,6 +69,9 @@ try {
         $bytes=[IO.File]::ReadAllBytes($file)
         Test-PrivateText ([Text.Encoding]::UTF8.GetString($bytes)) $name 'managed-literal-utf8'
         Test-PrivateText ([Text.Encoding]::Unicode.GetString($bytes)) $name 'managed-literal-utf16'
+        # The #US heap can place UTF-16 literals at odd file offsets. Decode both
+        # byte alignments so literal paths cannot evade the bounded text checks.
+        if($bytes.Length-gt1){Test-PrivateText ([Text.Encoding]::Unicode.GetString($bytes,1,$bytes.Length-1)) $name 'managed-literal-utf16-odd'}
     }
     foreach($file in Get-ChildItem -LiteralPath $payload -Filter '*.pdb' -File -Recurse){
         $stream=[IO.File]::OpenRead($file.FullName);$provider=$null

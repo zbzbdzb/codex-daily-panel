@@ -60,6 +60,17 @@ try {
     $null=Gate 'reject-corrupt-pdb' $corrupt $false
     $missing=Join-Path $output 'missing-managed';[void][IO.Directory]::CreateDirectory($missing)
     $null=Gate 'reject-missing-managed' $missing $false
+    $paritySource=Join-Path $output 'parity-source';[void][IO.Directory]::CreateDirectory($paritySource)
+    foreach($name in @('global.json','NuGet.Config')){[IO.File]::Copy((Join-Path $source $name),(Join-Path $paritySource $name),$false)}
+    '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><DebugType>none</DebugType><DebugSymbols>false</DebugSymbols><Deterministic>true</Deterministic><AssemblyName>Probe</AssemblyName></PropertyGroup></Project>'|Set-Content -LiteralPath (Join-Path $paritySource 'Probe.csproj') -Encoding utf8NoBOM
+    $privateLiteral='C:\Users\synthetic-parity-person\build\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\source.cs'
+    ('public static class Probe { public static string Value() => @"'+$privateLiteral+'"; }')|Set-Content -LiteralPath (Join-Path $paritySource 'Probe.cs') -Encoding utf8NoBOM
+    $parityArtifacts=Join-Path $output 'parity-build'
+    $null=Invoke-BuildCommand $state.Executable @('build','Probe.csproj','-c','Release','--artifacts-path',$parityArtifacts,'-p:UseSharedCompilation=false',"-p:PathMap=$output=/_/codexdaily") $paritySource 'parity-build' $output
+    $parityPayload=Join-Path $parityArtifacts 'bin/Probe/release';$parityBytes=[IO.File]::ReadAllBytes((Join-Path $parityPayload 'Probe.dll'))
+    Assert-Test 'compiled-private-literal-at-odd-offset' (-not([Text.Encoding]::Unicode.GetString($parityBytes)).Contains($privateLiteral)-and([Text.Encoding]::Unicode.GetString($parityBytes,1,$parityBytes.Length-1)).Contains($privateLiteral))
+    $odd=Gate 'reject-odd-utf16-private-literal' $parityPayload $false
+    Assert-Test 'odd-literal-is-rejection-reason' (@($odd.violations|Where-Object kind -eq 'managed-literal-utf16-odd').Count-gt0)
 }finally{
     [ordered]@{kind='compiled synthetic artifact privacy gates; no product execution';assertions=$results.Count;passed=@($results|Where-Object passed).Count;results=@($results)}|ConvertTo-Json -Depth 8|Set-Content -LiteralPath (Join-Path $output 'result.json') -Encoding utf8NoBOM
     if($state){Restore-BuildEnvironment $state}
