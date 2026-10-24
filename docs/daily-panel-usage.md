@@ -1,6 +1,8 @@
 # CodexDaily v0.2.0 使用说明
 
-CodexDaily 是 Windows x64 托盘统计面板，用于查看本机 Codex 根会话的 token、估算 TPS 与周额度日志快照。自包含 win-x64 包携带 .NET 10 运行时；框架依赖的开发构建需要 .NET 10 Windows Desktop Runtime。请从完整解压目录运行 `CodexDaily.exe`，不要只复制 EXE 或混用不同构建的 DLL。
+CodexDaily 是 Windows x64 托盘统计面板，用于查看本机 Codex 根会话的 token、估算 TPS 与周额度日志快照。请从完整交付目录运行 `CodexDaily.exe`，不要只复制 EXE 或混用不同构建的 DLL。
+
+先查看交付目录根的 `BUILD-PROVENANCE.json`：`selfContained=true` 表示该交付携带指定 .NET 运行时；`false` 表示框架依赖构建，运行需要 .NET 10 Windows Desktop Runtime。两类目录都会带本说明，不能因看到“使用说明”或 .NET 许可文件就认定运行时已打包。准确构建版本、源码提交和运行时信息以同目录来源记录为准；候选构建不自动等于正式发布或验收通过。
 
 ## 启动与日常操作
 
@@ -8,7 +10,7 @@ CodexDaily 是 Windows x64 托盘统计面板，用于查看本机 Codex 根会�
 
 面板依次显示统计日期与状态、总 token 和输入/输出、估算 TPS 与净处理时间、周额度日志快照。“明细与统计范围 / Breakdown and scope”可展开查看缓存、推理、活动时长、会话/回合和 TPS 覆盖。内容较长时可滚动，底部操作保持独立。
 
-底部提供“复制统计 / Copy stats”、刷新、打开日志目录、退出。复制内容使用当前语言，包含精确整数、快照日期与更新时间、范围、估算口径和数据质量/原因；短暂显示“已复制 / Copied”，失败时提示重试。大号 token 数字可能缩写，旁边的精确数值和复制内容保留完整数量。
+底部提供“复制统计 / Copy stats”、刷新、打开日志目录、退出。存在快照时，复制内容使用当前语言，包含精确整数、快照日期与更新时间、范围、估算口径和数据质量/原因；尚无快照时只输出标题、无数据与可用原因。短暂显示“已复制 / Copied”，失败时提示重试。大号 token 数字可能缩写，旁边的精确数值和复制内容保留完整数量。
 
 程序通常每 10 秒自动刷新，面板隐藏后仍继续；读取积压时每秒继续。托盘提示包含总 token、估算速度和状态，不另列输出 token。旧快照会按原日期标记，不能当作今日新统计。
 
@@ -25,7 +27,7 @@ CodexDaily 是 Windows x64 托盘统计面板，用于查看本机 Codex 根会�
 
 选择后应用于当前面板、托盘菜单和复制文字。设置只保存 schema 版本、主题、语言；不保存日志 home、暂停状态或统计数据，不读取 Codex 的私人外观配置。
 
-默认文件为 `%LOCALAPPDATA%\CodexDaily\settings.json`。`--settings-dir <目录>` 可选择独立设置目录；其中仍使用 `settings.json`。不存在设置文件时使用默认值；损坏、不支持的版本、超过 16 KiB 或不可读设置会回退默认值并显示非致命提示。保存失败时当前选择可继续使用，但不能保证重启后保留。写入采用同目录临时文件再整体替换，避免把已有文件截断成半份内容。
+默认文件为 `%LOCALAPPDATA%\CodexDaily\settings.json`。`--settings-dir <目录>` 可选择独立设置目录；其中仍使用 `settings.json`。显式目录读取或保存失败时不会改到真实默认设置目录。不存在设置文件时使用默认值；损坏、不支持的版本、超过 16 KiB 或不可读设置会回退默认值并显示非致命提示。保存失败时当前选择可继续使用，但不能保证重启后保留。写入采用同目录临时文件再整体替换，避免把已有文件截断成半份内容。手工编辑时只接受 `schemaVersion`、`theme`、`language` 三个唯一字段，schema 为整数1；枚举值区分大小写，分别为 `System/Light/Dark` 和 `System/ZhCN/EnUS`。额外、重复字段或无效值会回退。
 
 普通 demo 和 render 也会读取所选设置，demo 中的外观选择可以保存；`--help`、`--version` 与 snapshot 不加载设置。需要完全隔离的演示或渲染时，也请显式传入 `--settings-dir`。
 
@@ -62,7 +64,7 @@ CodexDaily 是 Windows x64 托盘统计面板，用于查看本机 Codex 根会�
 
 已知为零的统计仍显示 `0`；`No data` 不是零用量的证明。缺失依据仍影响当前统计时保留 Partial；依据恢复或不再影响当前统计后解除对应提示。其他缺失或冲突仍可使整体保持 Partial，恢复冲突记录不自动恢复时长/TPS 资格。`Partial=false` 不代表完整账号账单。
 
-同一天混合出现现代请求和旧格式快照时，若无法证明快照已被现代请求覆盖，保留已确认的现代请求小计，并提示“统计不完整：旧格式快照覆盖关系未知，无法还原全部今日用量”。其他会话或回合存在现代请求，不能消除这项提示；已完整对账的镜像快照不会重复累计或触发这项告警。覆盖规则与合成验收记录见[源码仓库中的统计完整性说明](https://github.com/zbzbdzb/codex-daily-panel/blob/codex/initial-release/docs/statistics-integrity-validation.md)。
+同一天混合出现现代请求和旧格式快照时，若无法证明快照已被现代请求覆盖，保留已确认的现代请求小计，并提示“统计不完整：旧格式快照覆盖关系未知，无法还原全部今日用量”。其他会话或回合存在现代请求，不能消除这项提示；已完整对账的镜像快照不会重复累计或触发这项告警。覆盖未知时保留小计与提示；历史合成回归不代表当前完整交付已完成普通 EXE 验收。
 
 **总 token（Total tokens）** 为输入与输出相加，在面板、托盘提示和复制统计中同时提供。缓存和推理不再另加。输入或输出未知、无效或总和超出整数范围时保持未知；统计不完整时托盘提示同时包含“统计不完整 / Partial”状态。
 
@@ -72,7 +74,7 @@ CodexDaily 是 Windows x64 托盘统计面板，用于查看本机 Codex 根会�
 
 开始/结束事件与声明耗时相差超过 1 秒或声明耗时的 5%（取较大值）时，该回合不计速度。回合结束后收到的有效修订，仍按原始发生时间定位；只有最终 token 和回合快照能重新对账时才保留该回合 TPS。缺少真实回合内发生证据时，不臆造开始时间。
 
-同一实例已观察到的唯一历史 start 即使暂时不在当前可读来源中，仍约束同 session/turn 的声明耗时资格。它只用于拒绝矛盾回合，不用于补出活动区间、TTFT、处理时长或 token。合法 token 小计和时长/TPS 的可用性分别判断。该路径的原始失败与修复回归见[源码仓库中的 PR #1 历史验证记录](https://github.com/zbzbdzb/codex-daily-panel/blob/codex/initial-release/docs/pr1-final-validation.md)。
+同一实例已观察到的唯一历史 start 即使暂时不在当前可读来源中，仍约束同 session/turn 的声明耗时资格。它只用于拒绝矛盾回合，不用于补出活动区间、TTFT、处理时长或 token。合法 token 小计和时长/TPS 的可用性分别判断。这是继承的 F1 资格修复；历史失败与修复记录仍保留，不能将旧版本结果改名为本版本界面验收。
 
 **净处理时间（Net processing time）** 为纳入估算 TPS 的同一组回合扣除首字和工具等待区间并集后的时长之和。**活动时长（Active time）** 为裁剪到本地当日和当前时刻后的有效回合区间并集，重叠并发时间只计算一次，仍包含首字与工具等待。只有近期、该 root 最新且未被已知闭合或后继事实排除的开始事件，才可在 15 分钟观察资格内暂计至当前；超时后停止贡献该未闭合区间，没有其他有效区间时显示 `—`。这不是服务端仍在执行或人工工作时长的证明，历史摘要也不补出缺失活动区间。
 
@@ -92,11 +94,15 @@ CodexDaily 是 Windows x64 托盘统计面板，用于查看本机 Codex 根会�
 | `--help` | 输出帮助，不解析 home、读取日志或加载设置 |
 | `--version` | 输出构建版本后退出，不读取日志或加载设置 |
 
-render 和 snapshot 不能组合。未知选项、缺少值、无效/空白路径返回 2；路径值以 `--` 开头也按缺值处理。设备路径、保留设备名和文件流等路径被拒绝。`--help`/`--version` 仍先经过参数语法检查，有效的信息查询则直接退出；两者同时出现时输出帮助。
+选项名区分大小写；超过64个参数、未知选项、缺少值或路径值以 `--` 开头时返回2。重复的带值选项使用最后一次值。
+
+`--help` / `--version` 在上述语法检查通过后直接返回：不解析路径、不读取日志或设置，也不再检查 render/snapshot 互斥；两者同时出现时帮助优先。因此有效信息查询可以忽略不适用的路径或输出组合，但不能忽略未知选项和缺值。
+
+非信息查询模式下，render 与 snapshot 不能组合；无效/空白路径返回2。路径规范化拒绝设备路径、保留设备名、文件流及不支持的字符等。该检查不证明目标存在或可写；实际读写失败另按执行结果处理。
 
 | 退出码 | 含义 |
 | --- | --- |
-| `0` | 正常完成、正常退出或已向既有普通实例发送激活请求 |
+| `0` | 正常完成/退出，或收到既有普通实例的本地激活协议确认；协议确认不单独证明窗口已可见 |
 | `1` | 执行失败，例如输出不可写、启动失败或已有实例无法激活 |
 | `2` | 参数或路径无效 |
 | `3` | snapshot 已输出，但首次读取及最多 64 轮补读后仍有积压 |
@@ -106,9 +112,9 @@ snapshot 返回 0 不要求 `IsPartial=false`，也不证明真实账号完整�
 普通 EXE 的合成隔离示例（先创建相应的物理目录）：
 
 ```powershell
-.\CodexDaily.exe --codex-home F:\CodexDaily-test\home --settings-dir F:\CodexDaily-test\settings
-.\CodexDaily.exe --demo --settings-dir F:\CodexDaily-test\demo-settings
-.\CodexDaily.exe --demo --snapshot F:\CodexDaily-test\demo.json
+.\CodexDaily.exe --codex-home .\synthetic-home --settings-dir .\synthetic-settings
+.\CodexDaily.exe --demo --settings-dir .\synthetic-demo-settings
+.\CodexDaily.exe --demo --snapshot .\synthetic-output\demo.json
 .\CodexDaily.exe --help
 .\CodexDaily.exe --version
 ```
@@ -119,22 +125,24 @@ snapshot 返回 0 不要求 `IsPartial=false`，也不证明真实账号完整�
 
 产品源码固定 .NET SDK `10.0.402`，目标 .NET 10；自包含构建固定 runtime `10.0.13`。原九份 Core 源码和冻结 DLL 保留不变，历史字节核验单独使用 SDK `9.0.318`，不要求新产品 DLL 与旧 DLL 哈希相同。
 
-源码构建脚本 `scripts/build-daily-panel.ps1` 要求干净的已提交源码和不存在的新输出目录。默认构建完整的框架依赖 Release、执行构建时回归并保存来源证据，**默认不生成 ZIP**；冻结后显式指定 `-Package` 和已核验的本地 Microsoft runtime feed 才创建自包含归档。详情见[源码仓库构建说明](https://github.com/zbzbdzb/codex-daily-panel/blob/codex/initial-release/docs/build-v020.md)。ZIP 不包含源码目录及开发脚本，以上链接指向发布目标分支中的源码文档。
+源码构建脚本 `scripts/build-daily-panel.ps1` 要求干净的已提交源码和不存在的新输出目录。默认构建完整的框架依赖 Release、执行构建时回归并保存来源证据，**默认不生成 ZIP**；冻结后显式指定 `-Package` 和已核验的本地 Microsoft runtime feed 才创建自包含归档。完整源码检出中的 `docs/build-v020.md` 说明构建入口；该文档和开发脚本不随 ZIP 交付，不应在包内当作可打开的相邻文件。此说明兼用于源码与包内，因此不提供会随目标分支变化的远端验证链接。
 
 升级时先从应用菜单正常退出旧实例，把新包完整解压到新目录，再启动新 EXE。不要覆盖仍在运行的目录；只复制 EXE 或混用 Core、DailyCore、面板 DLL 会失去构建身份保证。默认偏好设置位于解压目录外，因此新目录仍会读取同一份主题/语言设置；使用不同 `--settings-dir` 可独立保存偏好。
 
 没有安装程序、后台服务或开机启动项。移除时先正常退出，再删除不再需要的解压目录。若也要清除偏好，另行处理 `%LOCALAPPDATA%\CodexDaily\settings.json` 或自己指定设置目录内的文件；删除程序目录不会自动清除外部偏好，日志 home 不属于卸载范围。自包含包内的 Microsoft .NET 许可随 `licenses` 目录保留。
 
-本文是使用与实现边界说明，不是本轮验收通过证明。普通 EXE、真实 DPI、同实例日志变化、退出清理和持续资源观察须在最终完整产物上分别记录；合成测试和渲染不证明真实账号、自然午夜、所有多屏/混合 DPI、其他机器或长期稳定性。
+本文说明使用方法与实现边界，不作为某次验收通过证明。按交付目录的 `BUILD-PROVENANCE.json` 和 `--version` 确认源码提交与构建身份，再到本项目 GitHub Releases 的对应版本及其关联 PR 记录查询实际验收摘要、附件、受测环境和限制；没有相应记录的事项不推定为通过。普通 EXE、真实 DPI、同实例日志变化、退出清理和持续资源观察应分别对应受测产物。合成测试和渲染不证明真实账号、自然午夜、所有多屏/混合 DPI、其他机器或长期稳定性。
 
-历史修复验证期间，SDK 曾自动生成并安装 ASP.NET Core HTTPS 开发证书；后续禁用自动生成不代表该历史证书已清理。运行 dotnet/构建脚本前应设置 `DOTNET_GENERATE_ASPNET_CERTIFICATE=false`；现有构建脚本也设置该变量。应用移除不会清理这些历史开发环境事项，详情见[PR #1 历史验证记录](https://github.com/zbzbdzb/codex-daily-panel/blob/codex/initial-release/docs/pr1-final-validation.md)。
+历史修复验证期间，SDK 曾自动生成并安装 ASP.NET Core HTTPS 开发证书；后续禁用自动生成不代表该历史证书已清理。运行 dotnet/构建脚本前应设置 `DOTNET_GENERATE_ASPNET_CERTIFICATE=false`；现有构建脚本也设置该变量。没有历史证书撤销或清理证据；应用移除不会处理这些历史开发环境事项。不要将后续禁用自动生成描述为“没有系统变化”。
 
 ## English quick start
 
-Extract the entire Windows x64 self-contained package and run `CodexDaily.exe`. Click the blue bar-chart tray icon to open the panel. Esc, outside-click and Hide only hide it; use **Exit panel** or the power button to quit.
+Run `CodexDaily.exe` from the complete Windows x64 delivery directory. Check `BUILD-PROVENANCE.json`: a self-contained delivery includes its runtime; a framework-dependent build requires .NET 10 Windows Desktop Runtime. Click the blue bar-chart tray icon to open the panel. Esc, outside-click and Hide only hide it; use **Exit panel** or the power button to quit.
 
 Expand **Appearance and language** to select System/Light/Dark and System/简体中文/English. Preferences default to `%LOCALAPPDATA%\CodexDaily\settings.json`; `--settings-dir` selects another directory. Ordinary instances are scoped by current user and normalized log home: a second launch of the same home activates the existing panel.
 
 **Pause automatic refresh** stops new automatic reads. In-flight reads may finish, manual refresh still works, and resuming requests a refresh. **Partial** means only the verifiable subtotal is available. **Stale** retains the original snapshot date and update time; it is not current usage. Unknown is not zero. Copy stats includes exact counts, dates, scope, estimated-TPS notes and current quality reasons.
 
 Only local root sessions are counted. Child/cloud sessions and full account billing are excluded. Weekly allowance is a local log snapshot, not a live account query. Use `--codex-home` and `--settings-dir` together for isolated synthetic testing; `--help` and `--version` do not read logs/settings. Rendering and snapshots are auxiliary modes, not ordinary tray-app acceptance evidence.
+
+This iteration's acceptance target is the local Windows 11 Insider 26220 machine. Other machines, non-Insider Windows and physical mixed-DPI/multi-monitor scenarios are deferred and unverified. This guide describes interfaces; it is not evidence of completed ordinary EXE, eight-hour or release acceptance. Historical SDK validation generated and installed an ASP.NET Core HTTPS development certificate; no revocation or cleanup is evidenced.

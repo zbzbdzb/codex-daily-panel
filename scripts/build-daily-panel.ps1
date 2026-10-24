@@ -78,7 +78,7 @@ try {
     $artifacts = Join-Path $output 'build'
     $compile = Join-Path $output 'compile-inputs'
     $payload = Join-Path $output 'payload'
-    $common = @('--configuration','Release','--artifacts-path',$artifacts,'--nologo','--verbosity','minimal','-p:CodexTargetFramework=net10.0',"-p:CodexSourceRevision=$revision", "-p:CustomAfterMicrosoftCommonTargets=$capture", "-p:CodexEvidenceDirectory=$compile")
+    $common = @('--configuration','Release','--artifacts-path',$artifacts,'--nologo','--verbosity','minimal','-p:CodexTargetFramework=net10.0',"-p:CodexSourceRevision=$revision", "-p:CustomAfterMicrosoftCommonTargets=$capture", "-p:CodexEvidenceDirectory=$compile", "-p:PathMap=$output=/_/codexdaily")
     $restore = @('--configfile',(Join-Path $source 'NuGet.Config'))
     if ($RuntimeFeed) {
         $feed = [IO.Path]::GetFullPath($RuntimeFeed, $repository)
@@ -97,7 +97,7 @@ try {
         $restore += @('--source',$feed)
         $record.runtimeFeedFiles = @(Get-ChildItem -LiteralPath $feed -Filter '*.nupkg' -File | Sort-Object Name | ForEach-Object { Get-BuildFileEvidence $_.FullName $feed })
     }
-    $publish = @('publish',(Join-Path $source 'src/CodexUsage.DailyPanel/CodexUsage.DailyPanel.csproj')) + $common + $restore + @('--output',$payload,'--self-contained',$([bool]$Package).ToString().ToLowerInvariant(),"-bl:$(Join-Path $commands 'product.binlog')")
+    $publish = @('publish',(Join-Path $source 'src/CodexUsage.DailyPanel/CodexUsage.DailyPanel.csproj')) + $common + $restore + @('--output',$payload,'--self-contained',$([bool]$Package).ToString().ToLowerInvariant(),'-p:DisableTransitiveFrameworkReferenceDownloads=true',"-bl:$(Join-Path $commands 'product.binlog')")
     if ($Package) { $publish += @('--runtime','win-x64','-p:RuntimeFrameworkVersion=10.0.13','-p:PublishSingleFile=false','-p:PublishTrimmed=false','-p:PublishReadyToRun=false') }
     $null = Invoke-BuildCommand $state.Executable $publish $source 'product-publish' $commands
     $record.productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $payload 'CodexDaily.dll')).ProductVersion
@@ -137,12 +137,25 @@ try {
         $null = Invoke-BuildCommand $state.Executable (@('build',$harness) + $harnessCommon + $restore + @("-p:ProductDirectory=$payload")) $source 'gui-harness-build' $commands
         $harnessDll = Join-Path $artifacts 'bin/CodexUsage.Daily.GuiHarness/release/CodexUsage.Daily.GuiHarness.dll'
         $null = Invoke-BuildCommand $state.Executable @($harnessDll,(Join-Path $output 'gui-harness')) $source 'gui-harness-run' $commands
+        $null = Invoke-BuildCommand (Get-Process -Id $PID).Path @('-NoProfile','-File',(Join-Path $source 'scripts/test-artifact-privacy.ps1'),'-OutputDirectory',(Join-Path $output 'privacy-selftests'),'-DotNetExecutable',$state.Executable) $source 'privacy-selftests' $commands
     }
     Copy-Item -LiteralPath (Join-Path $source 'docs/daily-panel-usage.md') -Destination (Join-Path $payload '使用说明.md')
     Copy-Item -LiteralPath (Join-Path $source 'THIRD_PARTY_NOTICES.md') -Destination $payload
     Copy-Item -LiteralPath (Join-Path $source 'licenses') -Destination $payload -Recurse
     $publicProvenance = [ordered]@{ product='CodexDaily'; version='0.2.0'; sourceCommit=$revision; sourceTree=$tree; sdk=$record.sdkActual; runtime=$record.runtimeExpected; targetFramework=$record.targetFramework; runtimeIdentifier=$record.runtimeIdentifier; selfContained=$record.selfContained; compiledSources=@($record.compilerInputs | Where-Object { $_.project -in @('CodexUsage.Core','CodexUsage.DailyCore','CodexUsage.DailyPanel') } | ForEach-Object { $_.file } | Where-Object { $_.path -notlike '../*' }); verificationScope='Synthetic build-time checks only; ordinary EXE, UI and sustained acceptance are separate gates.' }
     $publicProvenance | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $payload 'BUILD-PROVENANCE.json') -Encoding utf8NoBOM
+    $privacyReport = Join-Path $output 'artifact-privacy.json'
+    $privacyRunner = Join-Path $output 'invoke-artifact-privacy.ps1'
+    # Preserve the array argument across the native PowerShell boundary without string interpolation by the child shell.
+    $privacyLiterals = @((Join-Path $source 'scripts/verify-artifact-privacy.ps1'),$payload,$privacyReport,$repository,$output) | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }
+    @(
+        '$ErrorActionPreference = ''Stop'''
+        "& $($privacyLiterals[0]) -PayloadDirectory $($privacyLiterals[1]) -OutputFile $($privacyLiterals[2]) -ForbiddenRoots @($($privacyLiterals[3]),$($privacyLiterals[4]))"
+    ) | Set-Content -LiteralPath $privacyRunner -Encoding utf8NoBOM
+    $null = Invoke-BuildCommand (Get-Process -Id $PID).Path @('-NoProfile','-File',$privacyRunner) $source 'artifact-privacy' $commands
+    $privacyResult = Get-Content -LiteralPath $privacyReport -Raw | ConvertFrom-Json
+    if ($privacyResult.status -cne 'passed') { throw 'Artifact privacy verification did not pass; no package will be created.' }
+    $record.artifactPrivacy = Get-BuildFileEvidence $privacyReport $output
     $record.productFiles = @(Get-ChildItem -LiteralPath $payload -File -Recurse | Sort-Object FullName | ForEach-Object { Get-BuildFileEvidence $_.FullName $payload })
     $record.productFiles | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $output 'payload-manifest.json') -Encoding utf8NoBOM
     if ($Package) {
