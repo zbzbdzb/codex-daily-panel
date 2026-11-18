@@ -4,6 +4,8 @@ using CodexUsage.DailyPanel;
 
 if (args is ["--observed-evidence", var group]) { await ObservedEvidenceTests.RunAsync(group); return; }
 if (args is ["--monitor-disposal"]) { await MonitorDisposalTests.RunAsync(); return; }
+if (args is ["--discovery"]) { await DiscoveryCancellationTests.RunAsync(); return; }
+if (args is ["--source-limit"]) { await SourceLimitTests.RunAsync(); return; }
 
 var directory = Path.Combine(Path.GetTempPath(), "CodexDaily-tests-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);
@@ -78,6 +80,8 @@ try
     await ObservedEvidenceTests.RunAsync();
     await HistoricalDurationMonitorTests.RunAsync();
     await MonitorDisposalTests.RunAsync();
+    await DiscoveryCancellationTests.RunAsync();
+    await SourceLimitTests.RunAsync();
     Console.WriteLine($"RESULT: {passes} passed, 0 failed");
 }
 finally { Directory.Delete(directory, true); }

@@ -2,6 +2,7 @@ using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -18,9 +19,11 @@ namespace CodexUsage.DailyPanel;
 
 internal sealed class DailyController : IDisposable
 {
-    private readonly Application _app;
     private readonly DailyWindow _window;
     private readonly SessionLogMonitor? _monitor;
+    private readonly Func<CancellationToken, Task<DailySnapshot>> _readSnapshot;
+    private readonly Action<DailyPresentationState, DateTimeOffset, TimeZoneInfo> _renderState;
+    private readonly Action _shutdown;
     private readonly string _home;
     private readonly bool _demo;
     private readonly Forms.NotifyIcon _tray;
@@ -37,6 +40,7 @@ internal sealed class DailyController : IDisposable
     private PanelSettings _settings;
     private bool _disposed;
     private bool _exiting;
+    private bool _reportingOperationFailure;
     private bool _paused;
     private bool _openingPopup;
     private readonly TrayPopupInteraction _popupInteraction = new();
@@ -47,10 +51,14 @@ internal sealed class DailyController : IDisposable
         : this(app, window, home, demo, null, null) { }
 
     public DailyController(Application app, DailyWindow window, string home, bool demo,
-        PanelSettingsStore? settingsStore, PanelSettingsResult? settingsResult)
+        PanelSettingsStore? settingsStore, PanelSettingsResult? settingsResult,
+        Func<CancellationToken, Task<DailySnapshot>>? readSnapshot = null,
+        Action<DailyPresentationState, DateTimeOffset, TimeZoneInfo>? renderState = null,
+        Action? shutdown = null)
     {
-        _app = app;
         _window = window;
+        _renderState = renderState ?? window.SetState;
+        _shutdown = shutdown ?? app.Shutdown;
         _home = Path.GetFullPath(home);
         _demo = demo;
         _settingsStore = settingsStore;
@@ -59,7 +67,8 @@ internal sealed class DailyController : IDisposable
         if (settingsResult?.Issue is { } issue) _state = _state with { Issues = [new DailyIssue(issue.Code)] };
         _window.Configure(_settings);
         _window.SetDemo(demo);
-        _monitor = demo ? null : new SessionLogMonitor(_home, TimeZoneInfo.Local);
+        _monitor = demo || readSnapshot is not null ? null : new SessionLogMonitor(_home, TimeZoneInfo.Local);
+        _readSnapshot = readSnapshot ?? ReadFromMonitorAsync;
         _icon = CreateIcon();
         _menu = new Forms.ContextMenuStrip();
         _menu.Items.Add(_strings["Open"], null, (_, _) => _window.Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(ShowPopup)));
@@ -69,9 +78,8 @@ internal sealed class DailyController : IDisposable
         _pauseItem.CheckedChanged += (_, _) =>
         {
             _paused = _pauseItem.Checked;
-            var start = _scheduler.SetPaused(_paused);
-            RefreshView();
-            if (start) _refresh = RefreshAsync();
+            if (_scheduler.SetPaused(_paused)) StartAdmittedRefresh();
+            else TryRefreshView();
         };
         _menu.Items.Add(_pauseItem);
         _menu.Items.Add(_strings["Folder"], null, (_, _) => OpenFolder());
@@ -85,7 +93,10 @@ internal sealed class DailyController : IDisposable
         };
         _tray.MouseClick += (_, e) => { if (e.Button == Forms.MouseButtons.Left) TogglePopup(); };
         _timer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(10) };
-        _timer.Tick += (_, _) => { RefreshView(); RequestRefresh(RefreshReason.Automatic); };
+        _timer.Tick += (_, _) =>
+        {
+            if (!_exiting && !RequestRefresh(RefreshReason.Automatic)) TryRefreshView();
+        };
         _window.RefreshRequested += BeginRefresh;
         _window.FolderRequested += OpenFolder;
         _window.ExitRequested += async () => await ExitAsync();
@@ -103,44 +114,93 @@ internal sealed class DailyController : IDisposable
         RequestRefresh(RefreshReason.Manual);
     }
 
-    private void RequestRefresh(RefreshReason reason)
+    private bool RequestRefresh(RefreshReason reason)
     {
-        if (_scheduler.Request(reason)) _refresh = RefreshAsync();
+        if (!_scheduler.Request(reason)) return false;
+        StartAdmittedRefresh();
+        return true;
     }
+
+    private void StartAdmittedRefresh() => _refresh = RefreshAsync();
 
     private async Task RefreshAsync()
     {
+        // Publish the task before invoking any presentation callback that can reenter the UI.
+        await Dispatcher.Yield(DispatcherPriority.Background);
+        bool followUp;
         do
         {
-            _state = _state with { LastAttemptAt = DateTimeOffset.Now };
-            RefreshView();
+            var settledNormally = false;
             try
             {
-                var snapshot = _demo ? Program.DemoSnapshot()
-                    : await Task.Run(() => _monitor!.RefreshAsync(DateTimeOffset.UtcNow, _lifetime.Token), _lifetime.Token);
-                if (!_exiting) _state = _state with { Snapshot = snapshot, RefreshFailed = false };
-                _timer.Interval = TimeSpan.FromSeconds(_monitor?.IsLoading == true ? 1 : 10);
+                if (!_exiting) await RefreshOnceAsync();
+                settledNormally = true;
             }
-            catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
             catch (Exception exception) when (exception is not OutOfMemoryException)
             {
-                if (!_exiting) _state = _state with { RefreshFailed = true };
+                HandleOperationFailure(exception);
+                settledNormally = true;
+            }
+            finally
+            {
+                // If the loop is leaving on a fatal failure, do not admit work it cannot run.
+                if (!settledNormally) _scheduler.Exit();
+                followUp = _scheduler.Complete();
             }
         }
-        while (_scheduler.Complete());
-        if (!_exiting) RefreshView();
+        while (followUp);
+        if (!_exiting) TryRefreshView();
     }
 
-    private void RefreshView()
+    private async Task RefreshOnceAsync()
+    {
+        _state = _state with { LastAttemptAt = DateTimeOffset.Now };
+        TryRefreshView();
+        if (_exiting) return;
+
+        var snapshot = _demo ? Program.DemoSnapshot() : await TryReadSnapshotAsync();
+        if (snapshot is null || _exiting) return;
+        _state = _state with { Snapshot = snapshot, RefreshFailed = false };
+        _timer.Interval = TimeSpan.FromSeconds(_monitor?.IsLoading == true ? 1 : 10);
+    }
+
+    private Task<DailySnapshot> ReadFromMonitorAsync(CancellationToken cancellationToken) =>
+        Task.Run(() => _monitor!.RefreshAsync(DateTimeOffset.UtcNow, cancellationToken), cancellationToken);
+
+    private async Task<DailySnapshot?> TryReadSnapshotAsync()
+    {
+        var cancellationToken = _lifetime.Token;
+        try { return await _readSnapshot(cancellationToken); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            if (!_exiting) _state = _state with { RefreshFailed = true };
+        }
+        return null;
+    }
+
+    private void TryRefreshView()
     {
         if (_disposed) return;
         _state = _state with { IsPaused = _scheduler.IsPaused, IsBusy = _scheduler.IsBusy, IsExiting = _exiting };
-        var now = DateTimeOffset.Now;
-        _window.SetState(_state, now, TimeZoneInfo.Local);
-        var view = _state.Project(now, TimeZoneInfo.Local);
+        try
+        {
+            var now = DateTimeOffset.Now;
+            _renderState(_state, now, TimeZoneInfo.Local);
+            UpdateTrayText(_state.Project(now, TimeZoneInfo.Local));
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            HandleOperationFailure(exception);
+        }
+    }
+
+    private void UpdateTrayText(DailyPresentationProjection view)
+    {
         var total = DailyFormatting.Tokens(DailyFormatting.TotalTokens(view.Snapshot?.InputTokens, view.Snapshot?.OutputTokens));
         var label = view.IsStale && view.Snapshot is { } old
-            ? _strings.Format("TraySnapshot", old.Day.ToString("yyyy-MM-dd"), total) : _strings.Format("TrayTotal", total);
+            ? _strings.Format("TraySnapshot", old.Day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), total)
+            : _strings.Format("TrayTotal", total);
         var speed = view.Snapshot?.AverageTps is { } tps && double.IsFinite(tps) ? FormattableString.Invariant($"≈{tps:0.0} t/s") : "—";
         var activity = DailyPresentationFormatting.Activity(view, _strings, _demo);
         var quality = DailyPresentationFormatting.Quality(view, _strings);
@@ -157,9 +217,17 @@ internal sealed class DailyController : IDisposable
     public void HandleOperationFailure(Exception exception)
     {
         ArgumentNullException.ThrowIfNull(exception);
-        if (_exiting) return;
-        _state = _state with { RefreshFailed = true, LastAttemptAt = DateTimeOffset.Now };
-        RefreshView();
+        if (_exiting || _disposed || _reportingOperationFailure) return;
+        _reportingOperationFailure = true;
+        try
+        {
+            _tray.ShowBalloonTip(2000, _strings["Title"], _strings["OperationFailed"], Forms.ToolTipIcon.Info);
+        }
+        catch (Exception reportError) when (reportError is not OutOfMemoryException)
+        {
+            // A failed notification must not cause another notification or redraw.
+        }
+        finally { _reportingOperationFailure = false; }
     }
 
     private void ChangeSettings(PanelSettings settings)
@@ -171,7 +239,7 @@ internal sealed class DailyController : IDisposable
         var keys = new[] { "Open", "Copy", "Refresh", "Pause", "Folder" };
         for (var i = 0; i < keys.Length; i++) _menu.Items[i].Text = _strings[keys[i]];
         _menu.Items[^1].Text = _strings["Exit"];
-        StyleMenu(); RefreshView();
+        StyleMenu(); TryRefreshView();
     }
 
     private void StyleMenu()
@@ -216,7 +284,7 @@ internal sealed class DailyController : IDisposable
     private void ShowPopup()
     {
         if (_exiting) return;
-        RefreshView();
+        TryRefreshView();
         _openingPopup = true;
         try
         {
@@ -265,8 +333,9 @@ internal sealed class DailyController : IDisposable
 
     private void Copy()
     {
-        RefreshView();
-        _window.CopyStats();
+        if (_exiting) return;
+        if (_window.CopyStatsAndGetView() is { } view)
+            UpdateTrayText(view);
     }
 
     private void OpenFolder()
@@ -287,13 +356,22 @@ internal sealed class DailyController : IDisposable
         if (_exiting) return;
         _exiting = true;
         _scheduler.Exit();
-        RefreshView();
         _timer.Stop();
-        _tray.Visible = false;
-        _lifetime.Cancel();
-        try { await _refresh; }
-        catch (Exception) { /* An earlier failed refresh must not prevent exit. */ }
-        finally { _window.Close(); _app.Shutdown(); }
+        try { _lifetime.Cancel(); }
+        catch (AggregateException) { /* Cancellation still reaches the token if a callback fails. */ }
+        try { _tray.Visible = false; }
+        catch (Exception exception) when (exception is not OutOfMemoryException) { HandleOperationFailure(exception); }
+        try { TryRefreshView(); }
+        finally
+        {
+            try { await _refresh; }
+            catch (Exception exception) when (exception is not OutOfMemoryException) { HandleOperationFailure(exception); }
+            finally
+            {
+                try { _window.Close(); }
+                finally { _shutdown(); }
+            }
+        }
     }
 
     public void Dispose()

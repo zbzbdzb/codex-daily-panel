@@ -86,10 +86,9 @@ internal static class Program
             using var controller = new DailyController(application, window, home, demo, settingsStore, settingsResult);
             application.DispatcherUnhandledException += (_, e) =>
             {
+                if (e.Exception is OutOfMemoryException) return;
                 e.Handled = true;
                 controller.HandleOperationFailure(e.Exception);
-                var currentStrings = new DailyStrings(window.Settings.Language);
-                MessageBox.Show(currentStrings["OperationFailed"], currentStrings["Title"], MessageBoxButton.OK, MessageBoxImage.Information);
             };
             controller.Start();
             instance?.StartListening(controller.RequestShow);

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
@@ -19,6 +20,7 @@ public sealed class SessionLogMonitor : IDisposable
     private const long ReadBudget = 64L * 1024 * 1024;
     private readonly string _home;
     private readonly TimeZoneInfo _zone;
+    private readonly Func<DirectoryInfo, IEnumerable<FileSystemInfo>> _enumerateDirectory;
     private readonly Dictionary<string, Source> _sources = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _gate = new(1, 1);
     private DateOnly? _day;
@@ -36,9 +38,14 @@ public sealed class SessionLogMonitor : IDisposable
     public bool IsLoading { get; private set; }
 
     public SessionLogMonitor(string homeDirectory, TimeZoneInfo zone)
+        : this(homeDirectory, zone, EnumerateDirectory) { }
+
+    internal SessionLogMonitor(string homeDirectory, TimeZoneInfo zone,
+        Func<DirectoryInfo, IEnumerable<FileSystemInfo>> enumerateDirectory)
     {
         _home = Path.GetFullPath(homeDirectory);
         _zone = zone;
+        _enumerateDirectory = enumerateDirectory;
     }
 
     public async Task<DailySnapshot> RefreshAsync(DateTimeOffset now, CancellationToken cancellationToken = default)
@@ -48,6 +55,7 @@ public sealed class SessionLogMonitor : IDisposable
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            cancellationToken.ThrowIfCancellationRequested();
             var day = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(now, _zone).DateTime);
             _refreshAt = now;
             if (_day != day)
@@ -82,7 +90,8 @@ public sealed class SessionLogMonitor : IDisposable
             while (_zone.IsInvalidTime(localStart)) localStart = localStart.AddMinutes(1);
             var startOffset = _zone.IsAmbiguousTime(localStart) ? _zone.GetAmbiguousTimeOffsets(localStart).Max() : _zone.GetUtcOffset(localStart);
             var midnight = new DateTimeOffset(localStart, startOffset).UtcDateTime;
-            var paths = Discover(midnight, out var discoveryPartial, out var directoryFound);
+            var paths = Discover(midnight, cancellationToken, out var discoveryPartial, out var directoryFound, out var sourceLimitReached);
+            cancellationToken.ThrowIfCancellationRequested();
             var retained = paths.ToHashSet(StringComparer.OrdinalIgnoreCase);
             var removed = _sources.Keys.Where(path => !retained.Contains(path)).ToArray();
             foreach (var old in removed) RecordLoss(_sources[old], _sources[old].Reader.Coverage);
@@ -169,6 +178,12 @@ public sealed class SessionLogMonitor : IDisposable
                 diagnostics.Add(issue);
             }
             if (!directoryFound) Reason("未找到本机 Codex sessions 日志目录", new(DailyIssueCodes.SourceNotFound));
+            if (sourceLimitReached)
+            {
+                var limit = MaximumFiles.ToString(CultureInfo.InvariantCulture);
+                Reason($"最多读取 {limit} 个日志来源，仅显示可核验小计",
+                    DailyIssue.With(DailyIssueCodes.SourceLimitReached, ("limit", limit)));
+            }
             if (IsLoading) Reason("正在读取今日统计，请稍候…", new(DailyIssueCodes.SourceLoading));
             if (_lostOversizedLine || _sources.Values.Any(source => source.OversizedLine) || activeLosses.Any(loss => !loss.PositiveResolved && loss.OversizedLine))
                 Reason("部分统计或未知日志行超过 4 MiB 读取上限；当前为可读取范围",
@@ -179,7 +194,13 @@ public sealed class SessionLogMonitor : IDisposable
             if (coverageLost) Reason("日志截断、替换或删除后，当日覆盖无法确认；仅显示当前可核验小计", new(DailyIssueCodes.CoverageLost));
             reasons.Add(snapshot.Status);
             diagnostics.AddRange(snapshot.Issues);
-            return snapshot with { Status = string.Join("；", reasons), Issues = diagnostics.AsReadOnly() };
+            // The source cap limits coverage, independently of loading or read failures.
+            return snapshot with
+            {
+                IsPartial = snapshot.IsPartial || sourceLimitReached,
+                Status = string.Join("；", reasons),
+                Issues = diagnostics.AsReadOnly()
+            };
         }
         finally
         {
@@ -424,34 +445,95 @@ public sealed class SessionLogMonitor : IDisposable
         return scopes.Select(x => new DailyTimingUnavailableEvent(x.Session, x.Turn, now));
     }
 
-    private List<string> Discover(DateTime midnightUtc, out bool partial, out bool found)
+    private List<string> Discover(DateTime midnightUtc, CancellationToken cancellationToken,
+        out bool partial, out bool found, out bool sourceLimitReached)
     {
         partial = false;
         found = false;
+        sourceLimitReached = false;
         var paths = new List<string>();
         foreach (var name in new[] { "sessions", "archived_sessions" })
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var root = Path.Combine(_home, name);
             if (!Directory.Exists(root)) continue;
             found = true;
             try
             {
-                if ((File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0) { partial = true; continue; }
-                // Ignore links. A resumed conversation may be in an old date folder;
-                // select by file modification time, then filter each event by local day.
-                var options = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = false, AttributesToSkip = FileAttributes.ReparsePoint };
-                foreach (var path in Directory.EnumerateFiles(root, "*.jsonl", options))
-                {
-                    var info = new FileInfo(path);
-                    if (info.LastWriteTimeUtc < midnightUtc && !_sources.ContainsKey(path)) continue;
-                    if (paths.Count >= MaximumFiles) { partial = true; break; }
-                    paths.Add(path);
-                }
+                if (DiscoverUnderRoot(root, midnightUtc, paths, cancellationToken, ref sourceLimitReached)) partial = true;
             }
             catch (IOException) { partial = true; }
             catch (UnauthorizedAccessException) { partial = true; }
         }
         return paths;
+    }
+
+    internal static IEnumerable<FileSystemInfo> EnumerateDirectory(DirectoryInfo directory) =>
+        directory.EnumerateFileSystemInfos("*", new EnumerationOptions
+        {
+            IgnoreInaccessible = false, AttributesToSkip = FileAttributes.ReparsePoint
+        });
+
+    // Reports enumeration problems separately from reaching the shared source limit.
+    private bool DiscoverUnderRoot(string root, DateTime midnightUtc, List<string> paths,
+        CancellationToken cancellationToken, ref bool sourceLimitReached)
+    {
+        var rootDirectory = new DirectoryInfo(root);
+        var pending = new Queue<DirectoryInfo>();
+        pending.Enqueue(rootDirectory);
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        var partial = false;
+        while (pending.TryDequeue(out var directory))
+        {
+            var isRoot = ReferenceEquals(directory, rootDirectory);
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                // A queued path may have changed since enumeration. Never follow a directory link.
+                var attributes = File.GetAttributes(directory.FullName);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    if (isRoot) return true;
+                    continue;
+                }
+                if ((attributes & FileAttributes.Directory) == 0)
+                {
+                    partial = true;
+                    continue;
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                using var entries = _enumerateDirectory(directory).GetEnumerator();
+                while (true)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!entries.MoveNext()) break;
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var entry = entries.Current;
+                    if (entry is DirectoryInfo child)
+                    {
+                        pending.Enqueue(child);
+                        continue;
+                    }
+                    if (!Path.GetExtension(entry.Name).Equals(".jsonl", comparison)) continue;
+                    var path = entry.FullName;
+                    // A conversation can resume in an old date folder. Select by file timestamp.
+                    var info = new FileInfo(path);
+                    if (info.LastWriteTimeUtc < midnightUtc && !_sources.ContainsKey(path)) continue;
+                    if (paths.Count >= MaximumFiles)
+                    {
+                        sourceLimitReached = true;
+                        return partial;
+                    }
+                    paths.Add(path);
+                }
+            }
+            catch (Exception error) when (!isRoot && error is (IOException or UnauthorizedAccessException))
+            {
+                // Retain entries already discovered and continue with the queued directories.
+                partial = true;
+            }
+        }
+        return partial;
     }
 
     private void ClearSources()

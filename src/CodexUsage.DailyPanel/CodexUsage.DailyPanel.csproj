@@ -12,6 +12,7 @@
     <NoWarn>$(NoWarn);WFO0003</NoWarn>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="CodexUsage.DailyUi.Tests" />
     <ProjectReference Include="../CodexUsage.DailyCore/CodexUsage.DailyCore.csproj" />
     <ProjectReference Include="../CodexUsage.Core/CodexUsage.Core.csproj" />
   </ItemGroup>

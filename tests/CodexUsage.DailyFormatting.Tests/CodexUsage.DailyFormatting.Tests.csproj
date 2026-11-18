@@ -3,5 +3,10 @@
   <ItemGroup>
     <ProjectReference Include="../../src/CodexUsage.DailyCore/CodexUsage.DailyCore.csproj" />
     <Compile Include="../../src/CodexUsage.DailyPanel/DailyFormatting.cs" Link="DailyFormatting.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/DailyPresentationFormatting.cs" Link="DailyPresentationFormatting.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/DailyPresentationState.cs" Link="DailyPresentationState.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/DailyIssueText.cs" Link="DailyIssueText.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/DailyStrings.cs" Link="DailyStrings.cs" />
+    <Compile Include="../../src/CodexUsage.DailyPanel/PanelSettings.cs" Link="PanelSettings.cs" />
   </ItemGroup>
 </Project>

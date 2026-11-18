@@ -53,7 +53,7 @@ CodexDaily 是 Windows x64 托盘统计面板，用于查看本机 Codex 根会�
 
 - 本机时区的今日请求，来自选定 home 下的 `sessions` 和 `archived_sessions`。路径按显式 `--codex-home <目录>`、非空白的 `CODEX_HOME`、用户目录的 `.codex` 的顺序确定。
 - 只汇总根会话，不计子代理、云任务、其他机器以及服务端未落入本机日志的用量。并非账号全部 token 账单。
-- 初次枚举选择当天更新的日志文件，包括保存在旧日期目录中、今天继续使用的会话。最多 32 个文件，每文件最多 25000 个统计事件，全部来源合计最多 50000 个事件。单次 monitor 刷新的读取预算为 64 MiB；reader 单次批次和普通解析单行的上限分别为 4 MiB，不能把这些限制混为单文件大小上限。选中文件中会保留有界的历史统计以对账修订和午夜生命周期；触及限制、文件不可读或统计格式异常时显示 Partial。
+- 初次枚举选择当天更新的日志文件，包括保存在旧日期目录中、今天继续使用的会话。两个目录合计最多纳入 32 个合格日志文件。恰好 32 个且均可完整读取时，数量本身不触发 Partial。发现第 33 个时，面板和“复制统计”会说明来源上限，并给出已核验文件的小计。若另有文件被锁定、无法读取或格式损坏，同时列出相应原因。每文件最多 25000 个统计事件，全部来源合计最多 50000 个事件。单次 monitor 刷新的读取预算为 64 MiB；reader 单次批次和普通解析单行的上限分别为 4 MiB，不能把这些限制混为单文件大小上限。选中文件中会保留有界的历史统计以对账修订和午夜生命周期；触及限制、文件不可读或统计格式异常时显示 Partial。
 - 超过 4 MiB 的 `response_item` / `turn_context` 普通消息行和 `compacted` 上下文压缩记录，会在持续校验完整 JSON、UTF-8、唯一根类型及结构后丢弃正文，不因此误报 token 统计不完整。工具调用与返回的允许时序字段会以有界流式方式提取，即使字段位于大段正文之后也可读取；无法识别的超大工具时序会让相应来源的估算 TPS 不可用。超大的统计行、未知根类型、歧义或损坏行仍标记 Partial，不能静默漏算。
 - 只投影统计字段到内存；不保存聊天正文、不读取认证文件、不发起账号查询。日志以只读共享方式打开。统计不会写回 Codex。
 - 历史分类、首现、闭合及冲突依据只保留在当前 monitor 实例内。重启后的新实例无法证明启动前已丢失来源的完整性；头部/读取边界探针也不保证发现任意内部改写。证据容量不足或未知尾部可能使统计继续保守地标记 Partial。
@@ -142,6 +142,8 @@ Run `CodexDaily.exe` from the complete Windows x64 delivery directory. Check `BU
 Expand **Appearance and language** to select System/Light/Dark and System/简体中文/English. Preferences default to `%LOCALAPPDATA%\CodexDaily\settings.json`; `--settings-dir` selects another directory. Ordinary instances are scoped by current user and normalized log home: a second launch of the same home activates the existing panel.
 
 **Pause automatic refresh** stops new automatic reads. In-flight reads may finish, manual refresh still works, and resuming requests a refresh. **Partial** means only the verifiable subtotal is available. **Stale** retains the original snapshot date and update time; it is not current usage. Unknown is not zero. Copy stats includes exact counts, dates, scope, estimated-TPS notes and current quality reasons.
+
+The panel counts up to 32 eligible log files across `sessions` and `archived_sessions` combined. Exactly 32 fully readable files can produce a complete result. When a 33rd file qualifies, the panel and **Copy stats** report the source limit and show the verified subtotal. If a file is also locked, unreadable or malformed, the corresponding reason appears alongside the limit.
 
 Only local root sessions are counted. Child/cloud sessions and full account billing are excluded. Weekly allowance is a local log snapshot, not a live account query. Use `--codex-home` and `--settings-dir` together for isolated synthetic testing; `--help` and `--version` do not read logs/settings. Rendering and snapshots are auxiliary modes, not ordinary tray-app acceptance evidence.
 

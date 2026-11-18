@@ -34,6 +34,7 @@ public sealed class DailyStrings
         ["Chats"]=("Chats", "会话"), ["Turns"]=("Turns", "回合"), ["ActiveTurns"]=("Active turns", "运行中回合"),
         ["Sources"]=("Sources", "日志来源"), ["Running"]=("{0} running", "{0} 个运行中"),
         ["Coverage"]=("TPS: {0} included / {1} excluded", "TPS：纳入 {0} / 排除 {1}"),
+        ["CoverageUnavailable"]=("TPS coverage: {0}", "TPS 覆盖：{0}"),
         ["Scope"]=("Local root sessions only; subagents and cloud tasks excluded.", "仅本机根会话；不计子代理与云任务。"),
         ["Subsets"]=("Input includes cached input; output includes reasoning. Do not add these subsets again.", "输入包含缓存输入，输出包含推理输出；请勿重复相加。"),
         ["TpsExplanation"]=("Estimated TPS uses output and net time from the same eligible completed turns. TTFT and observed tool waits are merged before subtraction.", "估算 TPS 使用同一组可核验完成回合的输出与净时间；首 token 等待和工具等待合并后扣除。"),

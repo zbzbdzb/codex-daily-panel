@@ -47,6 +47,7 @@ public static class DailyIssueCodes
     public const string SourceNotFound = "source.not_found";
     public const string SourceLoading = "source.loading";
     public const string SourceOversized = "source.oversized";
+    public const string SourceLimitReached = "source.limit_reached";
     public const string SourceUnreadable = "source.unreadable";
     public const string CoverageLost = "source.coverage_lost";
     public const string RefreshFailed = "ui.refresh_failed";

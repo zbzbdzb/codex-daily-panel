@@ -12,8 +12,9 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using CodexUsage.Daily;
 using CodexUsage.DailyPanel;
+using Forms = System.Windows.Forms;
 
-internal static class Program
+internal static partial class Program
 {
     private static int _failures;
     private static int _checks;
@@ -76,6 +77,129 @@ internal static class Program
             window.SetState(new() { Snapshot=Fixture() with { InputTokens=null, OutputTokens=null } },Now,Zone);
             Require(ById<TextBlock>(window,"TotalTokens").Text=="—" && window.CopyText.Contains("Total tokens: Unavailable"),"Unknown must not become zero");
         });
+        foreach (var language in new[] { LanguagePreference.EnUS, LanguagePreference.ZhCN })
+        {
+            var chinese = language == LanguagePreference.ZhCN;
+            var title = chinese ? "Codex 用量" : "Codex Usage";
+            var noData = chinese ? "暂无数据" : "No data";
+            var refreshFailure = chinese
+                ? "最近一次刷新失败；保留快照仍使用原日期与时间。"
+                : "The last refresh failed; any retained snapshot keeps its original date and time.";
+
+            TestCopyActions("first read shows unknown counts and can be copied", language, new() { IsBusy = true }, Now,
+                window => RequireUnknownBreakdown(window, chinese),
+                copy => Require(copy.TrimEnd() == string.Join(Environment.NewLine, title, noData),
+                    "Waiting copy must contain the localized title and no-data text without snapshot fields"));
+
+            TestCopyActions("first read failure can be copied with its reason", language, new() { RefreshFailed = true }, Now,
+                window =>
+                {
+                    RequireUnknownBreakdown(window, chinese);
+                    Require(ById<TextBlock>(window, "DataIssues").Text.Contains(refreshFailure, StringComparison.Ordinal),
+                        "The first refresh failure reason is missing from the panel");
+                },
+                copy => Require(copy.TrimEnd() == string.Join(Environment.NewLine, title, noData, refreshFailure),
+                    "First failure copy must keep the localized reason without inventing snapshot fields"));
+
+            var zero = Fixture() with
+            {
+                InputTokens = 0, CachedInputTokens = 0, OutputTokens = 0, ReasoningTokens = 0,
+                ChatCount = 0, TurnCount = 0, TimedTurnCount = 0, ExcludedTimingTurnCount = 0,
+                ProcessingSeconds = null, ActiveSeconds = null, AverageTps = null
+            };
+            var zeroCounts = chinese ? "会话: 0 · 回合: 0 · 运行中回合: 0" : "Chats: 0 · Turns: 0 · Active turns: 0";
+            var zeroCoverage = chinese ? "TPS：纳入 0 / 排除 0" : "TPS: 0 included / 0 excluded";
+            TestCopyActions("known zero is numeric in the panel and in copy", language, new() { Snapshot = zero }, Now,
+                window =>
+                {
+                    var texts = BreakdownTexts(window);
+                    Require(texts.Contains(zeroCounts) && texts.Contains(zeroCoverage), "Known zero counts or coverage are missing");
+                    Require(ById<TextBlock>(window, "TotalTokens").Text == "0", "Known zero must be shown as a numeric total");
+                },
+                copy =>
+                {
+                    RequireCopyLine(copy, chinese ? "总 token: 0" : "Total tokens: 0");
+                    RequireCopyLine(copy, chinese ? "会话: 0" : "Chats: 0");
+                    RequireCopyLine(copy, chinese ? "回合: 0" : "Turns: 0");
+                    RequireCopyLine(copy, zeroCoverage);
+                });
+
+            var partial = Fixture() with
+            {
+                InputTokens = 1_234_567, OutputTokens = 890, UpdatedAt = Now.AddMinutes(-1),
+                IsPartial = true, Issues = [new(DailyIssueCodes.CoverageLost)]
+            };
+            var partialReason = chinese
+                ? "日志截断、替换或删除后，当日覆盖无法确认；仅显示可核验小计。"
+                : "Daily coverage cannot be confirmed after truncation, replacement or deletion; showing the verifiable subtotal.";
+            var partialLabel = chinese ? "统计不完整" : "Partial";
+            var staleLabel = chinese ? "数据已过期" : "Stale";
+            var staleDayReason = chinese ? "保留的快照属于 2026-10-23，并非今日数据。"
+                : "The retained snapshot belongs to 2026-10-23, not the current day.";
+            var today = chinese ? "今日" : "Today";
+            var todayTrayTotal = chinese ? "今日总 token 1.24M" : "Daily total 1.24M tokens";
+            var datedTrayTotal = chinese ? "2026-10-23 快照：1.24M token" : "Snapshot 2026-10-23: 1.24M tokens";
+            var midnight = Now.AddHours(12);
+            TestCopyActions("partial copy retains exact statistics and reevaluates the date", language, new() { Snapshot = partial }, midnight,
+                window =>
+                {
+                    Require(ById<TextBlock>(window, "DataQuality").Text == partialLabel, "Partial quality is missing before the day changes");
+                    Require(Texts(window).Contains($"{today} · 2026-10-23"), "Snapshot starts on the current day");
+                    Require(Texts(window).Contains("1,235,457"), "Exact partial total is missing from the panel");
+                },
+                copy =>
+                {
+                    RequireCopyLine(copy, chinese ? "总输入: 1,234,567" : "Total input: 1,234,567");
+                    RequireCopyLine(copy, chinese ? "总输出: 890" : "Total output: 890");
+                    RequireCopyLine(copy, chinese ? "总 token: 1,235,457" : "Total tokens: 1,235,457");
+                    RequireCopyLine(copy, chinese ? "快照日期: 2026-10-23 · 本地时间 · UTC+08:00" : "Snapshot date: 2026-10-23 · Local time · UTC+08:00");
+                    RequireCopyLine(copy, chinese ? "更新于：2026-10-23 11:59:00 +08:00" : "Updated: 2026-10-23 11:59:00 +08:00");
+                    RequireCopyLine(copy, chinese ? $"状态: {staleLabel} · {partialLabel}" : $"Status: {staleLabel} · {partialLabel}");
+                    RequireCopyLine(copy, partialReason);
+                    RequireCopyLine(copy, staleDayReason);
+                },
+                displayedAt: midnight.AddTicks(-1),
+                trayCheck: (title + " · " + todayTrayTotal + " · " + partialLabel, (window, tooltip) =>
+                {
+                    Require(tooltip.Contains(datedTrayTotal, StringComparison.Ordinal)
+                        && !tooltip.Contains(todayTrayTotal, StringComparison.Ordinal), "Tray copy left yesterday's subtotal labeled as today");
+                    Require(tooltip.Contains($"{staleLabel} · {partialLabel}", StringComparison.Ordinal), "Tray quality differs from the copied quality");
+                    Require(ById<TextBlock>(window, "DataQuality").Text == $"{staleLabel} · {partialLabel}"
+                        && Texts(window).Contains("2026-10-23"), "Window did not update to the same dated snapshot");
+                    Require(ById<TextBlock>(window, "DataIssues").Text.Contains(staleDayReason, StringComparison.Ordinal),
+                        "The updated panel is missing the day-change reason");
+                }));
+
+            var sourceLimit = DailyIssue.With(DailyIssueCodes.SourceLimitReached, ("limit", "32"));
+            var capped = Fixture() with
+            {
+                InputTokens = 3_200, OutputTokens = 800, SourceCount = 32, IsPartial = true, Issues = [sourceLimit]
+            };
+            var limitReason = chinese ? "最多读取 32 个日志来源，仅显示可核验小计。"
+                : "At most 32 log sources are read. Showing the verifiable subtotal.";
+            var unreadable = chinese ? "部分日志不可读取" : "Some logs cannot be read";
+            TestCopyActions("source limit explains the partial subtotal in the panel and copy", language,
+                new() { Snapshot = capped }, Now,
+                window =>
+                {
+                    var visibleReasons = ById<TextBlock>(window, "DataIssues").Text;
+                    Require(ById<TextBlock>(window, "DataQuality").Text == partialLabel
+                        && ById<TextBlock>(window, "TotalTokens").Text == "4,000", "The panel lost the partial subtotal");
+                    Require(visibleReasons.Contains(limitReason, StringComparison.Ordinal)
+                        && !visibleReasons.Contains(unreadable, StringComparison.Ordinal), "The panel misclassified the source limit");
+                },
+                copy =>
+                {
+                    RequireCopyLine(copy, chinese ? "总 token: 4,000" : "Total tokens: 4,000");
+                    RequireCopyLine(copy, chinese ? "日志来源: 32" : "Sources: 32");
+                    RequireCopyLine(copy, limitReason);
+                    Require(!copy.Contains(unreadable, StringComparison.Ordinal), "Copy reported a false read failure");
+                });
+        }
+        TestCopyActions("copy actions do not write during exit", LanguagePreference.EnUS,
+            new() { Snapshot = Fixture(), IsExiting = true }, Now, _ => { }, checkCopy: null);
+        TestTrayCopyControllerExitGuard();
+        TestRefreshAndExit();
         Test("partial paused and busy states coexist without a current running claim", window =>
         {
             Configure(window,"Light","EnUS");
@@ -131,11 +255,11 @@ internal static class Program
         Test("all diagnostic codes have localized text rather than key fallbacks", window =>
         {
             var codes=typeof(DailyIssueCodes).GetFields(BindingFlags.Public|BindingFlags.Static).Select(f=>(string)f.GetRawConstantValue()!).ToArray();
-            window.SetState(new() {Snapshot=Fixture() with {IsPartial=true,Issues=codes.Select(c=>DailyIssue.With(c,("count","2"),("included","1"),("excluded","1"),("limitMiB","16"),("day","2026-10-22"))).ToArray()}},Now,Zone);
+            window.SetState(new() {Snapshot=Fixture() with {IsPartial=true,Issues=codes.Select(c=>DailyIssue.With(c,("count","2"),("included","1"),("excluded","1"),("limitMiB","16"),("limit","32"),("day","2026-10-22"))).ToArray()}},Now,Zone);
             foreach(var language in new[]{"EnUS","ZhCN"})
             {
                 Configure(window,"Light",language);
-                Require(!window.CopyText.Contains("Diagnostic:") && !window.CopyText.Contains("诊断：") && !window.CopyText.Contains("{count}"),"Known code fallback or missing parameter");
+                Require(!window.CopyText.Contains("Diagnostic:") && !window.CopyText.Contains("诊断：") && !window.CopyText.Contains("{count}") && !window.CopyText.Contains("{limit}"),"Known code fallback or missing parameter");
             }
         });
         Test("unknown diagnostic remains visible without inventing semantics", window =>
@@ -232,10 +356,123 @@ internal static class Program
         Require(method is not null, "Window cannot apply preferences yet");
         method!.Invoke(window, new[] { settings });
     }
-    private static void Test(string name, Action<DailyWindow> test)
+    private static void TestCopyActions(string name, LanguagePreference language, DailyPresentationState state,
+        DateTimeOffset clickTime, Action<DailyWindow> checkView, Action<string>? checkCopy,
+        DateTimeOffset? displayedAt = null, (string BeforeClick, Action<DailyWindow, string> Verify)? trayCheck = null)
+    {
+        var writes = new List<string>();
+        var clockReads = 0;
+        var window = new DailyWindow(() => { clockReads++; return clickTime; }, writes.Add);
+        Test($"{name} ({language})", view =>
+        {
+            using var controller = CreateCopyTestController(view, language);
+            var tray = GetControllerTray(controller);
+            var trayCopy = GetTrayCopyItem(tray, language);
+            var panelCopy = ById<Button>(view, "CopyStats");
+
+            foreach (var (entry, click) in new (string, Action)[]
+            {
+                ("panel", () => panelCopy.RaiseEvent(new RoutedEventArgs(Button.ClickEvent))),
+                ("tray", trayCopy.PerformClick)
+            })
+            {
+                view.SetState(state, displayedAt ?? Now, Zone);
+                if (entry == "panel") checkView(view);
+                else
+                {
+                    view.Hide();
+                    if (trayCheck is { } expected) tray.Text = expected.BeforeClick;
+                }
+                Require(panelCopy.IsEnabled == (checkCopy is not null), "Unexpected copy button availability");
+                writes.Clear();
+                clockReads = 0;
+                click();
+                Require(writes.Count == (checkCopy is null ? 0 : 1), $"Unexpected clipboard writes from {entry}");
+                Require(clockReads == (checkCopy is null ? 0 : 1), $"Unexpected clock reads from {entry}");
+                if (checkCopy is not null) checkCopy(writes.Single());
+                if (entry == "tray" && trayCheck is { } check) check.Verify(view, tray.Text);
+            }
+        }, window);
+    }
+
+    private static void TestTrayCopyControllerExitGuard()
+    {
+        var writes = new List<string>();
+        var clickTime = Now;
+        Test("tray copy stops at controller exit before the window enters exit", view =>
+        {
+            using var controller = CreateCopyTestController(view, LanguagePreference.EnUS);
+            var tray = GetControllerTray(controller);
+            var trayCopy = GetTrayCopyItem(tray, LanguagePreference.EnUS);
+            view.SetState(new() { Snapshot = Fixture() }, Now, Zone);
+            trayCopy.PerformClick();
+            Require(writes.Count == 1, "The menu item must copy before controller exit");
+            writes.Clear();
+            var tooltip = tray.Text;
+
+            var exiting = typeof(DailyController).GetField("_exiting", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException("Controller exit flag not found");
+            // Exercise the interval after the controller starts exiting and before it publishes that state.
+            exiting.SetValue(controller, true);
+            clickTime = Now.AddHours(12);
+            Require(ById<Button>(view, "CopyStats").IsEnabled, "The window's independent exit guard must not mask the controller guard");
+            trayCopy.PerformClick();
+            Require(writes.Count == 0, "The menu wrote to the clipboard after controller exit started");
+            Require(tray.Text == tooltip, "The menu changed the tray tooltip after controller exit started");
+        }, new DailyWindow(() => clickTime, writes.Add));
+    }
+
+    private static DailyController CreateCopyTestController(DailyWindow window, LanguagePreference language)
+    {
+        window.Configure(new PanelSettings(1, ThemePreference.Light, language));
+        // Use the ordinary menu wiring without starting the controller's monitor.
+        var application = Application.Current ?? throw new InvalidOperationException("UI test application is not running");
+        var home = Path.Combine(Path.GetTempPath(), "daily-ui-copy-" + Guid.NewGuid().ToString("N"));
+        return new DailyController(application, window, home, demo: false);
+    }
+
+    private static Forms.NotifyIcon GetControllerTray(DailyController controller)
+    {
+        var trayField = typeof(DailyController).GetField("_tray", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Controller tray icon not found");
+        return (Forms.NotifyIcon)trayField.GetValue(controller)!;
+    }
+
+    private static Forms.ToolStripMenuItem GetTrayCopyItem(Forms.NotifyIcon tray, LanguagePreference language)
+    {
+        var menu = tray.ContextMenuStrip ?? throw new InvalidOperationException("Controller tray menu not found");
+        return menu.Items.OfType<Forms.ToolStripMenuItem>().Single(item =>
+            item.Text == (language == LanguagePreference.ZhCN ? "复制统计" : "Copy stats"));
+    }
+
+    private static string[] BreakdownTexts(DailyWindow window)
+    {
+        ById<Expander>(window, "StatisticsDetails").IsExpanded = true;
+        window.UpdateLayout();
+        return Texts(window);
+    }
+
+    private static void RequireUnknownBreakdown(DailyWindow window, bool chinese)
+    {
+        var texts = BreakdownTexts(window);
+        var counts = chinese ? "会话: 不可用 · 回合: 不可用 · 运行中回合: 不可用" : "Chats: Unavailable · Turns: Unavailable · Active turns: Unavailable";
+        Require(texts.Contains(counts), "Unknown session and turn counts must not be displayed as zeros");
+        Require(texts.Contains(chinese ? "TPS 覆盖：不可用" : "TPS coverage: Unavailable"), "Coverage should be unavailable until a snapshot exists");
+    }
+
+    private static void RequireCopyLine(string copy, string expected) =>
+        Require(copy.Split(Environment.NewLine).Contains(expected), "Missing copy line: " + expected);
+
+    private static void Test(string name, Action<DailyWindow> test, DailyWindow? window = null)
     {
         _checks++;
-        var window = new DailyWindow { ShowActivated = false, Left = -20000, Top = -20000, WindowStartupLocation = WindowStartupLocation.Manual };
+        window ??= new DailyWindow();
+        window.ShowActivated = false;
+        window.Left = -20000;
+        window.Top = -20000;
+        window.WindowStartupLocation = WindowStartupLocation.Manual;
+        var closed = false;
+        window.Closed += (_, _) => closed = true;
         try
         {
             window.Show(); window.UpdateLayout();
@@ -243,7 +480,7 @@ internal static class Program
             Console.WriteLine("PASS " + name);
         }
         catch (Exception e) { _failures++; Console.WriteLine("FAIL " + name + ": " + e.GetBaseException().Message); }
-        finally { window.Close(); }
+        finally { if (!closed) window.Close(); }
     }
     private static void Require(bool condition, string reason) { if (!condition) throw new InvalidOperationException(reason); }
     internal static T ById<T>(DependencyObject root,string id) where T:DependencyObject => Descendants(root).OfType<T>().Single(x=>AutomationProperties.GetAutomationId(x)==id);

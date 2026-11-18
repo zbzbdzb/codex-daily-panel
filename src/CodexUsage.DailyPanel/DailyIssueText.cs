@@ -42,6 +42,7 @@ internal static class DailyIssueText
         [DailyIssueCodes.SourceNotFound] = ("No sessions directory was found in the selected Codex home.", "在所选 Codex 目录中未找到 sessions 日志目录。"),
         [DailyIssueCodes.SourceLoading] = ("Reading local statistics; more source data remains.", "正在读取本地统计，仍有待处理数据。"),
         [DailyIssueCodes.SourceOversized] = ("Some statistics or unknown log lines exceed the {limitMiB} MiB read limit.", "部分统计或未知日志行超过 {limitMiB} MiB 读取上限。"),
+        [DailyIssueCodes.SourceLimitReached] = ("At most {limit} log sources are read. Showing the verifiable subtotal.", "最多读取 {limit} 个日志来源，仅显示可核验小计。"),
         [DailyIssueCodes.SourceUnreadable] = ("Some logs cannot be read or are incomplete; showing the readable scope.", "部分日志不可读取或格式不完整，显示当前可读取范围。"),
         [DailyIssueCodes.CoverageLost] = ("Daily coverage cannot be confirmed after truncation, replacement or deletion; showing the verifiable subtotal.", "日志截断、替换或删除后，当日覆盖无法确认；仅显示可核验小计。"),
         [DailyIssueCodes.RefreshFailed] = ("The last refresh failed; any retained snapshot keeps its original date and time.", "最近一次刷新失败；保留快照仍使用原日期与时间。"),

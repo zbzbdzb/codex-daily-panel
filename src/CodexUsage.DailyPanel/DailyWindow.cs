@@ -28,6 +28,8 @@ public sealed class DailyWindow : Window
     private readonly ComboBox _themeChoice = new(), _languageChoice = new();
     private readonly DispatcherTimer _copyFeedbackTimer = new() { Interval = TimeSpan.FromSeconds(2) };
     private readonly Expander _details;
+    private readonly Func<DateTimeOffset> _getCopyTime;
+    private readonly Action<string> _writeClipboard;
     private DailyPresentationState _state = new();
     private PanelSettings _settings = new();
     private DailyStrings _strings = new(LanguagePreference.System);
@@ -42,8 +44,12 @@ public sealed class DailyWindow : Window
     public string CopyText => DailyPresentationFormatting.Copy(_state.Project(_now, _zoneInfo), _strings, _zoneInfo, _demo);
     public PanelSettings Settings => _settings;
 
-    public DailyWindow()
+    public DailyWindow() : this(() => DateTimeOffset.Now, Clipboard.SetText) { }
+
+    internal DailyWindow(Func<DateTimeOffset> getCopyTime, Action<string> writeClipboard)
     {
+        _getCopyTime = getCopyTime;
+        _writeClipboard = writeClipboard;
         Width = 460; Height = 640; MinWidth = 300; MinHeight = 280;
         WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize; AllowsTransparency = true;
         Background = Brushes.Transparent; FontFamily = new FontFamily("Segoe UI, Microsoft YaHei UI"); FontSize = 14;
@@ -141,7 +147,7 @@ public sealed class DailyWindow : Window
     public void SetBusy(bool busy) => SetState(_state with { IsBusy=busy },DateTimeOffset.Now,_zoneInfo);
     public void SetDemo(bool demo) { _demo=demo; RenderState(); }
 
-    private void RenderState()
+    private DailyPresentationProjection RenderState()
     {
         var view=_state.Project(_now,_zoneInfo); var value=view.Snapshot;
         var day=value?.Day ?? view.CurrentDay;
@@ -159,8 +165,13 @@ public sealed class DailyWindow : Window
         _reasoning.Text=DailyPresentationFormatting.Exact(value?.ReasoningTokens,_strings);
         _uncached.Text=DailyPresentationFormatting.Exact(DailyFormatting.Uncached(value?.InputTokens,value?.CachedInputTokens),_strings);
         _active.Text=DailyFormatting.Duration(value?.ActiveSeconds);
-        _counts.Text=$"{_strings["Chats"]}: {value?.ChatCount ?? 0} · {_strings["Turns"]}: {value?.TurnCount ?? 0} · {_strings["ActiveTurns"]}: {DailyPresentationFormatting.Exact(view.DisplayActiveTurns,_strings)}";
-        _timing.Text=_strings.Format("Coverage",value?.TimedTurnCount ?? 0,value?.ExcludedTimingTurnCount ?? 0);
+        var chats = DailyPresentationFormatting.Exact(value?.ChatCount, _strings);
+        var turns = DailyPresentationFormatting.Exact(value?.TurnCount, _strings);
+        var activeTurns = DailyPresentationFormatting.Exact(view.DisplayActiveTurns, _strings);
+        _counts.Text = $"{_strings["Chats"]}: {chats} · {_strings["Turns"]}: {turns} · {_strings["ActiveTurns"]}: {activeTurns}";
+        _timing.Text = value is null
+            ? _strings.Format("CoverageUnavailable", _strings["Unavailable"])
+            : _strings.Format("Coverage", value.TimedTurnCount, value.ExcludedTimingTurnCount);
         if(view.DisplayWeekly is { } weekly && double.IsFinite(weekly.UsedPercent) && weekly.UsedPercent is >=0 and <=100)
         {
             _weekly.Text=_strings.Format("Remaining",(100-weekly.UsedPercent).ToString("0.#",CultureInfo.InvariantCulture));
@@ -174,7 +185,8 @@ public sealed class DailyWindow : Window
         // Manual intent remains available during a read; the controller coalesces it.
         _refreshButton.IsEnabled=!_state.IsExiting;
         _refreshButton.ToolTip=_state.IsBusy ? _strings["RefreshPending"] : _strings["Refresh"];
-        _copyButton.IsEnabled=value is not null && !_state.IsExiting;
+        _copyButton.IsEnabled=!_state.IsExiting;
+        return view;
     }
     private void PreferencesSelected(object sender, SelectionChangedEventArgs args)
     {
@@ -186,15 +198,22 @@ public sealed class DailyWindow : Window
     {
         if(!_closed && !Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(() => { if(!_closed && _settings.Theme==ThemePreference.System) DailyTheme.Apply(this,_settings.Theme); }));
     }
-    public void CopyStats()
+    public void CopyStats() => CopyStatsAndGetView();
+
+    internal DailyPresentationProjection? CopyStatsAndGetView()
     {
-        if(_state.Snapshot is null || _state.IsExiting) return;
+        if (_state.IsExiting) return null;
         // The copy action may occur between timer ticks or after midnight while paused.
-        _now=DateTimeOffset.Now;
-        RenderState();
-        try { Clipboard.SetText(CopyText); _copyLabel.Text=_strings["Copied"]; }
+        _now = _getCopyTime();
+        var view = RenderState();
+        try
+        {
+            _writeClipboard(DailyPresentationFormatting.Copy(view, _strings, _zoneInfo, _demo));
+            _copyLabel.Text = _strings["Copied"];
+        }
         catch(ExternalException) { _copyLabel.Text=_strings["CopyFailed"]; }
         _copyFeedbackTimer.Stop(); _copyFeedbackTimer.Start();
+        return view;
     }
     private void Tokens(TextBlock compact,TextBlock exact,long? value)
     {
