@@ -135,8 +135,10 @@ internal sealed class DailyLogReader : IDisposable
             {
                 try
                 {
+                    // Most polls only run small positional probes. Use a synchronous handle
+                    // for those probes while retaining cancellable ReadAsync for new bytes.
                     await using var stream = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
-                        ChunkBytes, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                        ChunkBytes, FileOptions.SequentialScan);
                     _sourceMissing = false;
                     FileIdentity identity = GetIdentity(stream);
                     // Sample before validating the previous cursor. A rewrite between the cursor check
