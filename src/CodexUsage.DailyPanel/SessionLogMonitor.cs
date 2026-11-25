@@ -245,9 +245,16 @@ public sealed class SessionLogMonitor : IDisposable
             requestConflicts: RequestConflicts(), requestConflictProof: conflicts);
         // Child metadata is a conditional decision fact, rather than a daily
         // contribution. It is needed only while its session still has candidates.
-        var events = new Dictionary<string, (string Session, string? Turn)>(StringComparer.Ordinal);
+        var events = new Dictionary<string, (string Session, string? Turn)?>(StringComparer.Ordinal);
         foreach (var row in source.Events.Where(x => required.Contains(x) && x is not MetadataEvent { IsChild: true }))
-            events.TryAdd(EventDigest(row), (row.SessionKey, TimingTurn(row)?.Turn));
+        {
+            // The current metadata decides root scope. An unscoped legacy snapshot
+            // can affect coverage but supplies no evidence for a modern turn's timing.
+            (string Session, string? Turn)? timingScope =
+                row is MetadataEvent or UsageEvent { Legacy: true, TurnKey: null }
+                    ? null : (row.SessionKey, TimingTurn(row)?.Turn);
+            events.TryAdd(EventDigest(row), timingScope);
+        }
         var guards = source.Events.Where(exclusions.Contains).Select(x => CreateGuard(x, conflicts)).Where(x => x is not null)
             .Cast<ExclusionGuard>().Distinct().ToList();
         if (events.Count == 0 && guards.Count == 0 && !source.BadStatistics && !source.PendingLine && !source.HasMore
@@ -261,7 +268,7 @@ public sealed class SessionLogMonitor : IDisposable
                 || coverage.Stamp.Bytes == 0 && (source.ReadFailed || source.HasMore),
             source.BadStatistics, source.OversizedLine, source.ReadFailed || source.UncertainTail,
             guards, source.Events.Select(x => x.SessionKey).Distinct(StringComparer.Ordinal).ToArray(),
-            events.Values.Where(x => x.Turn is not null).Distinct().Count());
+            events.Values.Where(x => x?.Turn is not null).Distinct().Count());
         if (_coverageLosses.Any(x => !x.PositiveResolved && x.RawPrefix == loss.RawPrefix && x.Unprovable == loss.Unprovable
             && x.BadStatistics == loss.BadStatistics && x.OversizedLine == loss.OversizedLine
             && x.ReadFailed == loss.ReadFailed && x.Events.Count == events.Count
@@ -300,7 +307,7 @@ public sealed class SessionLogMonitor : IDisposable
     private static string EventDigest(StatsEvent item) => item.GetType().FullName + ":"
         + Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(item, item.GetType())));
 
-    private sealed record CoverageLoss(Dictionary<string, (string Session, string? Turn)> Events, DailyCoverageStamp? RawPrefix, bool Unprovable,
+    private sealed record CoverageLoss(Dictionary<string, (string Session, string? Turn)?> Events, DailyCoverageStamp? RawPrefix, bool Unprovable,
         bool BadStatistics, bool OversizedLine, bool ReadFailed, List<ExclusionGuard> Guards, string[] Sessions,
         int TimedScopeCount)
     {
@@ -437,7 +444,7 @@ public sealed class SessionLogMonitor : IDisposable
                     // A known lost row only disqualifies its own turn (or session if unassociated).
                     // Use current verified digests; cached rows from a blocked source prove nothing.
                     foreach (var (digest, scope) in loss.Events)
-                        if (verifiedCoverage?.Contains(digest) != true) scopes.Add(scope);
+                        if (scope is { } timingScope && verifiedCoverage?.Contains(digest) != true) scopes.Add(timingScope);
             }
             foreach (var guard in loss.Guards.OfType<TimingGuard>())
             {

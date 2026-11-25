@@ -438,6 +438,38 @@ internal static class CoverageLossTests
         });
 
 
+        foreach (var legacy in new[] { false, true })
+        {
+            await Case(legacy
+                ? "COV-30 losing an unscoped legacy snapshot preserves a complete modern sibling's timing"
+                : "COV-29 losing newer equivalent root metadata preserves a complete sibling's timing", async () =>
+            {
+                using var fixture = new Fixture(legacy ? "unscoped-legacy" : "different-root-timestamp");
+                var lost = Metadata("A") + (legacy ? Row("event_msg", At.AddSeconds(-2),
+                    new { type = "token_count", info = new { total_token_usage = Vector(123, 6, 17, 4) } }) : "")
+                    + Completed("A", "r1", At);
+                var survivor = Metadata("A", legacy ? At : At.AddMinutes(-1)) + Completed("A", "r2", At.AddMinutes(1));
+                var path = fixture.WriteSession("newer", lost);
+                fixture.WriteArchive("survivor", survivor);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                ExpectTiming(await monitor.RefreshAsync(Now), 200, 80, 18, 2, 0, legacy, "both sources are readable");
+
+                File.Delete(path);
+                var partial = await monitor.RefreshAsync(Now);
+                ExpectTiming(partial, 100, 40, 9, 1, 0, true, "independently verified surviving turn");
+                Require(partial.Issues.Any(x => x.Code == DailyIssueCodes.CoverageLost), "a lost source still leaves coverage debt");
+                ExpectTiming(await monitor.RefreshAsync(Now), 100, 40, 9, 1, 0, true, "idle after source loss");
+
+                fixture.WriteSession("newer", lost);
+                var restored = await monitor.RefreshAsync(Now);
+                ExpectTiming(restored, 200, 80, 18, 2, 0, legacy, "exact source restoration");
+                Require(restored.Issues.All(x => x.Code != DailyIssueCodes.CoverageLost), "exact restoration clears source coverage debt");
+                Require(restored.Issues.Any(x => x.Code == DailyIssueCodes.LegacyCoverageUnknown) == legacy,
+                    "restoration preserves the independent legacy coverage decision");
+            });
+        }
+
+
         Console.WriteLine($"RESULT COVERAGE LOSS: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Coverage loss regressions:\n" + string.Join("\n", failures));
