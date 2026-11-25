@@ -78,7 +78,7 @@ public sealed class SessionLogMonitor : IDisposable
                 ClearSources();
                 _coverageLosses.Clear();
                 if (guards.Count > 0)
-                    _coverageLosses.Add(new CoverageLoss([], null, false, false, false, false, guards, [], []) { PositiveResolved = true });
+                    _coverageLosses.Add(new CoverageLoss([], null, false, false, false, false, guards, [], 0) { PositiveResolved = true });
                 _coverageEvidenceCount = guards.Count;
                 _unprovableCoverage = overflow;
                 _lostBadStatistics = _lostOversizedLine = _lostReadFailed = false;
@@ -158,7 +158,7 @@ public sealed class SessionLogMonitor : IDisposable
                 catch (OperationCanceledException) { source.Apply(source.Reader.DrainPendingResult()); throw; }
             }
             UpdateUnreadableGuards();
-            ReconcileCoverage();
+            var verifiedCoverage = _coverageLosses.Count == 0 ? null : ReconcileCoverage();
             IsLoading = _sources.Values.Any(source => source.HasMore);
             var current = _sources.Values.SelectMany(source => source.Events).ToArray();
             var view = _coverageLosses.Count > 0 || _unprovableCoverage ? CoverageViewFor(current) : null;
@@ -166,7 +166,7 @@ public sealed class SessionLogMonitor : IDisposable
             var coverageLost = _unprovableCoverage || activeLosses.Length > 0;
             var partial = coverageLost || discoveryPartial || IsLoading || _sources.Values.Any(source => source.BadStatistics || source.ReadFailed || source.UncertainTail || source.PendingLine);
             var events = _sources.Values.SelectMany(source => source.SummaryEvents(now))
-                .Concat(ChildEvidence()).Concat(view is null ? [] : MissingTiming(view, activeLosses, now));
+                .Concat(ChildEvidence()).Concat(view is null ? [] : MissingTiming(view, activeLosses, verifiedCoverage, now));
             var snapshot = DailyAggregator.Summarize(events, day, _zone, now, partial,
                 requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory(), closureFacts: ClosureFacts(),
                 requestConflicts: RequestConflicts()) with { SourceCount = _sources.Count };
@@ -245,25 +245,27 @@ public sealed class SessionLogMonitor : IDisposable
             requestConflicts: RequestConflicts(), requestConflictProof: conflicts);
         // Child metadata is a conditional decision fact, rather than a daily
         // contribution. It is needed only while its session still has candidates.
-        var hashes = source.Events.Where(x => required.Contains(x) && x is not MetadataEvent { IsChild: true })
-            .Select(EventDigest).ToHashSet(StringComparer.Ordinal);
+        var events = new Dictionary<string, (string Session, string? Turn)>(StringComparer.Ordinal);
+        foreach (var row in source.Events.Where(x => required.Contains(x) && x is not MetadataEvent { IsChild: true }))
+            events.TryAdd(EventDigest(row), (row.SessionKey, TimingTurn(row)?.Turn));
         var guards = source.Events.Where(exclusions.Contains).Select(x => CreateGuard(x, conflicts)).Where(x => x is not null)
             .Cast<ExclusionGuard>().Distinct().ToList();
-        if (hashes.Count == 0 && guards.Count == 0 && !source.BadStatistics && !source.PendingLine && !source.HasMore
+        if (events.Count == 0 && guards.Count == 0 && !source.BadStatistics && !source.PendingLine && !source.HasMore
             && !source.ReadFailed && !source.UncertainTail && !coverage.Incomplete) return;
         // Unknown/unread bytes cannot be reconstructed from the remaining valid events.
         // An exact consumed prefix is required for malformed/half-line/timing input.
         var opaque = source.BadStatistics || coverage.Incomplete || source.PendingLine || source.TimingUnavailable || source.UnassociatedTiming
-            || source.ReadFailed && hashes.Count == 0;
-        var loss = new CoverageLoss(hashes, opaque ? coverage.Stamp : null,
+            || source.ReadFailed && events.Count == 0;
+        var loss = new CoverageLoss(events, opaque ? coverage.Stamp : null,
             source.ReadFailed || source.UncertainTail || !coverage.Stable || coverage.ObservedLength > coverage.Stamp.Bytes
                 || coverage.Stamp.Bytes == 0 && (source.ReadFailed || source.HasMore),
             source.BadStatistics, source.OversizedLine, source.ReadFailed || source.UncertainTail,
             guards, source.Events.Select(x => x.SessionKey).Distinct(StringComparer.Ordinal).ToArray(),
-            source.Events.Where(required.Contains).Select(TimingTurn).Where(x => x.HasValue).Select(x => x!.Value).Distinct().ToArray());
+            events.Values.Where(x => x.Turn is not null).Distinct().Count());
         if (_coverageLosses.Any(x => !x.PositiveResolved && x.RawPrefix == loss.RawPrefix && x.Unprovable == loss.Unprovable
             && x.BadStatistics == loss.BadStatistics && x.OversizedLine == loss.OversizedLine
-            && x.ReadFailed == loss.ReadFailed && x.Events.SetEquals(hashes) && x.Guards.ToHashSet().SetEquals(guards))) return;
+            && x.ReadFailed == loss.ReadFailed && x.Events.Count == events.Count
+            && events.Keys.All(x.Events.ContainsKey) && x.Guards.ToHashSet().SetEquals(guards))) return;
         // Repeated generations must not circumvent the existing bounded retention.
         if (_coverageLosses.Count >= MaximumRetainedEvents || _coverageEvidenceCount + loss.EvidenceCount > MaximumRetainedEvents)
         {
@@ -277,9 +279,8 @@ public sealed class SessionLogMonitor : IDisposable
         _coverageEvidenceCount += loss.EvidenceCount;
     }
 
-    private void ReconcileCoverage()
+    private HashSet<string> ReconcileCoverage()
     {
-        if (_coverageLosses.Count == 0) return;
         var drained = _sources.Values.Where(x => x.VerifiedThisRefresh && !x.HasMore && !x.PendingLine && !x.ReadFailed && !x.UncertainTail && x.Reader.Coverage.Stable).ToArray();
         var hashes = drained.Where(x => !x.BadStatistics).SelectMany(x => x.Events).Where(e => e is not QuotaEvent)
             .Select(EventDigest).ToHashSet(StringComparer.Ordinal);
@@ -287,23 +288,24 @@ public sealed class SessionLogMonitor : IDisposable
         {
             var proven = loss.Guards.RemoveAll(x => hashes.Contains(x.Digest));
             _coverageEvidenceCount -= proven;
-            if (!loss.Unprovable && loss.Events.IsSubsetOf(hashes)
+            if (!loss.Unprovable && loss.Events.Keys.All(hashes.Contains)
                 && (loss.RawPrefix is not { } prefix || drained.Any(x => x.Reader.Proves(prefix)))) loss.PositiveResolved = true;
             if (!loss.PositiveResolved || loss.Guards.Count > 0) continue;
             _coverageLosses.Remove(loss);
             _coverageEvidenceCount -= loss.EvidenceCount;
         }
+        return hashes;
     }
 
     private static string EventDigest(StatsEvent item) => item.GetType().FullName + ":"
         + Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(item, item.GetType())));
 
-    private sealed record CoverageLoss(HashSet<string> Events, DailyCoverageStamp? RawPrefix, bool Unprovable,
+    private sealed record CoverageLoss(Dictionary<string, (string Session, string? Turn)> Events, DailyCoverageStamp? RawPrefix, bool Unprovable,
         bool BadStatistics, bool OversizedLine, bool ReadFailed, List<ExclusionGuard> Guards, string[] Sessions,
-        (string Session, string Turn)[] Turns)
+        int TimedScopeCount)
     {
         public bool PositiveResolved { get; set; }
-        public int EvidenceCount => Events.Count + Guards.Count + Sessions.Length + Turns.Length;
+        public int EvidenceCount => Events.Count + Guards.Count + Sessions.Length + TimedScopeCount;
     }
 
     // No retired UsageEvent or token counter is retained in a guard.
@@ -416,7 +418,8 @@ public sealed class SessionLogMonitor : IDisposable
         _ => false
     };
 
-    private IEnumerable<StatsEvent> MissingTiming(CoverageView view, CoverageLoss[] losses, DateTimeOffset now)
+    private IEnumerable<StatsEvent> MissingTiming(CoverageView view, CoverageLoss[] losses,
+        IReadOnlySet<string>? verifiedCoverage, DateTimeOffset now)
     {
         var scopes = new HashSet<(string Session, string? Turn)>();
         var calls = new HashSet<(string Session, string Call)>();
@@ -427,10 +430,14 @@ public sealed class SessionLogMonitor : IDisposable
         {
             if (!loss.PositiveResolved)
             {
-                foreach (var turn in loss.Turns) scopes.Add((turn.Session, turn.Turn));
-                if (loss.RawPrefix.HasValue || loss.Unprovable || loss.Turns.Length == 0)
+                if (loss.RawPrefix.HasValue || loss.Unprovable)
                     foreach (var session in loss.Sessions.Length > 0 ? loss.Sessions : view.Rows.Select(x => x.SessionKey).Distinct(StringComparer.Ordinal))
                         scopes.Add((session, null));
+                else
+                    // A known lost row only disqualifies its own turn (or session if unassociated).
+                    // Use current verified digests; cached rows from a blocked source prove nothing.
+                    foreach (var (digest, scope) in loss.Events)
+                        if (verifiedCoverage?.Contains(digest) != true) scopes.Add(scope);
             }
             foreach (var guard in loss.Guards.OfType<TimingGuard>())
             {

@@ -385,10 +385,82 @@ internal static class CoverageLossTests
             Expect(await monitor.RefreshAsync(Now), 200, 80, 70, 20, false, "source-local replay cannot create daily coverage debt");
         });
 
+        await Case("COV-26 loss and recovery retain timing for each independently verified turn", async () =>
+        {
+            using var fixture = new Fixture("timing-per-turn");
+            var first = Metadata("A") + Completed("A", "r1", At);
+            var second = Completed("A", "r2", At.AddMinutes(1));
+            var third = Completed("A", "r3", At.AddMinutes(2));
+            fixture.WriteSession("A", first + second + third);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            ExpectTiming(await monitor.RefreshAsync(Now), 300, 120, 27, 3, 0, false, "all three turns");
+            fixture.WriteSession("A", first);
+            var truncated = await monitor.RefreshAsync(Now);
+            ExpectTiming(truncated, 100, 40, 9, 1, 0, true, "only the verified prefix remains");
+            Require(truncated.Issues.Any(x => x.Code == DailyIssueCodes.CoverageLost), "truncation still loses daily coverage");
+
+            var mirror = fixture.WriteArchive("split", Metadata("A") + second);
+            ExpectTiming(await monitor.RefreshAsync(Now), 200, 80, 18, 2, 0, true, "exact split recovery with third still missing");
+            using (var locked = new FileStream(mirror, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                ExpectTiming(await monitor.RefreshAsync(Now), 100, 40, null, 0, 1, true, "an unreadable mirror has an unknown tail in the same session");
+            ExpectTiming(await monitor.RefreshAsync(Now), 200, 80, 18, 2, 0, true, "unlocked mirror proves its turn again");
+            fixture.WriteSession("A", first + second + third);
+            ExpectTiming(await monitor.RefreshAsync(Now), 300, 120, 27, 3, 0, false, "restoration and exact mirror do not double count");
+        });
+
+        await Case("COV-27 withdrawn same-order conflict does not invalidate intact sibling timing", async () =>
+        {
+            using var fixture = new Fixture("timing-beside-conflict");
+            var first = Metadata("A") + Completed("A", "r1", At);
+            var conflict = Modern("A", "r1", 0, 0, 0, 0, At.AddSeconds(9));
+            var second = Completed("A", "r2", At.AddMinutes(1));
+            fixture.WriteSession("A", first + conflict + second);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            ExpectTiming(await monitor.RefreshAsync(Now), 100, 40, 9, 1, 1, true, "both versions are observed");
+            fixture.WriteSession("A", first + second);
+            var withdrawn = await monitor.RefreshAsync(Now);
+            ExpectTiming(withdrawn, 100, 40, 9, 1, 1, true, "only the conflicting turn remains excluded");
+            Require(withdrawn.Issues.Any(x => x.Code == DailyIssueCodes.RequestRevisionConflict), "historical conflict is still active");
+            Require(withdrawn.Issues.Any(x => x.Code == DailyIssueCodes.CoverageLost), "withdrawal still loses coverage");
+        });
+
+        await Case("COV-28 opaque removed bytes still block timing within their source session", async () =>
+        {
+            using var fixture = new Fixture("timing-with-opaque-loss");
+            var complete = Metadata("A") + Completed("A", "r1", At) + Completed("A", "r2", At.AddMinutes(1));
+            fixture.WriteSession("A", complete + "{invalid}\n");
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            await monitor.RefreshAsync(Now);
+            fixture.WriteSession("A", complete);
+            var missing = await monitor.RefreshAsync(Now);
+            ExpectTiming(missing, 200, 80, null, 0, 2, true, "missing raw prefix may contain timing for either turn");
+            Require(missing.Issues.Any(x => x.Code == DailyIssueCodes.CoverageLost), "opaque loss remains visible");
+        });
+
+
         Console.WriteLine($"RESULT COVERAGE LOSS: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Coverage loss regressions:\n" + string.Join("\n", failures));
     }
+
+    private static void ExpectTiming(DailySnapshot actual, long input, long output, double? seconds,
+        int included, int excluded, bool partial, string context)
+    {
+        Require(actual.InputTokens == input && actual.OutputTokens == output && actual.ProcessingSeconds == seconds
+            && actual.TimedTurnCount == included && actual.ExcludedTimingTurnCount == excluded && actual.IsPartial == partial,
+            $"{context}: actual input={actual.InputTokens}, output={actual.OutputTokens}, processing={actual.ProcessingSeconds}, "
+            + $"included={actual.TimedTurnCount}, excluded={actual.ExcludedTimingTurnCount}, partial={actual.IsPartial}; {actual.Status}");
+        Require(seconds is { } duration
+            ? actual.AverageTps is { } tps && Math.Abs(tps - output / duration) < .000001
+            : actual.AverageTps is null, $"{context}: unexpected average TPS {actual.AverageTps}");
+    }
+
+    private static string Completed(string session, string request, DateTimeOffset start) =>
+        Row("event_msg", start, new { type = "task_started", turn_id = "synthetic-turn-" + request })
+        + Modern(session, request, 100, 60, 40, 10, start.AddSeconds(9))
+        + Row("event_msg", start.AddSeconds(10),
+            new { type = "task_complete", turn_id = "synthetic-turn-" + request, duration_ms = 10000, time_to_first_token_ms = 1000 });
+
 
     private static void Expect(DailySnapshot actual, long? input, long? cached, long? output,
         long? reasoning, bool partial, string context)
