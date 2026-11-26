@@ -470,10 +470,118 @@ internal static class CoverageLossTests
         }
 
 
+        await Case("COV-31 withdrawn latest scope conflict blocks timing until a verified newer root", async () =>
+        {
+            using var fixture = new Fixture("withdrawn-conflicting-scope");
+            fixture.WriteSession("latest-root", Metadata("A"));
+            var child = Row("session_meta", At.AddHours(-1), new
+            {
+                id = "synthetic-coverage-A",
+                source = new { subagent = new { thread_spawn = new { parent_thread_id = "synthetic-parent" } } }
+            });
+            var childPath = fixture.WriteSession("latest-child", child);
+            fixture.WriteArchive("body", Metadata("A", At.AddMinutes(-1)) + Completed("A", "r1", At));
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            var conflict = await monitor.RefreshAsync(Now);
+            Require(conflict.ProcessingSeconds is null && conflict.Issues.Any(x => x.Code == DailyIssueCodes.MetadataConflict),
+                "initial equal-time classification conflict");
+            File.Delete(childPath);
+            var withdrawn = await monitor.RefreshAsync(Now);
+            ExpectTiming(withdrawn, 100, 40, null, 0, 1, true, "verified same-time root does not replace lost conflicting child");
+            Require(withdrawn.Issues.Any(x => x.Code == DailyIssueCodes.CoverageLost), "conflict withdrawal leaves coverage debt");
+            ExpectTiming(await monitor.RefreshAsync(Now), 100, 40, null, 0, 1, true, "idle does not forget the conflict");
+
+            var newer = fixture.WriteSession("newer-root", Metadata("A", At.AddSeconds(1)));
+            var resolved = await monitor.RefreshAsync(Now);
+            Require(resolved.ProcessingSeconds == 9 && resolved.TimedTurnCount == 1, "strictly newer verified root can supersede conflict timing");
+            File.Delete(newer);
+            ExpectTiming(await monitor.RefreshAsync(Now), 100, 40, null, 0, 1, true, "lost newer root reactivates the conflict");
+            fixture.WriteSession("latest-child", child);
+            Require((await monitor.RefreshAsync(Now)).Issues.Any(x => x.Code == DailyIssueCodes.MetadataConflict),
+                "exact restoration returns to current metadata conflict");
+        });
+
+        await Case("COV-32 a budget-skipped rewritten source cannot contribute cached timing", async () =>
+        {
+            using var fixture = new Fixture("budget-skipped-timing");
+            var filler = fixture.WriteSession("a-filler", "");
+            var newest = fixture.WriteSession("b-current-root", Metadata("A"));
+            fixture.WriteArchive("survivor", Metadata("A", At.AddMinutes(-1)) + Completed("A", "r1", At));
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone,
+                directory => SessionLogMonitor.EnumerateDirectory(directory).OrderBy(entry => entry.Name, StringComparer.Ordinal));
+            ExpectTiming(await monitor.RefreshAsync(Now), 100, 40, 9, 1, 0, false, "initial verified timing");
+
+            File.Delete(newest);
+            fixture.WriteArchive("survivor", Completed("A", "r1", At));
+            FillReadBudget(filler);
+            var skipped = await monitor.RefreshAsync(Now);
+            Require(monitor.IsLoading, "fixture must exercise the read budget in this refresh");
+            ExpectTiming(skipped, 100, 40, null, 0, 1, true, "stale subtotal is partial and cannot prove timing");
+            var verified = await monitor.RefreshAsync(Now);
+            Require(verified.InputTokens is null && verified.ProcessingSeconds is null
+                && verified.Issues.Any(x => x.Code == DailyIssueCodes.MetadataMissing), "actual reread cannot establish a root");
+        });
+
+
+        await Case("COV-33 budget skips preserve verified mirrors but exclude cache-only sibling timing", async () =>
+        {
+            using var fixture = new Fixture("verified-timing-beside-budget-skip");
+            var verified = Metadata("A") + Completed("A", "r1", At);
+            fixture.WriteSession("a-verified", verified);
+            var filler = fixture.WriteSession("b-filler", "");
+            fixture.WriteArchive("cached", verified + Completed("A", "r2", At.AddMinutes(1)));
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone,
+                directory => SessionLogMonitor.EnumerateDirectory(directory).OrderBy(entry => entry.Name, StringComparer.Ordinal));
+            ExpectTiming(await monitor.RefreshAsync(Now), 200, 80, 18, 2, 0, false, "both turns initially verified");
+
+            fixture.WriteArchive("cached", verified);
+            FillReadBudget(filler);
+            var skipped = await monitor.RefreshAsync(Now);
+            Require(monitor.IsLoading && skipped.IsPartial && skipped.InputTokens == 200 && skipped.OutputTokens == 80,
+                "the skipped source may contribute only a partial cached token subtotal");
+            Require(skipped.ProcessingSeconds == 9 && skipped.TimedTurnCount == 1 && skipped.ExcludedTimingTurnCount == 1
+                && skipped.AverageTps is { } tps && Math.Abs(tps - 40d / 9) < .000001,
+                "only the turn proved by the verified mirror supplies timing and TPS output");
+            ExpectTiming(await monitor.RefreshAsync(Now), 100, 40, 9, 1, 0, true, "rereading withdraws the stale turn");
+        });
+
+
+        await Case("COV-34 withdrawn scope conflict applies when a same-day turn arrives later", async () =>
+        {
+            using var fixture = new Fixture("scope-conflict-before-usage");
+            var olderRoot = Metadata("A", At.AddMinutes(-1));
+            fixture.WriteArchive("older-root", olderRoot);
+            var child = Row("session_meta", At.AddHours(-1), new
+            {
+                id = "synthetic-coverage-A",
+                source = new { subagent = new { thread_spawn = new { parent_thread_id = "synthetic-parent" } } }
+            });
+            var disputed = fixture.WriteSession("conflict", Metadata("A") + child);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            Require((await monitor.RefreshAsync(Now)).Issues.Any(x => x.Code == DailyIssueCodes.MetadataConflict),
+                "the latest conflict was observed before any turn");
+            File.Delete(disputed);
+            await monitor.RefreshAsync(Now);
+            fixture.WriteArchive("older-root", olderRoot + Completed("A", "r1", At));
+            ExpectTiming(await monitor.RefreshAsync(Now), 100, 40, null, 0, 1, true, "late turn still lacks a definitive root");
+        });
+
+
         Console.WriteLine($"RESULT COVERAGE LOSS: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Coverage loss regressions:\n" + string.Join("\n", failures));
     }
+
+    private static void FillReadBudget(string path)
+    {
+        using (var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read))
+        {
+            var padding = Utf8.GetBytes(Row("response_item", At, new { type = "message", content = new string('x', 32768) }));
+            while (stream.Position < 66L * 1024 * 1024) stream.Write(padding);
+        }
+        File.SetLastWriteTimeUtc(path, Now.UtcDateTime);
+    }
+
 
     private static void ExpectTiming(DailySnapshot actual, long input, long output, double? seconds,
         int included, int excluded, bool partial, string context)
