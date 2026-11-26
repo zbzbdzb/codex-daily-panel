@@ -31,6 +31,8 @@ public sealed class SessionLogMonitor : IDisposable
     // sources retain hashes and classification facts, never subtotal counters.
     private readonly List<CoverageLoss> _coverageLosses = [];
     private readonly List<ExclusionGuard> _unreadableGuards = [];
+    private readonly Dictionary<string, DateTimeOffset> _observedMetadataConflicts = new(StringComparer.Ordinal);
+    private bool _metadataConflictHistoryOverflow;
     private bool _unprovableCoverage;
     private int _coverageEvidenceCount;
     private bool _lostBadStatistics, _lostOversizedLine, _lostReadFailed;
@@ -71,15 +73,16 @@ public sealed class SessionLogMonitor : IDisposable
                 DailyAggregator.Summarize(_sources.Values.SelectMany(x => x.Events).Concat(ChildEvidence()), day, _zone, now,
                     exclusionProof: exclusions, requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory(), closureFacts: ClosureFacts(),
                     requestConflicts: RequestConflicts(), requestConflictProof: conflicts);
+                var guardCapacity = MaximumRetainedEvents - _observedMetadataConflicts.Count;
                 var guards = Guards().Concat(exclusions.Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>())
-                    .Distinct().Take(MaximumRetainedEvents + 1).ToList();
-                var overflow = guards.Count > MaximumRetainedEvents;
-                if (overflow) guards.RemoveAt(MaximumRetainedEvents);
+                    .Distinct().Take(guardCapacity + 1).ToList();
+                var overflow = guards.Count > guardCapacity;
+                if (overflow) guards.RemoveAt(guardCapacity);
                 ClearSources();
                 _coverageLosses.Clear();
                 if (guards.Count > 0)
                     _coverageLosses.Add(new CoverageLoss([], null, false, false, false, false, guards, [], 0) { PositiveResolved = true });
-                _coverageEvidenceCount = guards.Count;
+                _coverageEvidenceCount = guards.Count + _observedMetadataConflicts.Count;
                 _unprovableCoverage = overflow;
                 _lostBadStatistics = _lostOversizedLine = _lostReadFailed = false;
                 _day = day;
@@ -160,14 +163,17 @@ public sealed class SessionLogMonitor : IDisposable
             UpdateUnreadableGuards();
             var skippedSources = _sources.Values.Where(source => !source.VerifiedThisRefresh && !source.ReadFailed).ToArray();
             var verified = _coverageLosses.Count == 0 && skippedSources.Length == 0 ? null : ReconcileCoverage();
+            RememberMetadataConflicts();
             IsLoading = skippedSources.Length > 0 || _sources.Values.Any(source => source.HasMore);
             var current = _sources.Values.SelectMany(source => source.Events).ToArray();
-            var view = _coverageLosses.Count > 0 || _unprovableCoverage ? CoverageViewFor(current) : null;
-            var activeLosses = view is null ? [] : _coverageLosses.Where(x => !x.PositiveResolved || x.Guards.Any(g => GuardActive(g, view, verified))).ToArray();
-            var coverageLost = _unprovableCoverage || activeLosses.Length > 0;
+            var view = _coverageLosses.Count > 0 || _unprovableCoverage || _observedMetadataConflicts.Count > 0 || _metadataConflictHistoryOverflow
+                ? CoverageViewFor(current) : null;
+            var activeLosses = view is null ? [] : _coverageLosses.Where(x => !x.PositiveResolved || x.Guards.Any(g => GuardActive(g, view))).ToArray();
+            var metadataTimingGaps = view is null ? [] : MetadataTimingGaps(view, verified);
+            var coverageLost = _unprovableCoverage || _metadataConflictHistoryOverflow || activeLosses.Length > 0 || metadataTimingGaps.Length > 0;
             var partial = coverageLost || discoveryPartial || IsLoading || _sources.Values.Any(source => source.BadStatistics || source.ReadFailed || source.UncertainTail || source.PendingLine);
             var events = _sources.Values.SelectMany(source => source.SummaryEvents(now))
-                .Concat(ChildEvidence()).Concat(view is null ? [] : MissingTiming(view, activeLosses, verified, now))
+                .Concat(ChildEvidence()).Concat(view is null ? [] : MissingTiming(view, activeLosses, verified, metadataTimingGaps, now))
                 .Concat(verified is null ? [] : UnverifiedTiming(skippedSources, verified, now));
             var snapshot = DailyAggregator.Summarize(events, day, _zone, now, partial,
                 requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory(), closureFacts: ClosureFacts(),
@@ -217,6 +223,45 @@ public sealed class SessionLogMonitor : IDisposable
     private DailyCoverageStamp[] CoverageTargets() => _coverageLosses.Where(x => !x.PositiveResolved && x.RawPrefix.HasValue)
         .Select(x => x.RawPrefix!.Value).Distinct().ToArray();
 
+    private void RememberMetadataConflicts()
+    {
+        bool changed = false;
+        foreach (var source in _sources.Values)
+        {
+            // A source skipped or denied this poll needs to participate again
+            // when it is verified, even if its cached metadata didn't change.
+            if (!source.CanObserveMetadata) source.MetadataNeedsObservation = true;
+            else if (source.MetadataNeedsObservation)
+            {
+                changed = true;
+                source.MetadataNeedsObservation = false;
+            }
+        }
+        if (!changed || _metadataConflictHistoryOverflow) return;
+
+        var metadata = _sources.Values.Where(x => x.CanObserveMetadata)
+            .SelectMany(x => x.Events).OfType<MetadataEvent>().Concat(ChildEvidence());
+        foreach (var group in metadata.GroupBy(x => (x.SessionKey, x.Timestamp)))
+        {
+            if (!group.Select(x => (x.IsChild, x.ParentKey)).Distinct().Skip(1).Any()) continue;
+            var (session, at) = group.Key;
+            if (_observedMetadataConflicts.TryGetValue(session, out var previous))
+            {
+                if (at > previous) _observedMetadataConflicts[session] = at;
+                continue;
+            }
+            if (_coverageEvidenceCount >= MaximumRetainedEvents)
+            {
+                _metadataConflictHistoryOverflow = true;
+                return;
+            }
+            // One timestamp per session preserves the joint observation.
+            // A newer root can cover it for a refresh, but can't erase it.
+            _observedMetadataConflicts.Add(session, at);
+            _coverageEvidenceCount++;
+        }
+    }
+
     private void UpdateUnreadableGuards()
     {
         // Cached rows from an unreadable source cannot supply counters or timing.
@@ -252,16 +297,7 @@ public sealed class SessionLogMonitor : IDisposable
         foreach (var row in source.Events.Where(x => required.Contains(x) && x is not MetadataEvent { IsChild: true }))
             events.TryAdd(EventDigest(row), TimingScope(row));
 
-        // Retain either withdrawn side of a latest tie. A conflicting child
-        // was not eligible for the ordinary child guard, and the session
-        // may acquire an eligible turn only after the relation disappears.
-        var conflictingTimes = LatestMetadata(observed.OfType<MetadataEvent>())
-            .Where(x => x.Rows.Select(row => (row.IsChild, row.ParentKey)).Distinct().Skip(1).Any())
-            .ToDictionary(x => x.Session, x => x.At, StringComparer.Ordinal);
         var guards = source.Events.Where(exclusions.Contains).Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>()
-            .Concat(source.Events.OfType<MetadataEvent>()
-                .Where(x => conflictingTimes.TryGetValue(x.SessionKey, out var at) && x.Timestamp == at)
-                .Select(x => new MetadataTimingConflictGuard(EventDigest(x), x.SessionKey, x.Timestamp)))
             .Distinct().ToList();
         if (events.Count == 0 && guards.Count == 0 && !source.BadStatistics && !source.PendingLine && !source.HasMore
             && !source.ReadFailed && !source.UncertainTail && !coverage.Incomplete) return;
@@ -294,9 +330,12 @@ public sealed class SessionLogMonitor : IDisposable
 
     private sealed record VerifiedTimingEvidence(HashSet<string> Digests, Dictionary<string, DateTimeOffset> RootTimes);
 
+    private IEnumerable<Source> DrainedSources() => _sources.Values.Where(x => x.VerifiedThisRefresh && !x.HasMore
+        && !x.PendingLine && !x.ReadFailed && !x.UncertainTail && x.Reader.Coverage.Stable);
+
     private VerifiedTimingEvidence ReconcileCoverage()
     {
-        var drained = _sources.Values.Where(x => x.VerifiedThisRefresh && !x.HasMore && !x.PendingLine && !x.ReadFailed && !x.UncertainTail && x.Reader.Coverage.Stable).ToArray();
+        var drained = DrainedSources().ToArray();
         var verifiedRows = drained.Where(x => !x.BadStatistics).SelectMany(x => x.Events);
         var hashes = verifiedRows.Where(e => e is not QuotaEvent).Select(EventDigest).ToHashSet(StringComparer.Ordinal);
         foreach (var loss in _coverageLosses.ToArray())
@@ -328,7 +367,6 @@ public sealed class SessionLogMonitor : IDisposable
     private sealed record OriginGuard(string Hash, string Key, string Request, DateTimeOffset At) : ExclusionGuard(Hash, Key);
     private sealed record RequestConflictGuard(string Hash, string Key, string Request) : ExclusionGuard(Hash, Key);
     private sealed record ChildGuard(string Hash, MetadataEvent Relation) : ExclusionGuard(Hash, Relation.SessionKey);
-    private sealed record MetadataTimingConflictGuard(string Hash, string Key, DateTimeOffset At) : ExclusionGuard(Hash, Key);
     private sealed record TimingGuard(string Hash, StatsEvent Evidence) : ExclusionGuard(Hash, Evidence.SessionKey);
     private sealed record StartOrderGuard(string Hash, StartEvent Evidence) : ExclusionGuard(Hash, Evidence.SessionKey);
     private sealed record ClosureGuard(string Hash, DailyClosureFact Fact) : ExclusionGuard(Hash, Fact.Session);
@@ -448,14 +486,12 @@ public sealed class SessionLogMonitor : IDisposable
         return new(rows, turns, roots, todayRequests, sessions, times, calls);
     }
 
-    private static bool GuardActive(ExclusionGuard guard, CoverageView view, VerifiedTimingEvidence? verified) => guard switch
+    private static bool GuardActive(ExclusionGuard guard, CoverageView view) => guard switch
     {
         OriginGuard origin => view.Roots.Contains(origin.Session) && view.TodayRequests.Contains((origin.Session, origin.Request)),
         RequestConflictGuard conflict => view.Roots.Contains(conflict.Session) && view.TodayRequests.Contains((conflict.Session, conflict.Request)),
         ChildGuard child => view.CandidateSessions.Contains(child.Session)
             && (!view.MetadataTimes.TryGetValue(child.Session, out var latest) || latest <= child.Relation.Timestamp),
-        MetadataTimingConflictGuard conflict => view.Roots.Contains(conflict.Session) && view.CandidateSessions.Contains(conflict.Session)
-            && (verified?.RootTimes.TryGetValue(conflict.Session, out var rootAt) != true || rootAt <= conflict.At),
         TimingGuard timing => view.Roots.Contains(timing.Session) && (TimingTurn(timing.Evidence) is { } own && view.Turns.Contains(own)
             || timing.Evidence is DailyToolEvent { CallKey: { } call } && view.Calls.ContainsKey((timing.Session, call))
             || TimingTurn(timing.Evidence) is null && view.CandidateSessions.Contains(timing.Session)),
@@ -465,12 +501,28 @@ public sealed class SessionLogMonitor : IDisposable
         _ => false
     };
 
+    private string[] MetadataTimingGaps(CoverageView view, VerifiedTimingEvidence? verified)
+    {
+        if (_observedMetadataConflicts.Count == 0 || _metadataConflictHistoryOverflow) return [];
+        var affected = view.CandidateSessions.Where(_observedMetadataConflicts.ContainsKey).ToArray();
+        if (affected.Length == 0) return [];
+        // Match the metadata actually projected into the subtotal. An unreadable
+        // source's cached rows are omitted from the snapshot.
+        var roots = RootTimes(_sources.Values.Where(x => !x.ReadFailed)
+            .SelectMany(x => x.Events).OfType<MetadataEvent>().Concat(ChildEvidence()));
+        var checkedRoots = verified?.RootTimes ?? RootTimes(DrainedSources().Where(x => !x.BadStatistics)
+            .SelectMany(x => x.Events).OfType<MetadataEvent>().Concat(ChildEvidence()));
+        return affected.Where(session => roots.ContainsKey(session)
+            && (!checkedRoots.TryGetValue(session, out var at) || at <= _observedMetadataConflicts[session])).ToArray();
+    }
+
     private IEnumerable<StatsEvent> MissingTiming(CoverageView view, CoverageLoss[] losses,
-        VerifiedTimingEvidence? verified, DateTimeOffset now)
+        VerifiedTimingEvidence? verified, string[] metadataTimingGaps, DateTimeOffset now)
     {
         var scopes = new HashSet<(string Session, string? Turn)>();
+        foreach (var session in metadataTimingGaps) scopes.Add((session, null));
         var calls = new HashSet<(string Session, string Call)>();
-        if (_unprovableCoverage)
+        if (_unprovableCoverage || _metadataConflictHistoryOverflow)
             foreach (var session in view.Rows.Select(x => x.SessionKey).Distinct(StringComparer.Ordinal))
                 scopes.Add((session, null));
         foreach (var loss in losses)
@@ -486,9 +538,6 @@ public sealed class SessionLogMonitor : IDisposable
                     foreach (var (digest, scope) in loss.Events)
                         if (scope is { } timingScope && verified?.Digests.Contains(digest) != true) scopes.Add(timingScope);
             }
-            foreach (var conflict in loss.Guards.OfType<MetadataTimingConflictGuard>())
-                if (GuardActive(conflict, view, verified)) scopes.Add((conflict.Session, null));
-
             foreach (var guard in loss.Guards.OfType<TimingGuard>())
             {
                 if (!view.Roots.Contains(guard.Session)) continue;
@@ -630,6 +679,8 @@ public sealed class SessionLogMonitor : IDisposable
         public List<StatsEvent> Events { get; } = [];
         public bool HasMore { get; set; } = true;
         public bool VerifiedThisRefresh { get; set; }
+        public bool MetadataNeedsObservation { get; set; }
+        public bool CanObserveMetadata => VerifiedThisRefresh && !ReadFailed && Reader.HasStablePrefix;
         public bool PendingLine { get; set; }
         public bool ReadFailed { get; set; }
         public bool UncertainTail { get; set; }
@@ -702,6 +753,7 @@ public sealed class SessionLogMonitor : IDisposable
                 }
                 if (Events.Count >= MaximumEventsPerFile || !_canRetain()) { BadStatistics = true; return; }
                 Events.Add(item);
+                if (item is MetadataEvent) MetadataNeedsObservation = true;
                 _changeCount(1);
             }
             if (line.Contains("task_aborted", StringComparison.Ordinal) || line.Contains("turn_aborted", StringComparison.Ordinal))

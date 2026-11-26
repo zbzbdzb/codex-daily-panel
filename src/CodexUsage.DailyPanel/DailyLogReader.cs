@@ -94,8 +94,9 @@ internal sealed class DailyLogReader : IDisposable
     internal int RetainedLineBytes => _line.Length;
     /// <summary>Raised after resetting the cursor and before delivering any replacement-file lines.</summary>
     public event Action? ResetDetected;
+    internal bool HasStablePrefix => !_pendingReset;
     internal DailyCoverageState Coverage => new(new(Offset, Convert.ToHexString(_coverage.GetCurrentHash())), _observedLength,
-        !_pendingReset, _lineLength > 0 || _skippingOversizedLine);
+        HasStablePrefix, _lineLength > 0 || _skippingOversizedLine);
     internal DailyCoverageState CoverageBeforeReset { get; private set; }
     internal bool Proves(DailyCoverageStamp stamp) => !_pendingReset && (_coverageMatches.Contains(stamp) || Coverage.Stamp == stamp);
 

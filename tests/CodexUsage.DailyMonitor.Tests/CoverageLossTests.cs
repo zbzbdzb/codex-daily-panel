@@ -567,6 +567,127 @@ internal static class CoverageLossTests
         });
 
 
+        foreach (var alternating in new[] { false, true })
+        {
+            await Case(alternating
+                ? "COV-36 replaying the sides separately cannot erase an observed scope conflict"
+                : "COV-35 an observed scope conflict survives withdrawal under a newer verified root", async () =>
+            {
+                using var fixture = new Fixture(alternating ? "alternating-scope" : "superseded-scope");
+                fixture.WriteArchive("a-body", Metadata("A", At.AddMinutes(-1)) + Completed("A", "a", At, 60, 13));
+                fixture.WriteArchive("b-independent", Metadata("B") + Completed("B", "b", At.AddMinutes(1)));
+                var rootSide = Metadata("A");
+                var childSide = ChildMetadata("A");
+                var bothSides = rootSide + childSide;
+                var disputed = fixture.WriteSession("conflict", bothSides);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                var liveConflict = await monitor.RefreshAsync(Now);
+                ExpectTiming(liveConflict, 100, 40, 9, 1, 0, true, "current conflict excludes A from root totals");
+                Require(liveConflict.Issues.Any(x => x.Code == DailyIssueCodes.MetadataConflict), "the equal-time scope conflict was observed");
+
+                if (alternating)
+                {
+                    File.Delete(disputed);
+                    ExpectTiming(await monitor.RefreshAsync(Now), 200, 100, 9, 1, 1, true,
+                        "withdrawn tie leaves the two known token totals and only B's timing", timedOutput: 40);
+                }
+
+                var newer = fixture.WriteSession("newer", Metadata("A", At.AddSeconds(1)));
+                if (alternating)
+                {
+                    fixture.WriteSession("single-side", childSide);
+                    ExpectTiming(await monitor.RefreshAsync(Now), 200, 100, 21, 2, 0, true,
+                        "new root permits timing while the missing root-side coverage is still unresolved");
+                    fixture.WriteSession("single-side", rootSide);
+                    ExpectTiming(await monitor.RefreshAsync(Now), 200, 100, 21, 2, 0, false, "new root with root side");
+                }
+                else
+                {
+                    ExpectTiming(await monitor.RefreshAsync(Now), 200, 100, 21, 2, 0, false, "new root with both sides");
+                    File.Delete(disputed);
+                    ExpectTiming(await monitor.RefreshAsync(Now), 200, 100, 21, 2, 0, false, "new root after tie withdrawal");
+                }
+
+                File.Delete(newer);
+                foreach (var stage in new[] { "withdrawal of the newer root", "idle after withdrawal" })
+                {
+                    var fallback = await monitor.RefreshAsync(Now);
+                    var sequence = alternating ? "alternating" : "superseded";
+                    Console.WriteLine($"SCOPE TIMING {sequence}, {stage}: {fallback.InputTokens}/{fallback.OutputTokens}, "
+                        + $"{fallback.ProcessingSeconds:R}s, TPS={fallback.AverageTps:R}, "
+                        + $"{fallback.TimedTurnCount}/{fallback.ExcludedTimingTurnCount}, partial={fallback.IsPartial}");
+                    ExpectTiming(fallback, 200, 100, 9, 1, 1, true, stage, timedOutput: 40);
+                    Require(fallback.Issues.Any(x => x.Code == DailyIssueCodes.CoverageLost), stage + " retains the historical timing gap");
+                }
+
+                fixture.WriteSession("conflict", bothSides);
+                var restored = await monitor.RefreshAsync(Now);
+                ExpectTiming(restored, 100, 40, 9, 1, 0, true, "exact joint restore reports the current classification conflict");
+                Require(restored.Issues.Any(x => x.Code == DailyIssueCodes.MetadataConflict),
+                    "both sides jointly restore the current classification conflict");
+                fixture.WriteSession("newer", Metadata("A", At.AddSeconds(1)));
+                ExpectTiming(await monitor.RefreshAsync(Now), 200, 100, 21, 2, 0, false, "latest root verified again");
+            });
+        }
+
+        await Case("COV-37 a budget-skipped later root cannot cover an observed conflict", async () =>
+        {
+            using var fixture = new Fixture("scope-conflict-skipped-root");
+            fixture.WriteSession("a-body", Metadata("A", At.AddMinutes(-1)) + Completed("A", "a", At));
+            fixture.WriteSession("b-independent", Metadata("B") + Completed("B", "b", At.AddMinutes(1)));
+            var filler = fixture.WriteSession("c-filler", "");
+            var disputed = fixture.WriteArchive("conflict", Metadata("A") + ChildMetadata("A"));
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone,
+                directory => SessionLogMonitor.EnumerateDirectory(directory).OrderBy(entry => entry.Name, StringComparer.Ordinal));
+            ExpectTiming(await monitor.RefreshAsync(Now), 100, 40, 9, 1, 0, true, "original jointly observed conflict");
+            fixture.WriteArchive("newer", Metadata("A", At.AddSeconds(1)));
+            ExpectTiming(await monitor.RefreshAsync(Now), 200, 80, 18, 2, 0, false, "newer root verified while conflict is still present");
+            File.Delete(disputed);
+            FillReadBudget(filler);
+            var skipped = await monitor.RefreshAsync(Now);
+            Require(monitor.IsLoading, "newer root must be skipped by the read budget");
+            ExpectTiming(skipped, 200, 80, 9, 1, 1, true, "cached newer root cannot cover an observed conflict", timedOutput: 40);
+            ExpectTiming(await monitor.RefreshAsync(Now), 200, 80, 18, 2, 0, false, "rereading confirms the newer root");
+        });
+
+        await Case("COV-38 a conflict observed with a retained child fact still applies after midnight", async () =>
+        {
+            using var fixture = new Fixture("scope-conflict-historical-child");
+            var olderA = Metadata("A", At.AddMinutes(-1));
+            var stableB = Metadata("B");
+            fixture.WriteArchive("a-body", olderA + Completed("A", "a", At));
+            fixture.WriteArchive("b-independent", stableB + Completed("B", "b", At.AddMinutes(1)));
+            var child = fixture.WriteSession("child", ChildMetadata("A"));
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            ExpectTiming(await monitor.RefreshAsync(Now), 100, 40, 9, 1, 0, false, "confirmed child excluded");
+            File.Delete(child);
+            await monitor.RefreshAsync(Now);
+
+            var rootSide = fixture.WriteSession("root-tie", Metadata("A"));
+            var tied = await monitor.RefreshAsync(Now);
+            Require(tied.Issues.Any(x => x.Code == DailyIssueCodes.MetadataConflict),
+                "current root and retained child prove the conflicting relationship at one instant");
+            File.Delete(rootSide);
+            fixture.WriteSession("child", ChildMetadata("A"));
+            var newer = fixture.WriteSession("newer", Metadata("A", At.AddSeconds(1)));
+            var covered = await monitor.RefreshAsync(Now);
+            ExpectTiming(covered, 200, 80, 18, 2, 0, true, "newer root proves timing after the child reappears");
+            Require(covered.Issues.Any(x => x.Code == DailyIssueCodes.CoverageLost),
+                "the separately withdrawn root-side record still leaves a daily coverage gap");
+            File.Delete(child);
+            ExpectTiming(await monitor.RefreshAsync(Now), 200, 80, 18, 2, 0, true, "newer root remains");
+            File.Delete(newer);
+            ExpectTiming(await monitor.RefreshAsync(Now), 200, 80, 9, 1, 1, true, "fallback to older root", timedOutput: 40);
+
+            var tomorrow = Now.AddDays(1);
+            var a = fixture.WriteArchive("a-body", olderA + Completed("A", "a-next-day", At.AddDays(1)));
+            var b = fixture.WriteArchive("b-independent", stableB + Completed("B", "b-next-day", At.AddDays(1).AddMinutes(1)));
+            File.SetLastWriteTimeUtc(a, tomorrow.UtcDateTime);
+            File.SetLastWriteTimeUtc(b, tomorrow.UtcDateTime);
+            ExpectTiming(await monitor.RefreshAsync(tomorrow), 200, 80, 9, 1, 1, true,
+                "day rollover retains the classification fact while replacing daily totals", timedOutput: 40);
+        });
+
         Console.WriteLine($"RESULT COVERAGE LOSS: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Coverage loss regressions:\n" + string.Join("\n", failures));
@@ -584,22 +705,22 @@ internal static class CoverageLossTests
 
 
     private static void ExpectTiming(DailySnapshot actual, long input, long output, double? seconds,
-        int included, int excluded, bool partial, string context)
+        int included, int excluded, bool partial, string context, long? timedOutput = null)
     {
         Require(actual.InputTokens == input && actual.OutputTokens == output && actual.ProcessingSeconds == seconds
             && actual.TimedTurnCount == included && actual.ExcludedTimingTurnCount == excluded && actual.IsPartial == partial,
             $"{context}: actual input={actual.InputTokens}, output={actual.OutputTokens}, processing={actual.ProcessingSeconds}, "
             + $"included={actual.TimedTurnCount}, excluded={actual.ExcludedTimingTurnCount}, partial={actual.IsPartial}; {actual.Status}");
         Require(seconds is { } duration
-            ? actual.AverageTps is { } tps && Math.Abs(tps - output / duration) < .000001
+            ? actual.AverageTps is { } tps && Math.Abs(tps - (timedOutput ?? output) / duration) < .000001
             : actual.AverageTps is null, $"{context}: unexpected average TPS {actual.AverageTps}");
     }
 
-    private static string Completed(string session, string request, DateTimeOffset start) =>
+    private static string Completed(string session, string request, DateTimeOffset start, long output = 40, int durationSeconds = 10) =>
         Row("event_msg", start, new { type = "task_started", turn_id = "synthetic-turn-" + request })
-        + Modern(session, request, 100, 60, 40, 10, start.AddSeconds(9))
-        + Row("event_msg", start.AddSeconds(10),
-            new { type = "task_complete", turn_id = "synthetic-turn-" + request, duration_ms = 10000, time_to_first_token_ms = 1000 });
+        + Modern(session, request, 100, 60, output, 10, start.AddSeconds(durationSeconds - 1))
+        + Row("event_msg", start.AddSeconds(durationSeconds),
+            new { type = "task_complete", turn_id = "synthetic-turn-" + request, duration_ms = durationSeconds * 1000, time_to_first_token_ms = 1000 });
 
 
     private static void Expect(DailySnapshot actual, long? input, long? cached, long? output,
@@ -619,6 +740,12 @@ internal static class CoverageLossTests
 
     private static string Metadata(string session, DateTimeOffset? time = null) =>
         Row("session_meta", (time ?? At).AddHours(-1), new { id = "synthetic-coverage-" + session, source = "cli" });
+
+    private static string ChildMetadata(string session) => Row("session_meta", At.AddHours(-1), new
+    {
+        id = "synthetic-coverage-" + session,
+        source = new { subagent = new { thread_spawn = new { parent_thread_id = "synthetic-parent" } } }
+    });
 
     private static string Modern(string session, string request, long input, long cached, long output,
         long reasoning, DateTimeOffset? time = null) => Row("token_usage_record", time ?? At, new
