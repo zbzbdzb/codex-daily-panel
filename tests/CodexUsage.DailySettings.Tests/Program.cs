@@ -16,12 +16,22 @@ if (args.Length == 2 && args[0] == "--activation-worker")
         return false; // The Windows-denial path must still send the show request.
     }).GetAwaiter().GetResult() ? 0 : 1;
 }
-if (args.Length != 2 || args[0] != "--test-root" || !Path.IsPathFullyQualified(args[1]))
+if (args.Length == 3 && args[0] == "--compare-image-files" &&
+    Path.IsPathFullyQualified(args[1]) && Path.IsPathFullyQualified(args[2]))
 {
-    Console.Error.WriteLine("Require --test-root <new physical synthetic directory>.");
+    using var first = SingleInstanceCoordinator.TryOpenImageFile(args[1]);
+    using var second = SingleInstanceCoordinator.TryOpenImageFile(args[2]);
+    Console.WriteLine(SingleInstanceCoordinator.HaveSameImageFileIdentity(first, second) ? "same" : "different-or-unverified");
+    return 0;
+}
+if (args.Length is not (2 or 4) || args[0] != "--test-root" || !Path.IsPathFullyQualified(args[1]) ||
+    (args.Length == 4 && (args[2] != "--apphost-alias" || !Path.IsPathFullyQualified(args[3]))))
+{
+    Console.Error.WriteLine("Require --test-root <new physical synthetic directory> [--apphost-alias <synthetic apphost>].");
     return 2;
 }
 var root = args[1];
+var apphostAlias = args.Length == 4 ? args[3] : null;
 if (Directory.Exists(root)) throw new InvalidOperationException("Test root must be new.");
 Directory.CreateDirectory(root);
 var passed = 0;
@@ -248,7 +258,7 @@ Test("separate process activates the existing primary without duplicate ownershi
     Check(primary.IsPrimary, "Primary acquisition failed.");
     var calls = 0;
     primary.StartListening(() => Interlocked.Increment(ref calls));
-    var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+    var start = new ProcessStartInfo(apphostAlias ?? Environment.ProcessPath!) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
     var genericHost = string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), "dotnet", StringComparison.OrdinalIgnoreCase);
     if (genericHost)
         start.ArgumentList.Add(typeof(PanelSettings).Assembly.Location);

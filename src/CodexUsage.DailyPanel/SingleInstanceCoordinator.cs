@@ -152,17 +152,60 @@ public sealed class SingleInstanceCoordinator : IDisposable
         const uint queryLimitedInformation = 0x1000;
         using var process = OpenProcess(queryLimitedInformation, false, processId);
         if (process.IsInvalid) return;
-        var path = new StringBuilder(image.Length + 1);
+        // The peer may have been launched through an alias of a different length.
+        var path = new StringBuilder(32768);
         var length = (uint)path.Capacity;
-        if (QueryFullProcessImageName(process, 0, path, ref length) &&
-            string.Equals(path.ToString(), image, StringComparison.OrdinalIgnoreCase) &&
-            !cancellationToken.IsCancellationRequested)
+        if (!QueryFullProcessImageName(process, 0, path, ref length) || cancellationToken.IsCancellationRequested)
+            return;
+
+        using var currentImage = TryOpenImageFile(image);
+        using var primaryImage = TryOpenImageFile(path.ToString());
+        if (HaveSameImageFileIdentity(currentImage, primaryImage) && !cancellationToken.IsCancellationRequested)
         {
             // Windows may deny the handoff. In that case the existing instance
             // still receives the normal show request.
             _ = allowForeground(processId);
         }
     }
+
+    internal static SafeFileHandle? TryOpenImageFile(string path)
+    {
+        try
+        {
+            // Follow path aliases and hold the resolved file against replacement
+            // while the foreground handoff is considered.
+            return File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or SecurityException or
+                                  ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    internal static bool HaveSameImageFileIdentity(SafeFileHandle? first, SafeFileHandle? second)
+    {
+        const int fileIdInfo = 18;
+        var size = (uint)Marshal.SizeOf<ImageFileId>();
+        return first is { IsInvalid: false, IsClosed: false } && second is { IsInvalid: false, IsClosed: false } &&
+            GetFileInformationByHandleEx(first, fileIdInfo, out var left, size) &&
+            GetFileInformationByHandleEx(second, fileIdInfo, out var right, size) &&
+            (left.Low != 0 || left.High != 0) &&
+            left.VolumeSerial == right.VolumeSerial && left.Low == right.Low && left.High == right.High;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ImageFileId
+    {
+        public ulong VolumeSerial;
+        public ulong Low;
+        public ulong High;
+    }
+
+    [DllImport("kernel32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle file, int informationClass,
+        out ImageFileId identity, uint size);
 
     [DllImport("kernel32.dll", ExactSpelling = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
