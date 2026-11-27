@@ -10,7 +10,11 @@ using CodexUsage.DailyPanel;
 if (args.Length == 2 && args[0] == "--activation-worker")
 {
     using var instance = SingleInstanceCoordinator.Acquire(args[1]);
-    return !instance.IsPrimary && instance.TryActivateAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult() ? 0 : 1;
+    return !instance.IsPrimary && instance.TryActivateAsync(TimeSpan.FromSeconds(2), processId =>
+    {
+        Console.WriteLine($"FOREGROUND-TARGET {processId}");
+        return false; // The Windows-denial path must still send the show request.
+    }).GetAwaiter().GetResult() ? 0 : 1;
 }
 if (args.Length != 2 || args[0] != "--test-root" || !Path.IsPathFullyQualified(args[1]))
 {
@@ -180,7 +184,9 @@ Test("same normalized home owns one local instance and bounded activation", () =
     primary.StartListening(() => Interlocked.Increment(ref calls));
     using var secondary = SingleInstanceCoordinator.Acquire(Path.Combine(home, ".") + Path.DirectorySeparatorChar);
     Check(!secondary.IsPrimary, "Normalized home created another primary.");
-    Check(secondary.TryActivateAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult(), "Activation not acknowledged.");
+    Check(secondary.TryActivateAsync(TimeSpan.FromSeconds(2), _ =>
+        throw new InvalidOperationException("In-process endpoint was offered foreground permission.")).GetAwaiter().GetResult(),
+        "Activation not acknowledged.");
     Check(Volatile.Read(ref calls) == 1, "Activation callback count wrong.");
     using var distinct = SingleInstanceCoordinator.Acquire(Path.Combine(root, "other-home"));
     Check(distinct.IsPrimary, "Distinct home collided.");
@@ -243,7 +249,8 @@ Test("separate process activates the existing primary without duplicate ownershi
     var calls = 0;
     primary.StartListening(() => Interlocked.Increment(ref calls));
     var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
-    if (string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), "dotnet", StringComparison.OrdinalIgnoreCase))
+    var genericHost = string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), "dotnet", StringComparison.OrdinalIgnoreCase);
+    if (genericHost)
         start.ArgumentList.Add(typeof(PanelSettings).Assembly.Location);
     start.ArgumentList.Add("--activation-worker"); start.ArgumentList.Add(home.ToLowerInvariant());
     using var firstWorker = Process.Start(start)!;
@@ -251,14 +258,51 @@ Test("separate process activates the existing primary without duplicate ownershi
     try
     {
         Check(firstWorker.WaitForExit(5000) && secondWorker.WaitForExit(5000), "Secondary processes did not return within bounded activation interval.");
-        var diagnostics = $"exit={firstWorker.ExitCode},{secondWorker.ExitCode}; calls={Volatile.Read(ref calls)}; stdout={firstWorker.StandardOutput.ReadToEnd()}{secondWorker.StandardOutput.ReadToEnd()}; stderr={firstWorker.StandardError.ReadToEnd()}{secondWorker.StandardError.ReadToEnd()}";
+        var firstOutput = firstWorker.StandardOutput.ReadToEnd().Trim();
+        var secondOutput = secondWorker.StandardOutput.ReadToEnd().Trim();
+        var diagnostics = $"exit={firstWorker.ExitCode},{secondWorker.ExitCode}; calls={Volatile.Read(ref calls)}; stdout={firstOutput}/{secondOutput}; stderr={firstWorker.StandardError.ReadToEnd()}{secondWorker.StandardError.ReadToEnd()}";
         Check(firstWorker.ExitCode == 0 && secondWorker.ExitCode == 0 && Volatile.Read(ref calls) == 2, "Separate processes failed activation: " + diagnostics);
-        Console.WriteLine("ACTIVATION-WORKERS exits=0,0; calls=2");
+        var foregroundTarget = genericHost ? "" : $"FOREGROUND-TARGET {Environment.ProcessId}";
+        Check(firstOutput == foregroundTarget && secondOutput == foregroundTarget, "Secondary did not offer foreground permission to the connected primary: " + diagnostics);
+        Console.WriteLine(genericHost
+            ? "ACTIVATION-WORKERS exits=0,0; calls=2; foreground grant skipped for generic host"
+            : "ACTIVATION-WORKERS exits=0,0; calls=2; foreground grant offered twice to the primary and denied by test double");
     }
     finally
     {
         foreach (var worker in new[] { firstWorker, secondWorker })
             if (!worker.HasExited) { worker.Kill(); Check(worker.WaitForExit(3000), "Synthetic worker did not exit after termination."); }
+    }
+});
+Test("different image receives the existing show request without foreground permission", () =>
+{
+    var home = Path.Combine(root, "different-image");
+    using var primary = SingleInstanceCoordinator.Acquire(home);
+    Check(primary.IsPrimary, "Primary acquisition failed.");
+    var calls = 0;
+    primary.StartListening(() => Interlocked.Increment(ref calls));
+
+    var different = Directory.CreateDirectory(Path.Combine(root, "different-image-worker")).FullName;
+    var image = Path.ChangeExtension(typeof(PanelSettings).Assembly.Location, ".exe");
+    var stem = Path.GetFileNameWithoutExtension(image);
+    foreach (var extension in new[] { ".exe", ".dll", ".deps.json", ".runtimeconfig.json" })
+        File.Copy(Path.Combine(AppContext.BaseDirectory, stem + extension), Path.Combine(different, stem + extension));
+    var start = new ProcessStartInfo(Path.Combine(different, Path.GetFileName(image)))
+    {
+        UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
+    };
+    start.ArgumentList.Add("--activation-worker");
+    start.ArgumentList.Add(home);
+    using var worker = Process.Start(start)!;
+    try
+    {
+        Check(worker.WaitForExit(5000), "Different-image secondary timed out.");
+        Check(worker.ExitCode == 0 && Volatile.Read(ref calls) == 1, "Different image did not deliver the show request.");
+        Check(worker.StandardOutput.ReadToEnd().Trim().Length == 0, "The worker offered foreground permission to a different image.");
+    }
+    finally
+    {
+        if (!worker.HasExited) { worker.Kill(); Check(worker.WaitForExit(3000), "Synthetic worker did not exit after termination."); }
     }
 });
 Test("nonlistening primary activation timeout is bounded", () =>

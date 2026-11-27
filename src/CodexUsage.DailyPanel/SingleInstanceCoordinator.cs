@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security;
 using System.Security.AccessControl;
@@ -9,6 +10,7 @@ using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32.SafeHandles;
 namespace CodexUsage.DailyPanel;
 public sealed class SingleInstanceCoordinator : IDisposable
 {
@@ -100,7 +102,14 @@ public sealed class SingleInstanceCoordinator : IDisposable
         }
     }
 
-    public async Task<bool> TryActivateAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+    public Task<bool> TryActivateAsync(TimeSpan timeout, CancellationToken cancellationToken = default) =>
+        TryActivateAsync(timeout, null, cancellationToken);
+
+    internal Task<bool> TryActivateFromLaunchAsync(TimeSpan timeout) =>
+        TryActivateAsync(timeout, AllowSetForegroundWindow);
+
+    internal async Task<bool> TryActivateAsync(TimeSpan timeout, Func<uint, bool>? allowForeground,
+        CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!OperatingSystem.IsWindows() || IsPrimary || timeout <= TimeSpan.Zero || timeout > TimeSpan.FromSeconds(5)) return false;
@@ -116,6 +125,8 @@ public sealed class SingleInstanceCoordinator : IDisposable
             // Check the actual local endpoint before sending even the fixed command.
             // CurrentUserOnly compares the token Owner, which can differ from User.
             if (!IsOwnedByUser(pipe.GetAccessControl(), user)) return false;
+            lifetime.Token.ThrowIfCancellationRequested();
+            if (allowForeground is not null) TransferForeground(pipe.SafePipeHandle, allowForeground, lifetime.Token);
             await pipe.WriteAsync(Activation, lifetime.Token).ConfigureAwait(false);
             await pipe.FlushAsync(lifetime.Token).ConfigureAwait(false);
             var reply = new byte[Acknowledgement.Length];
@@ -127,6 +138,46 @@ public sealed class SingleInstanceCoordinator : IDisposable
         }
         catch (Exception e) when (e is IOException or OperationCanceledException or UnauthorizedAccessException or InvalidOperationException or SecurityException) { return false; }
     }
+
+    private static void TransferForeground(SafePipeHandle pipe, Func<uint, bool> allowForeground, CancellationToken cancellationToken)
+    {
+        if (Environment.ProcessPath is not { } image ||
+            string.Equals(Path.GetFileName(image), "dotnet.exe", StringComparison.OrdinalIgnoreCase) ||
+            !GetNamedPipeServerProcessId(pipe, out var processId) ||
+            processId is 0 or uint.MaxValue || processId == (uint)Environment.ProcessId)
+            return;
+
+        // The pipe owner check binds the user. Also bind the process that will
+        // receive foreground permission to this installed executable.
+        const uint queryLimitedInformation = 0x1000;
+        using var process = OpenProcess(queryLimitedInformation, false, processId);
+        if (process.IsInvalid) return;
+        var path = new StringBuilder(image.Length + 1);
+        var length = (uint)path.Capacity;
+        if (QueryFullProcessImageName(process, 0, path, ref length) &&
+            string.Equals(path.ToString(), image, StringComparison.OrdinalIgnoreCase) &&
+            !cancellationToken.IsCancellationRequested)
+        {
+            // Windows may deny the handoff. In that case the existing instance
+            // still receives the normal show request.
+            _ = allowForeground(processId);
+        }
+    }
+
+    [DllImport("kernel32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out uint processId);
+
+    [DllImport("kernel32.dll", ExactSpelling = true)]
+    private static extern SafeProcessHandle OpenProcess(uint access, [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, uint processId);
+
+    [DllImport("kernel32.dll", EntryPoint = "QueryFullProcessImageNameW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool QueryFullProcessImageName(SafeProcessHandle process, uint flags, StringBuilder image, ref uint size);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AllowSetForegroundWindow(uint processId);
 
     public void Dispose()
     {

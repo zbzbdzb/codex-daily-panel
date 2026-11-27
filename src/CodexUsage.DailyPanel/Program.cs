@@ -56,7 +56,7 @@ internal static class Program
             using var instance = demo ? null : SingleInstanceCoordinator.Acquire(home);
             if (instance is { IsPrimary: false })
             {
-                if (instance.TryActivateAsync(TimeSpan.FromSeconds(3)).GetAwaiter().GetResult()) return 0;
+                if (instance.TryActivateFromLaunchAsync(TimeSpan.FromSeconds(3)).GetAwaiter().GetResult()) return 0;
                 WriteConsole("The existing CodexDaily instance could not be activated. Try again after it has finished exiting.", isError: true);
                 return 1;
             }
