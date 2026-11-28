@@ -18,7 +18,12 @@ internal sealed class DailyToolTimingParser(string sourceKey)
     private string _session = sourceKey;
     private DateTimeOffset? _latestStart;
     private bool _lifecycleUncertain;
+    private bool _cohortOverflow;
     internal string SessionKey => _session;
+
+    // This source-local fact is normalized before aggregation and coverage hashing.
+    internal sealed record InferredTool(string SessionKey, string? TurnKey, string CallKey, DailyToolPhase Phase,
+        DateTimeOffset Timestamp, DateTimeOffset Start, bool Overflow) : StatsEvent(SessionKey, Timestamp);
 
     public IReadOnlyList<StatsEvent> Parse(string line, IReadOnlyList<StatsEvent> statistics,
         string abortSessionKey, out bool malformedAbort)
@@ -36,7 +41,13 @@ internal sealed class DailyToolTimingParser(string sourceKey)
                 var metadata = statistics.OfType<MetadataEvent>().SingleOrDefault();
                 // Invalid metadata can change session identity, so it has no reliable turn scope.
                 if (metadata is null) return SessionUnavailable(DateTimeOffset.MinValue);
-                if (_session != metadata.SessionKey) { _turnEnds.Clear(); _latestStart = null; _lifecycleUncertain = false; }
+                if (_session != metadata.SessionKey)
+                {
+                    _turnEnds.Clear();
+                    _latestStart = null;
+                    _lifecycleUncertain = false;
+                    _cohortOverflow = false;
+                }
                 _session = metadata.SessionKey;
                 return [];
             }
@@ -75,12 +86,12 @@ internal sealed class DailyToolTimingParser(string sourceKey)
                         // after compaction/interruption. Same-time distinct starts remain ambiguous.
                         _turnEnds.Clear();
                         _latestStart = time;
+                        _cohortOverflow = false;
                     }
                     if (_turnEnds.Count >= MaximumTrackedTurns && !_turnEnds.ContainsKey(turn))
                     {
-                        _lifecycleUncertain = true;
-                        // Dropped lifecycle state makes subsequent ownership uncertain session-wide.
-                        return SessionUnavailable(time);
+                        _cohortOverflow = true;
+                        return [];
                     }
                     _turnEnds.TryAdd(turn, null);
                 }
@@ -112,15 +123,24 @@ internal sealed class DailyToolTimingParser(string sourceKey)
             bool malformedTurn = Field(payload, "turn_id").ValueKind != JsonValueKind.Undefined && payloadTurn is null
                 || Field(root, "turn_id").ValueKind != JsonValueKind.Undefined && rootTurn is null
                 || rootTurn is not null && payloadTurn is not null && rootTurn != payloadTurn;
+            var phase = call ? DailyToolPhase.Call : DailyToolPhase.Result;
+            if (!_lifecycleUncertain && !malformedTurn && explicitTurn is null
+                && callKey is not null && time != DateTimeOffset.MinValue && _latestStart is { } inferredStart)
+            {
+                var inferredOwner = _cohortOverflow ? null : UniqueOwnerAt(time);
+                return [new InferredTool(_session, inferredOwner, callKey, phase, time, inferredStart, _cohortOverflow)];
+            }
             string? turnKey = explicitTurn ?? UniqueOwnerAt(time);
             bool knownTurn = !_lifecycleUncertain && !malformedTurn && turnKey is not null
                 && _turnEnds.TryGetValue(turnKey, out var end) && (end is null || time <= end.Value);
             if (!knownTurn || callKey is null || time == DateTimeOffset.MinValue)
             {
                 // Only bad call/time data with otherwise proven ownership can be limited to one turn.
+                if (_cohortOverflow && !_lifecycleUncertain && !malformedTurn && explicitTurn is not null)
+                    return TurnUnavailable(time, explicitTurn);
                 return knownTurn ? TurnUnavailable(time, turnKey!) : SessionUnavailable(time);
             }
-            return [new DailyToolEvent(_session, turnKey, callKey, call ? DailyToolPhase.Call : DailyToolPhase.Result, time)];
+            return [new DailyToolEvent(_session, turnKey, callKey, phase, time)];
         }
         // Unparseable data provides no dependable ownership evidence.
         catch (JsonException) { return SessionUnavailable(DateTimeOffset.MinValue); }
@@ -138,6 +158,62 @@ internal sealed class DailyToolTimingParser(string sourceKey)
             owner = turn;
         }
         return owner;
+    }
+
+    internal static IEnumerable<StatsEvent> ProjectOwnership(IReadOnlyList<StatsEvent> retained)
+    {
+        if (!retained.Any(row => row is InferredTool)) return retained;
+
+        // The input is one physical source's retained events. Never join
+        // ambiguous tool ownership across files or resurrect discarded history.
+        var starts = retained.OfType<StartEvent>().GroupBy(row => (row.SessionKey, row.Timestamp))
+            .ToDictionary(group => group.Key, group => group.Select(row => row.TurnKey).Distinct().ToArray());
+        var startTimes = starts.Keys.GroupBy(key => key.SessionKey, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Select(key => key.Timestamp).Order().ToArray(), StringComparer.Ordinal);
+        var ends = retained.OfType<CompletionEvent>().Select(row => (row.SessionKey, row.TurnKey, row.Timestamp))
+            .Concat(retained.OfType<DailyTurnAbortedEvent>().Select(row => (row.SessionKey, row.TurnKey, row.Timestamp)))
+            .GroupBy(row => (row.SessionKey, row.TurnKey)).ToDictionary(group => group.Key, group => group.Max(row => row.Timestamp));
+        var confirmed = new HashSet<InferredTool>();
+        var overflow = new HashSet<(string SessionKey, DateTimeOffset Start)>();
+        foreach (var tool in retained.OfType<InferredTool>())
+        {
+            var key = (tool.SessionKey, tool.Start);
+            if (!starts.TryGetValue(key, out var turns)) continue;
+            if (tool.Overflow || turns.Length > MaximumTrackedTurns)
+            {
+                overflow.Add(key);
+                continue;
+            }
+            var times = startTimes[tool.SessionKey];
+            var index = Array.BinarySearch(times, tool.Timestamp);
+            if (index < 0) index = ~index - 1;
+            if (index >= 0 && times[index] == tool.Start && tool.TurnKey is { } owner)
+            {
+                var possible = turns.Where(turn => !ends.TryGetValue((tool.SessionKey, turn), out var end)
+                    || end < tool.Start || end >= tool.Timestamp);
+                if (possible.Take(2).SequenceEqual([owner])) confirmed.Add(tool);
+            }
+        }
+        // Cache decisions, not another set of retained events. Coverage and
+        // the final subtotal both enumerate the same normalized facts.
+        return ProjectedRows();
+
+        IEnumerable<StatsEvent> ProjectedRows()
+        {
+            foreach (var row in retained)
+            {
+                if (row is not InferredTool tool) yield return row;
+                else if (confirmed.Contains(tool))
+                    yield return new DailyToolEvent(tool.SessionKey, tool.TurnKey, tool.CallKey, tool.Phase, tool.Timestamp);
+                else if (!overflow.Contains((tool.SessionKey, tool.Start)))
+                    yield return new DailyTimingUnavailableEvent(tool.SessionKey, null, tool.Timestamp);
+            }
+            // An overflowing group cannot prove implicit ownership. Emit at
+            // most one exclusion per retained start identity in that group.
+            foreach (var key in overflow)
+                foreach (var turn in starts[key])
+                    yield return new DailyTimingUnavailableEvent(key.SessionKey, turn, key.Start);
+        }
     }
 
     private IReadOnlyList<StatsEvent> SessionUnavailable(DateTimeOffset time) =>

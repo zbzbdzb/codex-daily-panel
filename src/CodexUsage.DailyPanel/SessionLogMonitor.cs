@@ -674,9 +674,11 @@ public sealed class SessionLogMonitor : IDisposable
         private readonly Action<int> _changeCount;
         private SourceContext _context;
         private DailyToolTimingParser _timing;
+        private readonly List<StatsEvent> _events = [];
+        private IEnumerable<StatsEvent>? _projectedEvents;
         private bool _unassociatedTiming;
         public DailyLogReader Reader { get; }
-        public List<StatsEvent> Events { get; } = [];
+        public IEnumerable<StatsEvent> Events => _projectedEvents ??= DailyToolTimingParser.ProjectOwnership(_events);
         public bool HasMore { get; set; } = true;
         public bool VerifiedThisRefresh { get; set; }
         public bool MetadataNeedsObservation { get; set; }
@@ -732,27 +734,35 @@ public sealed class SessionLogMonitor : IDisposable
             var parsed = _parser.Parse(line, _context);
             var timing = _timing.Parse(line, parsed.Events, _context.SessionKey, out var malformedAbort);
             BadStatistics |= parsed.Malformed || parsed.Unsupported || malformedAbort;
-            if (timing.Any(e => e is DailyTimingUnavailableEvent && e.SessionKey == _key)) _unassociatedTiming = true;
+            if (timing.Any(e => e.SessionKey == _key && e is (DailyTimingUnavailableEvent
+                or DailyToolTimingParser.InferredTool { TurnKey: null }))) _unassociatedTiming = true;
             foreach (var item in parsed.Events.Concat(timing))
             {
                 if (item.Timestamp == DateTimeOffset.MinValue) BadStatistics = true;
                 // Retain bounded modern request and lifecycle history together. Late revisions
                 // keep their original day, and a start before midnight needs its completion
                 // or abort retained as well to distinguish a clipped interval from an active turn.
-                if (item is not (MetadataEvent or QuotaEvent or StartEvent or CompletionEvent or DailyTurnAbortedEvent or DailyToolEvent or DailyTimingUnavailableEvent or UsageEvent { Legacy: false })
+                if (item is not (MetadataEvent or QuotaEvent or StartEvent or CompletionEvent or DailyTurnAbortedEvent
+                    or DailyToolEvent or DailyTimingUnavailableEvent or DailyToolTimingParser.InferredTool or UsageEvent { Legacy: false })
                     && DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(item.Timestamp, _zone).DateTime) != _day) continue;
                 if (item is QuotaEvent quota)
                 {
                     // Keep only the latest per bucket in each file, preserving sample time.
-                    var old = Events.FindLastIndex(e => e is QuotaEvent existing && existing.LimitKey == quota.LimitKey);
+                    var old = _events.FindLastIndex(e => e is QuotaEvent existing && existing.LimitKey == quota.LimitKey);
                     if (old >= 0)
                     {
-                        if (Events[old].Timestamp < quota.Timestamp) { Events[old] = quota; continue; }
-                        if (Events[old] == quota || Events[old].Timestamp > quota.Timestamp) continue;
+                        if (_events[old].Timestamp < quota.Timestamp)
+                        {
+                            _events[old] = quota;
+                            _projectedEvents = null;
+                            continue;
+                        }
+                        if (_events[old] == quota || _events[old].Timestamp > quota.Timestamp) continue;
                     }
                 }
-                if (Events.Count >= MaximumEventsPerFile || !_canRetain()) { BadStatistics = true; return; }
-                Events.Add(item);
+                if (_events.Count >= MaximumEventsPerFile || !_canRetain()) { BadStatistics = true; return; }
+                _events.Add(item);
+                _projectedEvents = null;
                 if (item is MetadataEvent) MetadataNeedsObservation = true;
                 _changeCount(1);
             }
@@ -766,7 +776,12 @@ public sealed class SessionLogMonitor : IDisposable
                 foreach (var session in Events.Select(e => e.SessionKey).Distinct(StringComparer.Ordinal))
                     yield return new DailyTimingUnavailableEvent(session, null, now);
         }
-        private void ClearEvents() { _changeCount(-Events.Count); Events.Clear(); }
+        private void ClearEvents()
+        {
+            _changeCount(-_events.Count);
+            _events.Clear();
+            _projectedEvents = null;
+        }
         public void Dispose() { ClearEvents(); Reader.Dispose(); }
     }
 }

@@ -141,6 +141,79 @@ internal static class ToolTimingTests
             foreach (string endType in new[] { "task_aborted", "turn_aborted", "task_complete" })
             {
                 bool completedSibling = endType == "task_complete";
+                string lateSiblingEnd = Row("event_msg", start.AddSeconds(8), new
+                {
+                    type = endType, turn_id = "another-turn", duration_ms = 8000, time_to_first_token_ms = 0
+                });
+                CheckLifecycleTiming(await ReadRows(metadata + began + finish + implicitTools + siblingStart + lateSiblingEnd),
+                    null, false, 10, $"{endType}: delayed sibling start invalidates inferred tools read after completion",
+                    unreconciledSibling: completedSibling);
+                CheckLifecycleTiming(await ReadRows(metadata + began + implicitTools + siblingStart + lateSiblingEnd + finish),
+                    null, false, 10, $"{endType}: delayed sibling start invalidates inferred tools read before completion",
+                    unreconciledSibling: completedSibling);
+                CheckLifecycleTiming(await ReadRows(tied + finish + implicitTools + lateSiblingEnd),
+                    null, false, 10, $"{endType}: prior sibling start produces the same unavailable result",
+                    unreconciledSibling: completedSibling);
+                CheckLifecycleTiming(await ReadRows(metadata + began + finish + explicitTools + siblingStart + lateSiblingEnd),
+                    6, false, 10, $"{endType}: delayed sibling start does not invalidate explicit tools",
+                    unreconciledSibling: completedSibling);
+
+                Write(metadata + began + finish + implicitTools + lateSiblingEnd);
+                using var retained = new SessionLogMonitor(home, TimeZoneInfo.Utc);
+                var refreshAt = start.AddMinutes(1);
+                CheckLifecycleTiming(await retained.RefreshAsync(refreshAt), 6, false, 10,
+                    $"{endType}: initial retained refresh has one established tool owner",
+                    unreconciledSibling: completedSibling);
+                File.AppendAllText(path, siblingStart, Utf8);
+                File.SetLastWriteTimeUtc(path, refreshAt.UtcDateTime);
+                CheckLifecycleTiming(await retained.RefreshAsync(refreshAt), null, false, 10,
+                    $"{endType}: appending a sibling start revokes previously inferred timing without changing tokens",
+                    unreconciledSibling: completedSibling);
+            }
+
+            foreach (int oldTurns in new[] { 128, 129 })
+            {
+                var rows = new StringBuilder(metadata);
+                for (int index = 0; index < oldTurns; index++)
+                {
+                    string identity = $"old-{index}";
+                    rows.Append(Row("event_msg", start.AddSeconds(-2), new { type = "task_started", turn_id = identity }));
+                    rows.Append(Row("event_msg", start.AddSeconds(-1), new { type = "task_aborted", turn_id = identity }));
+                }
+                var successor = await ReadRows(rows.ToString() + began + explicitTools + finish);
+                CheckLifecycleTiming(successor, 6, false, 11,
+                    $"{oldTurns} ended old identities do not suppress the independently timed successor");
+                Check(successor.TurnCount == oldTurns + 1, $"{oldTurns} ended old identities remain observable");
+            }
+
+            var overflowRows = new StringBuilder(metadata);
+            var oldBegan = start.AddSeconds(-20);
+            for (int index = 0; index < 129; index++)
+            {
+                string identity = $"overflow-{index}";
+                overflowRows.Append(Row("event_msg", oldBegan, new { type = "task_started", turn_id = identity }));
+                if (index != 0)
+                    overflowRows.Append(Row("event_msg", oldBegan.AddSeconds(index == 128 ? 8 : 1),
+                        new { type = "task_aborted", turn_id = identity }));
+            }
+            overflowRows.Append(Tool("function_call", -18, "old-call"));
+            overflowRows.Append(Tool("function_call_output", -15, "old-call"));
+            overflowRows.Append(Row("token_usage_record", oldBegan.AddSeconds(9), new
+            {
+                thread_id = "timing-session", session_id = "run", turn_id = "overflow-0", root_turn_id = "overflow-0",
+                response_id = "old-request", usage = tokens40, turn_token_usage = tokens40
+            }));
+            overflowRows.Append(Row("event_msg", oldBegan.AddSeconds(10),
+                new { type = "task_complete", turn_id = "overflow-0", duration_ms = 10000, time_to_first_token_ms = 1000 }));
+            var overflow = await ReadRows(overflowRows.ToString() + began + explicitTools + finish);
+            Check(overflow.InputTokens == 200 && overflow.OutputTokens == 80 && overflow.TimedTurnCount == 1
+                && overflow.ExcludedTimingTurnCount == 1 && overflow.ProcessingSeconds == 6
+                && overflow.AverageTps is { } successorTps && Math.Abs(successorTps - 40d / 6) < 0.000001,
+                "ambiguous tools in the overflowing old group are excluded while the successor retains its timing");
+
+            foreach (string endType in new[] { "task_aborted", "turn_aborted", "task_complete" })
+            {
+                bool completedSibling = endType == "task_complete";
                 string EndSibling(int seconds) => Row("event_msg", start.AddSeconds(seconds), new
                 {
                     type = endType, turn_id = "another-turn", duration_ms = seconds * 1000, time_to_first_token_ms = 0
@@ -337,7 +410,7 @@ internal static class ToolTimingTests
             var timing = new DailyToolTimingParser("source");
             timing.Parse(metadata, parser.Parse(metadata, context).Events, context.SessionKey, out _);
             timing.Parse(began, parser.Parse(began, context).Events, context.SessionKey, out _);
-            var projected = timing.Parse(Tool("function_call", 2), [], context.SessionKey, out _);
+            var projected = timing.Parse(Tool("function_call", 2, turn: "turn"), [], context.SessionKey, out _);
             var projectedTool = projected.OfType<DailyToolEvent>().Single();
             string serialized = JsonSerializer.Serialize(projectedTool);
             Check(projectedTool.SessionKey == EventParser.Key("session", "timing-session")
