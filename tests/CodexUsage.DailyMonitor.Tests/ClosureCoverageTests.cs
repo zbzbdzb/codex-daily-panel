@@ -602,6 +602,47 @@ internal static class ClosureCoverageTests
             });
         }
 
+        foreach (bool concurrent in new[] { true, false })
+        {
+            await Case($"CON-24 one raw tool requires both histories in one source ({(concurrent ? "concurrent" : "successive")})", async () =>
+            {
+                // The prior-day starts have aged out of the activity window.
+                // The same tool rows still need both starts for ownership.
+                var sample = midnight.AddMinutes(20);
+                using var fixture = new Fixture(concurrent ? "joint-tool-concurrent" : "joint-tool-successive", sample);
+                string a = Start("prior-A", priorDay.AddSeconds(-1));
+                string b = Start("prior-B", priorDay);
+                string tools = Tool("function_call", "joint-pair", midnight.AddSeconds(1))
+                    + Tool("function_call_output", "joint-pair", midnight.AddSeconds(4));
+                string today = Modern("midnight", "joint-request", "inferred-C", midnight.AddSeconds(11))
+                    + Complete("inferred-C", midnight.AddSeconds(12));
+                string original = midnightMeta + a + tools + b + today;
+                string firstHalf = midnightMeta + a + tools + today;
+                string secondHalf = midnightMeta + b + tools + today;
+                string live = fixture.WriteSession("live", original);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample), timed: false, lost: false,
+                    "the same raw rows depend on the parsed and event-time start groups");
+
+                string? archive = concurrent ? fixture.WriteSession("other-history", secondHalf, archived: true) : null;
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(1)), timed: false,
+                    lost: false, "the original still proves the full set");
+                ReplaceSession(fixture, live, firstHalf);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(2)), timed: false,
+                    lost: true, "the original constraints cannot be split between instances of one raw row");
+                if (!concurrent) ReplaceSession(fixture, live, secondHalf);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(3)), timed: false,
+                    lost: true, "a later poll cannot complete the other history on its own");
+
+                if (archive is not null) File.Delete(archive);
+                ReplaceSession(fixture, live, original);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(4)), timed: false,
+                    lost: false, "the original source proves the complete but still ambiguous history");
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(5)), timed: false,
+                    lost: false, "idle refresh retains the same genuine overlap");
+            });
+        }
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));

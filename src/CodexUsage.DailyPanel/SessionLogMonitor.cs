@@ -357,42 +357,58 @@ public sealed class SessionLogMonitor : IDisposable
                 || projections.Contains((guard.Digest, EventDigest(old.Evidence)))
                 || timing[guard.Digest].OfType<DailyTimingUnavailableEvent>().Any(row => CoversTiming(row, old.Evidence, starts)));
         static bool HasOwnershipHistory(ExclusionGuard guard) => guard is TimingGuard { Ownership: not null };
-        var timingSources = _coverageLosses.Any(loss => loss.Guards.Any(HasOwnershipHistory))
+        var ownershipGroups = _coverageLosses.SelectMany(loss => loss.Guards.Where(HasOwnershipHistory)
+                .Cast<TimingGuard>().Select(guard => (Loss: loss, Guard: guard)))
+            .ToLookup(x => x.Guard.Digest, StringComparer.Ordinal);
+        var timingSources = ownershipGroups.Count > 0
             ? checkedSources.Where(source => source.Facts.Any(x => x.RawTimingDigest is not null))
                 .Select(source => (source.Reader, Digests: source.Facts.Select(CoverageDigest).ToHashSet(StringComparer.Ordinal),
                     Timing: source.Facts.Where(x => x.RawTimingDigest is not null)
                         .ToLookup(x => x.RawTimingDigest!, x => x.Event, StringComparer.Ordinal))).ToArray()
             : [];
-        var historyMatches = new Dictionary<(DailyLogReader, ToolOwnershipHistory), bool>();
-        foreach (var loss in _coverageLosses.ToArray())
+        var completeSources = new Dictionary<CoverageLoss, HashSet<DailyLogReader>>(ReferenceEqualityComparer.Instance);
+        foreach (var loss in _coverageLosses)
         {
             bool complete = !loss.Unprovable && loss.Events.All(x => hashes.Contains(x.Digest))
                 && (loss.RawPrefix is not { } prefix || drained.Any(x => x.Reader.Proves(prefix)));
-            if (complete) loss.PositiveResolved = true;
-            var completeSources = complete && loss.Guards.Any(HasOwnershipHistory)
-                ? timingSources.Where(source => loss.Events.All(x => source.Digests.Contains(x.Digest))
-                        && (loss.RawPrefix is not { } stamp || source.Reader.Proves(stamp))).Select(x => x.Reader).ToHashSet()
-                : null;
-            bool ProvesOwnership(TimingGuard old, ToolOwnershipHistory history)
+            if (!complete) continue;
+            loss.PositiveResolved = true;
+            if (loss.Guards.Any(HasOwnershipHistory))
+                completeSources[loss] = timingSources.Where(source => loss.Events.All(x => source.Digests.Contains(x.Digest))
+                    && (loss.RawPrefix is not { } stamp || source.Reader.Proves(stamp))).Select(x => x.Reader).ToHashSet();
+        }
+
+        // A raw row can project into both its parsed and event-time start groups.
+        // One current reader must cover every constraint on that row before any
+        // are removed, even when the constraints came from different losses.
+        var historyMatches = new Dictionary<(DailyLogReader, ToolOwnershipHistory), bool>();
+        var provenOwnership = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var group in ownershipGroups)
+            foreach (var source in timingSources)
             {
-                // The source must reestablish its old lifecycle and raw tool
-                // evidence together, even if the old starts belong to yesterday.
-                foreach (var source in timingSources)
+                if (!source.Timing.Contains(group.Key)) continue;
+                var rows = source.Timing[group.Key];
+                bool owned = rows.Any(row => row is DailyToolEvent);
+                var unavailable = rows.OfType<DailyTimingUnavailableEvent>().ToArray();
+                bool ProvesConstraint((CoverageLoss Loss, TimingGuard Guard) item)
                 {
-                    if (!source.Timing.Contains(old.Digest)) continue;
+                    var history = item.Guard.Ownership!;
                     var key = (source.Reader, history);
                     if (!historyMatches.TryGetValue(key, out var matches))
                         historyMatches[key] = matches = history.Facts.Split('\n').All(source.Digests.Contains);
-                    if (matches && source.Timing[old.Digest].Any(row =>
-                            row is DailyToolEvent && completeSources?.Contains(source.Reader) == true
-                            || row is DailyTimingUnavailableEvent unavailable && CoversTiming(unavailable, old.Evidence, starts)))
-                        return true;
+                    return matches && (owned && completeSources.TryGetValue(item.Loss, out var covered) && covered.Contains(source.Reader)
+                        || unavailable.Any(row => CoversTiming(row, item.Guard.Evidence, starts)));
                 }
-                return false;
+                if (!group.All(ProvesConstraint)) continue;
+                provenOwnership.Add(group.Key);
+                break;
             }
+
+        foreach (var loss in _coverageLosses.ToArray())
+        {
             int before = GuardEvidenceCount(loss.Guards);
-            loss.Guards.RemoveAll(guard => guard is TimingGuard { Ownership: { } history } old
-                ? ProvesOwnership(old, history) : ProvesGuard(guard));
+            loss.Guards.RemoveAll(guard => HasOwnershipHistory(guard)
+                ? provenOwnership.Contains(guard.Digest) : ProvesGuard(guard));
             _coverageEvidenceCount -= before - GuardEvidenceCount(loss.Guards);
             if (!loss.PositiveResolved || loss.Guards.Count > 0) continue;
             _coverageLosses.Remove(loss);
