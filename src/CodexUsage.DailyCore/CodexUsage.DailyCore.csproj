@@ -1,4 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>$(CodexTargetFramework)</TargetFramework><RootNamespace>CodexUsage.Daily</RootNamespace></PropertyGroup>
   <ItemGroup><ProjectReference Include="../CodexUsage.Core/CodexUsage.Core.csproj" /></ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="CodexDaily" />
+    <InternalsVisibleTo Include="CodexUsage.DailyMonitor.Tests" />
+  </ItemGroup>
 </Project>

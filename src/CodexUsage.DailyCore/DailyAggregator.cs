@@ -141,7 +141,8 @@ public static class DailyAggregator
         // An invalid row must make its scope unavailable, never masquerade as no wait.
         var toolRows = usable.OfType<DailyToolEvent>().Distinct().ToArray();
         var timingUnavailable = usable.OfType<DailyTimingUnavailableEvent>().Distinct().ToArray();
-        var untimedSessions = timingUnavailable.Where(x => x.StartTimestamp is null && string.IsNullOrWhiteSpace(x.TurnKey)).Select(x => x.SessionKey)
+        var untimedSessions = timingUnavailable.Where(x => x.ObservedToolWait is null && x.StartTimestamp is null
+                && string.IsNullOrWhiteSpace(x.TurnKey)).Select(x => x.SessionKey)
             .Concat(toolRows.Where(x => string.IsNullOrWhiteSpace(x.TurnKey)).Select(x => x.SessionKey))
             .ToHashSet(StringComparer.Ordinal);
         var untimedTurns = timingUnavailable.Where(x => !string.IsNullOrWhiteSpace(x.TurnKey))
@@ -274,12 +275,8 @@ public static class DailyAggregator
 
             var completed = completions[0];
             var duration = completed.DurationMs is > 0 ? completed.DurationMs : null;
-            DateTimeOffset? durationStart = null;
-            if (duration is { } millis)
-            {
-                try { durationStart = completed.Timestamp.AddMilliseconds(-millis); }
-                catch (ArgumentOutOfRangeException) { }
-            }
+            var durationWindow = DailyTimingWindow.FromCompletion(completed);
+            var durationStart = durationWindow?.Start;
             var beganAt = explicitStart ?? durationStart;
             if (endInOrder && beganAt is { } intervalStart) AddInterval(intervalStart, completed.Timestamp);
             if (!InDay(completed.Timestamp)) continue;
@@ -311,7 +308,7 @@ public static class DailyAggregator
             if (untimedSessions.Contains(turn.Session) || untimedTurns.Contains((turn.Session, turn.Key))
                 || startEvidence.Length == 1 && untimedStarts.Contains((turn.Session, startEvidence[0]))
                 || explicitStart is null && uncertainToolWindows.TryGetValue(turn.Session, out var uncertain)
-                    && Overlaps(uncertain, durationStart!.Value, completed.Timestamp)
+                    && Overlaps(uncertain, durationWindow!.Value)
                 || !TryExcludedWait(durationStart!.Value, explicitStart, completed.Timestamp,
                     completed.TimeToFirstTokenMs.Value,
                     toolsByTurn.GetValueOrDefault((turn.Session, turn.Key)) ?? [], now, out var waitMs)
@@ -650,43 +647,38 @@ public static class DailyAggregator
         return last.Length == 1 && last[0] is { IsComplete: true, IsValid: true } snapshot && snapshot == total;
     }
 
-    private static Dictionary<string, (DateTimeOffset Start, DateTimeOffset End)[]> UncertainToolWindows(
+    private static Dictionary<string, DailyTimingWindow[]> UncertainToolWindows(
         DailyTimingUnavailableEvent[] unavailable, DailyToolEvent[] tools, DateTimeOffset now)
     {
         // A duration-derived interval has no explicit start identity to match
         // against the tool's group. Keep bounded time evidence for that case.
-        var scoped = unavailable.Where(x => x.StartTimestamp.HasValue
-            && x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now).ToArray();
-        var calls = scoped.Where(x => x.ToolCallKey is not null)
-            .Select(x => (x.SessionKey, x.ToolCallKey)).ToHashSet();
-        var toolTimes = scoped.Where(x => x.ToolCallKey is not null)
-            .Select(x => (x.SessionKey, x.ToolCallKey, x.Timestamp))
-            .Concat(tools.Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now
-                && calls.Contains((x.SessionKey, x.CallKey))).Select(x => (x.SessionKey, ToolCallKey: x.CallKey, x.Timestamp)));
-        var windows = toolTimes.GroupBy(x => (x.SessionKey, x.ToolCallKey))
-            .Select(group => (group.Key.SessionKey, Start: group.Min(x => x.Timestamp), End: group.Max(x => x.Timestamp)))
-            .Concat(scoped.Where(x => x.ToolCallKey is null).Select(x => (x.SessionKey, Start: x.Timestamp, End: x.Timestamp)));
-        return windows.GroupBy(x => x.SessionKey, StringComparer.Ordinal).ToDictionary(group => group.Key, group =>
+        var windows = DailyTimingWindow.UncertainCalls(unavailable, tools, now)
+            .Select(x => (Session: x.Key.Session, Window: x.Value))
+            .Concat(unavailable.Where(x => x.ObservedToolWait is null && x.StartTimestamp.HasValue && x.ToolCallKey is null)
+                .Select(x => (Session: x.SessionKey, Window: new DailyTimingWindow(x.Timestamp, x.Timestamp))))
+            .Concat(unavailable.Where(x => x.ObservedToolWait.HasValue)
+                .Select(x => (Session: x.SessionKey, Window: x.ObservedToolWait!.Value)));
+        return windows.Where(x => x.Window.IsObservedAt(now)).GroupBy(x => x.Session, StringComparer.Ordinal).ToDictionary(group => group.Key, group =>
         {
-            var ordered = group.OrderBy(x => x.Start).Select(x => (x.Start, x.End)).ToArray();
+            var ordered = group.Select(x => x.Window).OrderBy(x => x.Start).ToArray();
             // The running maximum makes overlap checks logarithmic even for
             // nested intervals or many calls in the same source.
             for (int i = 1; i < ordered.Length; i++)
-                if (ordered[i - 1].End > ordered[i].End) ordered[i].End = ordered[i - 1].End;
+                if (ordered[i - 1].End > ordered[i].End) ordered[i] = ordered[i] with { End = ordered[i - 1].End };
             return ordered;
         }, StringComparer.Ordinal);
     }
 
-    private static bool Overlaps((DateTimeOffset Start, DateTimeOffset End)[] windows, DateTimeOffset start, DateTimeOffset end)
+    private static bool Overlaps(DailyTimingWindow[] windows, DailyTimingWindow completion)
     {
         int low = 0, high = windows.Length;
         while (low < high)
         {
             int middle = low + (high - low) / 2;
-            if (windows[middle].Start <= end) low = middle + 1;
+            if (windows[middle].Start <= completion.End) low = middle + 1;
             else high = middle;
         }
-        return low > 0 && windows[low - 1].End >= start;
+        return low > 0 && windows[low - 1].Overlaps(completion);
     }
 
     private static bool TryExcludedWait(DateTimeOffset declaredStart, DateTimeOffset? explicitStart,

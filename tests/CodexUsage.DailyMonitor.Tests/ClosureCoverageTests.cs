@@ -643,6 +643,78 @@ internal static class ClosureCoverageTests
             });
         }
 
+        foreach (var (name, returnAt, append) in new[] { ("interior", 20, false), ("contact", 5, false),
+                     ("disjoint", 4, false), ("append-return", 20, true), ("single-endpoint", 0, false) })
+        {
+            await Case($"CON-25 retired tool range against an inferred completion ({name})", async () =>
+            {
+                var sample = midnight.AddMinutes(20);
+                using var fixture = new Fixture("retained-wait-range-" + name, sample);
+                string call = Tool("function_call", "retained-range", midnight.AddSeconds(1));
+                string result = returnAt > 0 ? Tool("function_call_output", "retained-range", midnight.AddSeconds(returnAt)) : "";
+                string completion = Modern("midnight", "retained-duration", "inferred-C", midnight.AddSeconds(14))
+                    + Complete("inferred-C", midnight.AddSeconds(15));
+                string history = midnightMeta + firstStart + competingStart;
+                string original = history + call + (append ? "" : result) + completion;
+                string live = fixture.WriteSession("live", original);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                bool overlaps = returnAt >= 5;
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample), timed: append || !overlaps, lost: false,
+                    "current evidence qualifies only if no observed range intersects the completion");
+                if (append)
+                {
+                    fixture.AppendSession(live, result);
+                    ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(1)), timed: false, lost: false,
+                        "the captured source now proves both endpoints");
+                }
+
+                string older = Start("older", priorDay.AddSeconds(-1));
+                string replacement = midnightMeta + older + call + result + completion;
+                ReplaceSession(fixture, live, replacement);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(2)), timed: !overlaps, lost: overlaps,
+                    "replacement cannot discard the observed range that affects the inferred completion");
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(3)), timed: !overlaps, lost: overlaps,
+                    "idle refresh retains the retired range");
+                ReplaceSession(fixture, live, midnightMeta + older + firstStart + competingStart + call + result + completion);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(4)), timed: !overlaps, lost: false,
+                    "the complete same-source evidence clears the coverage gap while continuing to constrain timing");
+            });
+        }
+
+        foreach (bool separate in new[] { false, true })
+        {
+            await Case($"CON-26 a late return extends a retired endpoint only with its raw anchor ({(separate ? "separate" : "same source")})", async () =>
+            {
+                var sample = midnight.AddMinutes(20);
+                using var fixture = new Fixture(separate ? "split-late-return" : "append-late-return", sample);
+                string call = Tool("function_call", "retired-endpoint", midnight.AddSeconds(1));
+                string result = Tool("function_call_output", "retired-endpoint", midnight.AddSeconds(20));
+                string completion = Modern("midnight", "late-return", "inferred-C", midnight.AddSeconds(14))
+                    + Complete("inferred-C", midnight.AddSeconds(15));
+                string replacement = midnightMeta + Start("older", priorDay.AddSeconds(-1));
+                string live = fixture.WriteSession("live", midnightMeta + firstStart + competingStart + call + completion);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample), timed: true, lost: false,
+                    "a lone point outside the completion does not exclude it");
+                ReplaceSession(fixture, live, replacement + call + completion);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(1)), timed: true, lost: false,
+                    "the retained endpoint is still a lone point");
+
+                if (separate) fixture.WriteSession("return-only", replacement + result, archived: true);
+                else fixture.AppendSession(live, result);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(2)), timed: separate, lost: !separate,
+                    "the return extends the observed range only if it was read beside the exact old call");
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(3)), timed: separate, lost: !separate,
+                    "idle retains the real range without merging sources");
+                if (!separate)
+                {
+                    ReplaceSession(fixture, live, replacement + call + completion);
+                    ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(4)), timed: false, lost: true,
+                        "retiring the source that extended the range does not shorten the observed evidence");
+                }
+            });
+        }
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));
