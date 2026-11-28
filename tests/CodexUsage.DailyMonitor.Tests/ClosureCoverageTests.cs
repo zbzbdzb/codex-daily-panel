@@ -293,15 +293,13 @@ internal static class ClosureCoverageTests
 
             var singleSource = await monitor.RefreshAsync(Now);
             ExpectTiedStarts(singleSource, null, true, "malformed abort cannot settle the current tie");
-            Check(singleSource, singleSource.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable),
-                "the current malformed abort must be diagnosed as a source issue");
+            ExpectAbortSourceDiagnostics(singleSource, "current malformed abort");
 
             fixture.WriteSession("valid-archive", prefix + AbortRow(kind, "tied-second", At.AddSeconds(10), 1, "1"), archived: true);
             var withArchive = await monitor.RefreshAsync(Now);
             ExpectTiedStarts(withArchive, null, false, "a valid archived abort settles the tie", partial: true);
-            Check(withArchive, withArchive.SourceCount == 2
-                && withArchive.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable),
-                "legal archived closure cannot suppress the current malformed-source diagnosis");
+            Check(withArchive, withArchive.SourceCount == 2, "the legal archived closure must be read");
+            ExpectAbortSourceDiagnostics(withArchive, "malformed abort alongside archived closure");
         }
 
         var secondTurn = Turn("tied-second");
@@ -365,6 +363,64 @@ internal static class ClosureCoverageTests
             ExpectMalformedAbort("ambiguous-escaped-kind", "turn_aborted", AbortEnvelope(
                 $$"""{"type":"{{escapedKind}}","turn_id":"{{secondTurn}}","schema_version":2,"schema_version":1}""")));
 
+        const string outerType = "\"type\":\"event_msg\",";
+        foreach (var kind in new[] { "task_aborted", "turn_aborted" })
+        {
+            var envelope = AbortEnvelope($$"""{"type":"{{kind}}","turn_id":"{{secondTurn}}"}""");
+            await Case($"CON-17 {kind} with missing outer type keeps source and timing diagnostics", () =>
+                ExpectMalformedAbort($"missing-outer-{kind}", kind, envelope.Replace(outerType, "", StringComparison.Ordinal)));
+            await Case($"CON-17 {kind} with numeric outer type keeps source and timing diagnostics", () =>
+                ExpectMalformedAbort($"numeric-outer-{kind}", kind, envelope.Replace(outerType, "\"type\":3,", StringComparison.Ordinal)));
+        }
+
+        var invalidOuterTypes = new (string Name, string Field)[]
+        {
+            ("null-outer", "\"type\":null,"),
+            ("boolean-outer", "\"type\":false,"),
+            ("array-outer", """ "type":["event_msg"], """),
+            ("object-outer", """ "type":{"value":"event_msg"}, """),
+            ("blank-outer", """ "type":" ", """),
+            ("escaped-outer-key", """ "t\u0079pe":7, """),
+            ("duplicate-escaped-outer-key", """ "type":"event_msg","t\u0079pe":7, """)
+        };
+        foreach (var (name, field) in invalidOuterTypes)
+        {
+            await Case($"CON-18 {name} cannot validate an abort envelope", () =>
+                ExpectMalformedAbort(name, "turn_aborted", AbortEnvelope(validPayload).Replace(outerType, field, StringComparison.Ordinal)));
+        }
+
+        await Case("CON-19 escaped object member names keep a valid abort recognizable", async () =>
+        {
+            using var fixture = new Fixture("escaped-abort-member-names", Now);
+            var escapedEnvelope = AbortEnvelope($$"""{"t\u0079pe":"turn_aborted","turn_id":"{{secondTurn}}"}""")
+                .Replace(outerType, """ "t\u0079pe":"event_msg", """, StringComparison.Ordinal)
+                .Replace("\"payload\":", """ "pay\u006coad": """, StringComparison.Ordinal);
+            fixture.WriteSession("current", TiedStartRows() + Complete("tied-first", At.AddSeconds(10)) + escapedEnvelope);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, false, "decoded keys preserve a supported abort");
+        });
+
+        await Case("CON-20 abort prose and other event types do not become malformed aborts", async () =>
+        {
+            using var fixture = new Fixture("non-abort-envelopes", Now);
+            var prose = AbortEnvelope("""{"type":"user_message","message":"task_aborted turn_aborted"}""")
+                .Replace(outerType, "\"type\":3,", StringComparison.Ordinal);
+            var nested = AbortEnvelope("""{"type":"message","content":{"type":"turn_aborted"}}""")
+                .Replace(outerType, "\"type\":\"response_item\",", StringComparison.Ordinal);
+            var unrelated = AbortEnvelope(validPayload)
+                .Replace(outerType, "\"type\":\"other_envelope\",", StringComparison.Ordinal);
+            var path = fixture.WriteSession("current", TiedStartRows() + Complete("tied-first", At.AddSeconds(10))
+                + prose + nested + unrelated);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            var before = await monitor.RefreshAsync(Now);
+            ExpectTiedStarts(before, 9, true, "unrelated envelopes neither close the tie nor remove trustworthy timing");
+            Check(before, !before.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable),
+                "unrelated envelopes do not add a source-quality diagnosis");
+
+            fixture.AppendSession(path, AbortRow("turn_aborted", "tied-second", At.AddSeconds(10)));
+            ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, false, "only the actual abort event closes the tie");
+        });
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));
@@ -379,6 +435,12 @@ internal static class ClosureCoverageTests
     private static void ExpectUnavailableTiming(DailySnapshot actual, string context) => Check(actual,
         actual.AverageTps is null && actual.ProcessingSeconds is null && actual.TimedTurnCount == 0,
         context + ": expected unavailable TPS and processing seconds with no timed completed turn");
+
+    private static void ExpectAbortSourceDiagnostics(DailySnapshot actual, string context) => Check(actual,
+        actual.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable)
+        && actual.Issues.Any(issue => issue.Code == DailyIssueCodes.SourcePartial)
+        && actual.Issues.Any(issue => issue.Code == DailyIssueCodes.TimingUnavailable),
+        context + ": expected source and timing diagnostics to remain independent of activity conflict");
 
     private static void ExpectInactiveToday(DailySnapshot actual, bool partial, string context)
     {

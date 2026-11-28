@@ -6,6 +6,7 @@ if (args is ["--observed-evidence", var group]) { await ObservedEvidenceTests.Ru
 if (args is ["--monitor-disposal"]) { await MonitorDisposalTests.RunAsync(); return; }
 if (args is ["--discovery"]) { await DiscoveryCancellationTests.RunAsync(); return; }
 if (args is ["--source-limit"]) { await SourceLimitTests.RunAsync(); return; }
+if (args is ["--tool-timing"]) { await ToolTimingTests.RunAsync(); return; }
 
 var directory = Path.Combine(Path.GetTempPath(), "CodexDaily-tests-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(directory);

@@ -39,13 +39,14 @@ internal sealed class DailyToolTimingParser(string sourceKey)
                 _session = metadata.SessionKey;
                 return [];
             }
-            if (outer is not ("response_item" or "event_msg")) return [];
-            bool abort = outer == "event_msg" && kind is ("task_aborted" or "turn_aborted");
+            bool abort = (outer is null or "event_msg") && kind is ("task_aborted" or "turn_aborted");
+            if (!abort && outer is not ("response_item" or "event_msg")) return [];
             if (outer == "event_msg" && !abort && kind is not ("task_started" or "task_complete")) return [];
-            if (!Unique(root) || !Unique(payload) || !HasSupportedVersion(root) || !HasSupportedVersion(payload))
+            if ((abort && outer is null) || !Unique(root) || !Unique(payload)
+                || !HasSupportedVersion(root) || !HasSupportedVersion(payload))
             {
                 malformedAbort = abort;
-                _lifecycleUncertain |= outer == "event_msg";
+                _lifecycleUncertain |= abort || outer == "event_msg";
                 // Ambiguous envelope/schema can conceal ownership outside the current active turn.
                 return SessionUnavailable(Time(root));
             }
@@ -84,6 +85,10 @@ internal sealed class DailyToolTimingParser(string sourceKey)
                 }
                 else
                 {
+                    // All active identities share the latest start time. An end
+                    // before this turn's start cannot narrow tool ownership.
+                    // Inactive identities can still provide a historical end.
+                    if (abort && _active.Contains(turn) && _latestStart is { } started && time < started) return [];
                     _active.Remove(turn);
                     if (abort) return [new DailyTurnAbortedEvent(abortSessionKey, turn, time)];
                 }

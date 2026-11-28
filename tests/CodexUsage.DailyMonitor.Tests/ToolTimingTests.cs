@@ -38,14 +38,30 @@ internal static class ToolTimingTests
             File.WriteAllText(path, rows, Utf8);
             File.SetLastWriteTimeUtc(path, start.AddMinutes(1).UtcDateTime);
         }
-        async Task CheckRows(string rows, double? seconds, string name)
+        async Task<DailySnapshot> ReadRows(string rows)
         {
             Write(rows);
             using var monitor = new SessionLogMonitor(home, TimeZoneInfo.Utc);
-            var snapshot = await monitor.RefreshAsync(start.AddMinutes(1));
+            return await monitor.RefreshAsync(start.AddMinutes(1));
+        }
+        async Task CheckRows(string rows, double? seconds, string name)
+        {
+            var snapshot = await ReadRows(rows);
             Check(snapshot.OutputTokens == 100 && (seconds is null ? snapshot.AverageTps is null && snapshot.ProcessingSeconds is null
                 : snapshot.ProcessingSeconds is { } p && Math.Abs(p - seconds.Value) < 0.000001
                     && snapshot.AverageTps is { } t && Math.Abs(t - 100 / seconds.Value) < 0.000001), name);
+        }
+        void CheckAbortTiming(DailySnapshot snapshot, double? seconds, bool activityConflict, double activitySeconds, string name)
+        {
+            bool timingMatches = seconds is null
+                ? snapshot.ProcessingSeconds is null && snapshot.AverageTps is null
+                    && snapshot.TimedTurnCount == 0 && snapshot.ExcludedTimingTurnCount == 1
+                : snapshot.ProcessingSeconds == seconds && snapshot.AverageTps is { } t && Math.Abs(t - 40 / seconds.Value) < 0.000001
+                    && snapshot.TimedTurnCount == 1 && snapshot.ExcludedTimingTurnCount == 0;
+            Check(snapshot.InputTokens == 100 && snapshot.OutputTokens == 40 && timingMatches
+                && snapshot.ActiveSeconds == activitySeconds
+                && snapshot.Issues.Any(issue => issue.Code == DailyIssueCodes.CurrentStartConflict) == activityConflict,
+                $"{name} (net={snapshot.ProcessingSeconds}, TPS={snapshot.AverageTps}, activity={snapshot.ActiveSeconds}, status={snapshot.Status})");
         }
         try
         {
@@ -109,6 +125,47 @@ internal static class ToolTimingTests
                 null, "unsupported tool kind cannot be treated as zero wait");
             await CheckRows(metadata + began + Row("event_msg", start, new { type = "task_started", turn_id = "another-turn" })
                 + Tool("function_call", 2) + Tool("function_call_output", 5) + usage + complete, null, "ambiguous active lifecycles exclude tool timing");
+            string tied = metadata + began
+                + Row("event_msg", start, new { type = "task_started", turn_id = "another-turn" });
+            var tokens40 = new { input_tokens = 100, cached_input_tokens = 50, output_tokens = 40, reasoning_output_tokens = 0, total_tokens = 140 };
+            string finish = Row("token_usage_record", start.AddSeconds(9), new
+            {
+                thread_id = "timing-session", session_id = "run", turn_id = "turn", root_turn_id = "turn", response_id = "request",
+                usage = tokens40, turn_token_usage = tokens40
+            }) + complete;
+            string implicitTools = Tool("function_call", 2) + Tool("function_call_output", 5);
+            string explicitTools = Tool("function_call", 2, turn: "turn") + Tool("function_call_output", 5, turn: "turn");
+            foreach (string abortType in new[] { "task_aborted", "turn_aborted" })
+            {
+                string Abort(string turn, DateTimeOffset at) => Row("event_msg", at, new { type = abortType, turn_id = turn });
+                var valid = Abort("another-turn", start.AddSeconds(1));
+                var reversed = Abort("another-turn", start.AddMilliseconds(-1));
+                CheckAbortTiming(await ReadRows(tied + valid + implicitTools + finish), 6, false, 10,
+                    $"{abortType}: valid same-turn end licenses implicit tool pairing");
+                CheckAbortTiming(await ReadRows(tied + implicitTools + finish), null, true, 10,
+                    $"{abortType}: omitted end leaves tool ownership ambiguous");
+                CheckAbortTiming(await ReadRows(tied + reversed + implicitTools + finish), null, true, 10,
+                    $"{abortType}: end earlier than that turn's start cannot license implicit tool pairing");
+                CheckAbortTiming(await ReadRows(tied + reversed + explicitTools + finish), 6, true, 10,
+                    $"{abortType}: reversed sibling end does not invalidate explicitly owned tools");
+                CheckAbortTiming(await ReadRows(tied + valid + valid + implicitTools + finish), 6, false, 10,
+                    $"{abortType}: replayed valid end preserves timing and activity closure");
+                CheckAbortTiming(await ReadRows(metadata + oldStart + began
+                    + Abort("old-unfinished-turn", start.AddSeconds(-1)) + implicitTools + finish), 6, false, 29,
+                    $"{abortType}: late-arriving older turn end retains its own activity interval");
+
+                string archive = Path.Combine(home, "archived_sessions");
+                Directory.CreateDirectory(archive);
+                string archivedPath = Path.Combine(archive, "abort.jsonl");
+                try
+                {
+                    File.WriteAllText(archivedPath, metadata + valid, Utf8);
+                    File.SetLastWriteTimeUtc(archivedPath, start.AddMinutes(1).UtcDateTime);
+                    CheckAbortTiming(await ReadRows(tied + reversed + explicitTools + finish), 6, false, 10,
+                        $"{abortType}: valid archived end resolves activity without reassigning explicit tools");
+                }
+                finally { File.Delete(archivedPath); }
+            }
             await CheckRows(metadata + began + Row("event_msg", start.AddSeconds(1), new { type = "task_aborted", turn_id = "turn" })
                 + Tool("function_call", 2) + Tool("function_call_output", 5) + usage + complete, null, "aborted lifecycle cannot associate later tools");
             await CheckRows(metadata + began + Tool("function_call", 2).Replace("\"timestamp\":", "\"turn_id\":\"another-turn\",\"timestamp\":", StringComparison.Ordinal)
