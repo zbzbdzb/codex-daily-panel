@@ -51,16 +51,18 @@ internal static class ToolTimingTests
                 : snapshot.ProcessingSeconds is { } p && Math.Abs(p - seconds.Value) < 0.000001
                     && snapshot.AverageTps is { } t && Math.Abs(t - 100 / seconds.Value) < 0.000001), name);
         }
-        void CheckAbortTiming(DailySnapshot snapshot, double? seconds, bool activityConflict, double activitySeconds, string name)
+        void CheckLifecycleTiming(DailySnapshot snapshot, double? seconds, bool activityConflict, double activitySeconds,
+            string name, bool unreconciledSibling = false)
         {
             bool timingMatches = seconds is null
-                ? snapshot.ProcessingSeconds is null && snapshot.AverageTps is null
-                    && snapshot.TimedTurnCount == 0 && snapshot.ExcludedTimingTurnCount == 1
+                ? snapshot.ProcessingSeconds is null && snapshot.AverageTps is null && snapshot.TimedTurnCount == 0
                 : snapshot.ProcessingSeconds == seconds && snapshot.AverageTps is { } t && Math.Abs(t - 40 / seconds.Value) < 0.000001
-                    && snapshot.TimedTurnCount == 1 && snapshot.ExcludedTimingTurnCount == 0;
+                    && snapshot.TimedTurnCount == 1;
+            int excluded = (seconds is null ? 1 : 0) + (unreconciledSibling ? 1 : 0);
             Check(snapshot.InputTokens == 100 && snapshot.OutputTokens == 40 && timingMatches
-                && snapshot.ActiveSeconds == activitySeconds
-                && snapshot.Issues.Any(issue => issue.Code == DailyIssueCodes.CurrentStartConflict) == activityConflict,
+                && snapshot.ActiveSeconds == activitySeconds && snapshot.ExcludedTimingTurnCount == excluded
+                && snapshot.Issues.Any(issue => issue.Code == DailyIssueCodes.CurrentStartConflict) == activityConflict
+                && snapshot.Issues.Any(issue => issue.Code == DailyIssueCodes.CompletionReconciliation) == unreconciledSibling,
                 $"{name} (net={snapshot.ProcessingSeconds}, TPS={snapshot.AverageTps}, activity={snapshot.ActiveSeconds}, status={snapshot.Status})");
         }
         try
@@ -140,17 +142,17 @@ internal static class ToolTimingTests
                 string Abort(string turn, DateTimeOffset at) => Row("event_msg", at, new { type = abortType, turn_id = turn });
                 var valid = Abort("another-turn", start.AddSeconds(1));
                 var reversed = Abort("another-turn", start.AddMilliseconds(-1));
-                CheckAbortTiming(await ReadRows(tied + valid + implicitTools + finish), 6, false, 10,
+                CheckLifecycleTiming(await ReadRows(tied + valid + implicitTools + finish), 6, false, 10,
                     $"{abortType}: valid same-turn end licenses implicit tool pairing");
-                CheckAbortTiming(await ReadRows(tied + implicitTools + finish), null, true, 10,
+                CheckLifecycleTiming(await ReadRows(tied + implicitTools + finish), null, true, 10,
                     $"{abortType}: omitted end leaves tool ownership ambiguous");
-                CheckAbortTiming(await ReadRows(tied + reversed + implicitTools + finish), null, true, 10,
+                CheckLifecycleTiming(await ReadRows(tied + reversed + implicitTools + finish), null, true, 10,
                     $"{abortType}: end earlier than that turn's start cannot license implicit tool pairing");
-                CheckAbortTiming(await ReadRows(tied + reversed + explicitTools + finish), 6, true, 10,
+                CheckLifecycleTiming(await ReadRows(tied + reversed + explicitTools + finish), 6, true, 10,
                     $"{abortType}: reversed sibling end does not invalidate explicitly owned tools");
-                CheckAbortTiming(await ReadRows(tied + valid + valid + implicitTools + finish), 6, false, 10,
+                CheckLifecycleTiming(await ReadRows(tied + valid + valid + implicitTools + finish), 6, false, 10,
                     $"{abortType}: replayed valid end preserves timing and activity closure");
-                CheckAbortTiming(await ReadRows(metadata + oldStart + began
+                CheckLifecycleTiming(await ReadRows(metadata + oldStart + began
                     + Abort("old-unfinished-turn", start.AddSeconds(-1)) + implicitTools + finish), 6, false, 29,
                     $"{abortType}: late-arriving older turn end retains its own activity interval");
 
@@ -161,11 +163,22 @@ internal static class ToolTimingTests
                 {
                     File.WriteAllText(archivedPath, metadata + valid, Utf8);
                     File.SetLastWriteTimeUtc(archivedPath, start.AddMinutes(1).UtcDateTime);
-                    CheckAbortTiming(await ReadRows(tied + reversed + explicitTools + finish), 6, false, 10,
+                    CheckLifecycleTiming(await ReadRows(tied + reversed + explicitTools + finish), 6, false, 10,
                         $"{abortType}: valid archived end resolves activity without reassigning explicit tools");
                 }
                 finally { File.Delete(archivedPath); }
             }
+            string SiblingCompletion(DateTimeOffset at) => Row("event_msg", at,
+                new { type = "task_complete", turn_id = "another-turn", duration_ms = 0, time_to_first_token_ms = 0 });
+            string reversedCompletion = SiblingCompletion(start.AddMilliseconds(-1));
+            CheckLifecycleTiming(await ReadRows(tied + implicitTools + finish), null, true, 10,
+                "task_complete: omitted sibling completion leaves implicit tool ownership ambiguous");
+            CheckLifecycleTiming(await ReadRows(tied + SiblingCompletion(start) + implicitTools + finish), 6, false, 10,
+                "task_complete: sibling completion at its start allows implicit tool pairing", unreconciledSibling: true);
+            CheckLifecycleTiming(await ReadRows(tied + reversedCompletion + explicitTools + finish), 6, true, 10,
+                "task_complete: reversed sibling completion preserves explicitly owned tools", unreconciledSibling: true);
+            CheckLifecycleTiming(await ReadRows(tied + reversedCompletion + implicitTools + finish), null, true, 10,
+                "task_complete: sibling completion earlier than its start cannot license implicit tool pairing", unreconciledSibling: true);
             await CheckRows(metadata + began + Row("event_msg", start.AddSeconds(1), new { type = "task_aborted", turn_id = "turn" })
                 + Tool("function_call", 2) + Tool("function_call_output", 5) + usage + complete, null, "aborted lifecycle cannot associate later tools");
             await CheckRows(metadata + began + Tool("function_call", 2).Replace("\"timestamp\":", "\"turn_id\":\"another-turn\",\"timestamp\":", StringComparison.Ordinal)

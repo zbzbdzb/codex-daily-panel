@@ -88,7 +88,7 @@ internal sealed class DailyToolTimingParser(string sourceKey)
                     // All active identities share the latest start time. An end
                     // before this turn's start cannot narrow tool ownership.
                     // Inactive identities can still provide a historical end.
-                    if (abort && _active.Contains(turn) && _latestStart is { } started && time < started) return [];
+                    if (_active.Contains(turn) && _latestStart is { } started && time < started) return [];
                     _active.Remove(turn);
                     if (abort) return [new DailyTurnAbortedEvent(abortSessionKey, turn, time)];
                 }
