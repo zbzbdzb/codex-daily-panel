@@ -4,5 +4,6 @@
   <ItemGroup>
     <InternalsVisibleTo Include="CodexDaily" />
     <InternalsVisibleTo Include="CodexUsage.DailyMonitor.Tests" />
+    <InternalsVisibleTo Include="CodexUsage.DailyState.Tests" />
   </ItemGroup>
 </Project>
