@@ -60,7 +60,8 @@ public sealed class SessionLogMonitor : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             var day = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(now, _zone).DateTime);
             _refreshAt = now;
-            foreach (var source in _sources.Values) source.SampleAt(now);
+            var rewindBudget = MaximumRetainedEvents - _sources.Values.Sum(source => source.RewoundEvidenceCount);
+            foreach (var source in _sources.Values) source.SampleAt(now, ref rewindBudget);
             if (_day != day)
             {
                 // Daily numeric gaps expire. Missing classification facts remain
@@ -78,7 +79,7 @@ public sealed class SessionLogMonitor : IDisposable
                 var guards = new List<ExclusionGuard>();
                 var histories = new HashSet<ToolOwnershipHistory>();
                 int guardCount = 0;
-                bool overflow = false;
+                bool overflow = _sources.Values.Any(source => source.HasUnretainedRewoundWait);
                 foreach (var guard in Guards().Concat(_sources.Values.SelectMany(x => CaptureGuards(x, exclusions, conflicts))).Distinct())
                 {
                     guardCount += 1 + (guard is TimingGuard { Ownership: { } history } && histories.Add(history) ? history.Count : 0);
@@ -209,6 +210,7 @@ public sealed class SessionLogMonitor : IDisposable
             if (coverageLost) Reason("日志截断、替换或删除后，当日覆盖无法确认；仅显示当前可核验小计", new(DailyIssueCodes.CoverageLost));
             reasons.Add(snapshot.Status);
             diagnostics.AddRange(snapshot.Issues);
+            foreach (var source in _sources.Values) source.RememberVerifiedSample();
             // The source cap limits coverage, independently of loading or read failures.
             return snapshot with
             {
@@ -288,6 +290,7 @@ public sealed class SessionLogMonitor : IDisposable
 
     private void RecordLoss(Source source, DailyCoverageState coverage)
     {
+        _unprovableCoverage |= source.HasUnretainedRewoundWait;
         // Use the same day/root/request-occurrence rules as the actual statistics.
         // A prior-day replay, closed historical turn or confirmed child alone is
         // not missing today's root-session coverage.
@@ -501,7 +504,7 @@ public sealed class SessionLogMonitor : IDisposable
         _ => null
     };
 
-    private static int GuardEvidenceCount(List<ExclusionGuard> guards) => guards.Count
+    private static int GuardEvidenceCount(IReadOnlyCollection<ExclusionGuard> guards) => guards.Count
         + guards.OfType<TimingGuard>().Select(x => x.Ownership).OfType<ToolOwnershipHistory>().Distinct().Sum(x => x.Count);
 
     private static RawToolEndpoint? ToolEndpoint(DailySourceEvidence fact) => fact.RawTimingDigest is { } digest
@@ -556,16 +559,21 @@ public sealed class SessionLogMonitor : IDisposable
         var evidence = source.Evidence.ToArray();
         var guards = evidence.Where(x => exclusions.Contains(x.Event)).Select(x => CreateGuard(x, conflicts))
             .OfType<ExclusionGuard>().ToArray();
+        return AttachToolHistory(guards, evidence, _refreshAt).Concat(source.WaitsBeyondSample());
+    }
+
+    private static IEnumerable<ExclusionGuard> AttachToolHistory(ExclusionGuard[] guards, DailySourceEvidence[] evidence,
+        DateTimeOffset at)
+    {
         var cohorts = guards.OfType<TimingGuard>().Select(x => x.Evidence).OfType<DailyTimingUnavailableEvent>()
             .Where(x => x.StartTimestamp.HasValue)
             .Select(x => (x.SessionKey, x.StartTimestamp!.Value)).ToHashSet();
         if (cohorts.Count == 0) return guards;
-
-        var pairs = IndexPairs(SourceWaitPairs(evidence, _refreshAt));
+        var pairs = IndexPairs(SourceWaitPairs(evidence, at));
         // ProjectOwnership uses the starts in the tool's group and the latest
         // observed end per member. Save those exact dependencies, not all prior
         // history or the subset that contributes to today's counters.
-        var ends = evidence.Select(x => x.Event).Where(x => x is CompletionEvent or DailyTurnAbortedEvent && x.Timestamp <= _refreshAt)
+        var ends = evidence.Select(x => x.Event).Where(x => x is CompletionEvent or DailyTurnAbortedEvent && x.Timestamp <= at)
             .Select(x => (Event: x, Turn: TimingTurn(x))).Where(x => x.Turn.HasValue).GroupBy(x => x.Turn!.Value)
             .ToDictionary(x => x.Key, x => x.MaxBy(y => y.Event.Timestamp).Event);
         var histories = evidence.Select(x => x.Event).OfType<StartEvent>().Where(x => cohorts.Contains((x.SessionKey, x.Timestamp)))
@@ -580,8 +588,8 @@ public sealed class SessionLogMonitor : IDisposable
                 }
                 return new ToolOwnershipHistory(string.Join('\n', facts.Order(StringComparer.Ordinal)), facts.Count);
             });
-        return guards.Select(guard => guard is TimingGuard { Evidence: DailyTimingUnavailableEvent { StartTimestamp: { } at } } timing
-            && histories.TryGetValue((timing.Session, at), out var ownership)
+        return guards.Select(guard => guard is TimingGuard { Evidence: DailyTimingUnavailableEvent { StartTimestamp: { } start } } timing
+            && histories.TryGetValue((timing.Session, start), out var ownership)
                 ? timing with { Ownership = ownership, ObservedPair = pairs.GetValueOrDefault(timing.Digest) } : guard);
     }
 
@@ -920,6 +928,9 @@ public sealed class SessionLogMonitor : IDisposable
         private DailyToolTimingParser _timing;
         private readonly List<DailySourceEvidence> _events = [];
         private IEnumerable<DailySourceEvidence>? _projectedEvents;
+        private (DateTimeOffset At, int Count)? _verifiedSample;
+        private Dictionary<string, TimingGuard[]>? _rewoundWaits;
+        private DateTimeOffset? _unretainedWaitEnd;
         private DateTimeOffset _sampleAt;
         private DateTimeOffset? _nextTimingChange;
         private bool _unassociatedTiming;
@@ -938,6 +949,8 @@ public sealed class SessionLogMonitor : IDisposable
         public bool OversizedLine { get; set; }
         public bool TimingUnavailable { get; set; }
         public bool UnassociatedTiming => _unassociatedTiming;
+        public int RewoundEvidenceCount { get; private set; }
+        public bool HasUnretainedRewoundWait => _unretainedWaitEnd > _sampleAt;
 
         public Source(string path, DateOnly day, TimeZoneInfo zone, DateTimeOffset now, Func<bool> canRetain, Action<int> changeCount,
             Action<Source, DailyCoverageState> recordLoss, Func<DailyCoverageStamp[]> coverageTargets)
@@ -966,11 +979,62 @@ public sealed class SessionLogMonitor : IDisposable
             };
         }
 
-        public void SampleAt(DateTimeOffset now)
+        public void SampleAt(DateTimeOffset now, ref int rewindBudget)
         {
+            if (_verifiedSample is { } sample && now < sample.At)
+            {
+                _verifiedSample = null;
+                // Only the verified prefix can use the old clock. An append
+                // read after the rewind must qualify at its own sample.
+                var prefix = _events.Take(sample.Count).ToArray();
+                var observed = DailyToolTimingParser.ProjectOwnership(prefix, sample.At, out _).ToArray();
+                var anchors = observed.Where(fact => fact.RawTimingDigest is not null
+                        && fact.Event is DailyTimingUnavailableEvent { StartTimestamp: not null, ToolPhase: not null })
+                    .Select(fact => new TimingGuard(fact.RawTimingDigest!, fact.Event)).ToArray();
+                Dictionary<string, TimingGuard[]>? updates = null;
+                var latestEnd = _unretainedWaitEnd;
+                foreach (var group in AttachToolHistory(anchors, observed, sample.At).OfType<TimingGuard>()
+                    .Where(x => x.ObservedPair is { } pair && pair.Window.End > now).GroupBy(x => x.Digest, StringComparer.Ordinal))
+                {
+                    var guards = group.Distinct().ToArray();
+                    // Windows sharing a raw endpoint are nested. Keep the
+                    // widest witnessed pair and its source-local scopes.
+                    var window = guards[0].ObservedPair!.Window;
+                    if (_rewoundWaits?.TryGetValue(group.Key, out var previous) == true)
+                    {
+                        var retained = previous[0].ObservedPair!.Window;
+                        if (retained.Start <= window.Start && retained.End >= window.End) continue;
+                    }
+                    updates ??= _rewoundWaits is null ? new(StringComparer.Ordinal) : new(_rewoundWaits, StringComparer.Ordinal);
+                    updates[group.Key] = guards;
+                    if (latestEnd is null || window.End > latestEnd) latestEnd = window.End;
+                }
+                if (updates is not null)
+                {
+                    var count = GuardEvidenceCount(updates.Values.SelectMany(guards => guards).ToArray());
+                    var added = count - RewoundEvidenceCount;
+                    if (added > rewindBudget)
+                        _unretainedWaitEnd = latestEnd;
+                    else
+                    {
+                        rewindBudget -= added;
+                        RewoundEvidenceCount = count;
+                        _rewoundWaits = updates;
+                    }
+                }
+            }
             if (now < _sampleAt || _nextTimingChange is { } next && now >= next) _projectedEvents = null;
             _sampleAt = now;
         }
+
+        public void RememberVerifiedSample()
+        {
+            if (VerifiedThisRefresh && !ReadFailed && Reader.HasStablePrefix)
+                _verifiedSample = (_sampleAt, _events.Count);
+        }
+
+        public IEnumerable<TimingGuard> WaitsBeyondSample() => _rewoundWaits is null ? [] :
+            _rewoundWaits.Values.SelectMany(guards => guards).Where(x => x.ObservedPair!.Window.End > _sampleAt);
 
         public void Apply(DailyReadBatchResult result)
         {
@@ -1052,6 +1116,10 @@ public sealed class SessionLogMonitor : IDisposable
             _changeCount(-_events.Count);
             _events.Clear();
             _projectedEvents = null;
+            _verifiedSample = null;
+            _rewoundWaits = null;
+            _unretainedWaitEnd = null;
+            RewoundEvidenceCount = 0;
             _nextTimingChange = null;
         }
         public void Dispose() { ClearEvents(); Reader.Dispose(); }

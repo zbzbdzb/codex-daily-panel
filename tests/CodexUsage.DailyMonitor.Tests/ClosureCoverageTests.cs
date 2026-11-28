@@ -887,6 +887,74 @@ internal static class ClosureCoverageTests
             });
         }
 
+        foreach (string change in new[] { "replace", "truncate", "remove", "rewind-then-remove", "day-rollback", "future-append", "second-pair" })
+        {
+            await Case($"CON-32 source generation witnesses survive a rewind ({change})", async () =>
+            {
+                var origin = midnight.AddMinutes(20);
+                using var fixture = new Fixture("rewind-generation-" + change, origin.AddSeconds(40));
+                string call = Tool("function_call", "rewind-generation", origin.AddSeconds(1));
+                string result = Tool("function_call_output", "rewind-generation", origin.AddSeconds(20));
+                string prefix = midnightMeta + firstStart + competingStart + call;
+                bool futureAppend = change == "future-append";
+                bool secondPair = change == "second-pair";
+                string original = prefix + (futureAppend ? "" : secondPair
+                    ? Tool("function_call_output", "rewind-generation", origin.AddSeconds(4)) : result);
+                string path = fixture.WriteSession("tools", original);
+                fixture.WriteSession("completed", midnightMeta
+                    + Modern("midnight", "rewind-generation", "inferred-C", origin.AddSeconds(14))
+                    + Complete("inferred-C", origin.AddSeconds(15)));
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                ExpectMidnightTiming(await monitor.RefreshAsync(origin.AddSeconds(37)), timed: futureAppend || secondPair, lost: false,
+                    "the original generation is observed before the rewind");
+
+                int firstLoss = 16;
+                if (change is "rewind-then-remove" or "future-append")
+                {
+                    if (futureAppend) fixture.AppendSession(path, result);
+                    // These successful live polls must neither erase a prior
+                    // witness nor admit a newly appended, future-dated return.
+                    await monitor.RefreshAsync(origin.AddSeconds(16));
+                    await monitor.RefreshAsync(origin.AddSeconds(18));
+                    firstLoss = 17;
+                }
+                if (secondPair)
+                {
+                    await monitor.RefreshAsync(origin.AddSeconds(16));
+                    string extra = Tool("function_call", "second-witness", origin.AddSeconds(2))
+                        + Tool("function_call_output", "second-witness", origin.AddSeconds(20));
+                    fixture.AppendSession(path, extra);
+                    original += extra;
+                    ExpectMidnightTiming(await monitor.RefreshAsync(origin.AddSeconds(25)), timed: false, lost: false,
+                        "a new wait becomes eligible in a longer prefix below the first sample time");
+                }
+                if (change == "replace") ReplaceSession(fixture, path, prefix);
+                else if (change == "truncate") fixture.TruncateSession(path, Utf8.GetByteCount(prefix));
+                else File.Delete(path);
+                if (change == "day-rollback")
+                {
+                    var previousDay = await monitor.RefreshAsync(midnight.AddSeconds(-1));
+                    Check(previousDay, previousDay.InputTokens is null && previousDay.OutputTokens is null
+                        && previousDay.ProcessingSeconds is null, "the earlier reporting day has no applicable counters");
+                }
+                foreach (int seconds in new[] { firstLoss, 19, 40 })
+                {
+                    var snapshot = await monitor.RefreshAsync(origin.AddSeconds(seconds));
+                    if (futureAppend)
+                    {
+                        Check(snapshot, snapshot.InputTokens == 100 && snapshot.OutputTokens == 40 &&
+                            snapshot.ProcessingSeconds == 9 && snapshot.TimedTurnCount == 1,
+                            $"an unwitnessed future return cannot form a retired pair at +{seconds}");
+                    }
+                    else
+                        ExpectMidnightTiming(snapshot, timed: false, lost: true, $"first loss and subsequent samples at +{seconds}");
+                }
+                fixture.WriteSession("tools", futureAppend ? prefix + result : original);
+                ExpectMidnightTiming(await monitor.RefreshAsync(origin.AddSeconds(41)), timed: false, lost: false,
+                    "exact raw restoration clears loss, while the restored overlapping wait excludes C");
+            });
+        }
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));
