@@ -156,9 +156,9 @@ internal static class ToolTimingTests
             var context = new SourceContext("source");
             var parser = new EventParser();
             var timing = new DailyToolTimingParser("source");
-            timing.Parse(metadata, parser.Parse(metadata, context).Events);
-            timing.Parse(began, parser.Parse(began, context).Events);
-            var projected = timing.Parse(Tool("function_call", 2), []);
+            timing.Parse(metadata, parser.Parse(metadata, context).Events, context.SessionKey, out _);
+            timing.Parse(began, parser.Parse(began, context).Events, context.SessionKey, out _);
+            var projected = timing.Parse(Tool("function_call", 2), [], context.SessionKey, out _);
             var projectedTool = projected.OfType<DailyToolEvent>().Single();
             string serialized = JsonSerializer.Serialize(projectedTool);
             Check(projectedTool.SessionKey == EventParser.Key("session", "timing-session")

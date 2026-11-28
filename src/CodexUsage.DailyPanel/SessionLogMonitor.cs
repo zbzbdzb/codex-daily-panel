@@ -730,8 +730,8 @@ public sealed class SessionLogMonitor : IDisposable
         public void AddLine(string line)
         {
             var parsed = _parser.Parse(line, _context);
-            BadStatistics |= parsed.Malformed || parsed.Unsupported;
-            var timing = _timing.Parse(line, parsed.Events);
+            var timing = _timing.Parse(line, parsed.Events, _context.SessionKey, out var malformedAbort);
+            BadStatistics |= parsed.Malformed || parsed.Unsupported || malformedAbort;
             if (timing.Any(e => e is DailyTimingUnavailableEvent && e.SessionKey == _key)) _unassociatedTiming = true;
             foreach (var item in parsed.Events.Concat(timing))
             {
@@ -756,42 +756,7 @@ public sealed class SessionLogMonitor : IDisposable
                 if (item is MetadataEvent) MetadataNeedsObservation = true;
                 _changeCount(1);
             }
-            if (line.Contains("task_aborted", StringComparison.Ordinal) || line.Contains("turn_aborted", StringComparison.Ordinal))
-                AddAbort(line);
         }
-
-        private void AddAbort(string line)
-        {
-            try
-            {
-                using var document = JsonDocument.Parse(line, new JsonDocumentOptions { MaxDepth = 64 });
-                var root = document.RootElement;
-                if (!Unique(root) || Field(root, "type").GetString() != "event_msg") return;
-                var payload = Field(root, "payload");
-                if (!Unique(payload)) return;
-                var kind = Field(payload, "type");
-                if (kind.ValueKind != JsonValueKind.String || kind.GetString() is not ("task_aborted" or "turn_aborted")) return;
-                if (!DailyToolTimingParser.HasSupportedVersion(root) || !DailyToolTimingParser.HasSupportedVersion(payload))
-                {
-                    BadStatistics = true;
-                    return;
-                }
-                var turn = Field(payload, "turn_id");
-                var timestamp = Field(root, "timestamp");
-                if (turn.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(turn.GetString())
-                    || !timestamp.TryGetDateTimeOffset(out var time)) return;
-                if (Events.Count < MaximumEventsPerFile && _canRetain())
-                {
-                    Events.Add(new DailyTurnAbortedEvent(_context.SessionKey, EventParser.Key("turn", turn.GetString()), time));
-                    _changeCount(1);
-                }
-                else BadStatistics = true;
-            }
-            catch (JsonException) { BadStatistics = true; }
-            catch (InvalidOperationException) { BadStatistics = true; }
-        }
-
-        private static JsonElement Field(JsonElement node, string name) => node.ValueKind == JsonValueKind.Object && node.TryGetProperty(name, out var value) ? value : default;
         public IEnumerable<StatsEvent> SummaryEvents(DateTimeOffset now)
         {
             if (!ReadFailed) foreach (var item in Events) yield return item;
@@ -801,7 +766,6 @@ public sealed class SessionLogMonitor : IDisposable
                 foreach (var session in Events.Select(e => e.SessionKey).Distinct(StringComparer.Ordinal))
                     yield return new DailyTimingUnavailableEvent(session, null, now);
         }
-        private static bool Unique(JsonElement node) => node.ValueKind == JsonValueKind.Object && node.EnumerateObject().Select(p => p.Name).Distinct(StringComparer.Ordinal).Count() == node.EnumerateObject().Count();
         private void ClearEvents() { _changeCount(-Events.Count); Events.Clear(); }
         public void Dispose() { ClearEvents(); Reader.Dispose(); }
     }

@@ -284,6 +284,87 @@ internal static class ClosureCoverageTests
             ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, false, "unsupported non-statistics row must not change source quality");
         });
 
+        async Task ExpectMalformedAbort(string label, string kind, string malformed)
+        {
+            using var fixture = new Fixture(label, Now);
+            var prefix = TiedStartRows() + Complete("tied-first", At.AddSeconds(10));
+            fixture.WriteSession("current", prefix + malformed);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+
+            var singleSource = await monitor.RefreshAsync(Now);
+            ExpectTiedStarts(singleSource, null, true, "malformed abort cannot settle the current tie");
+            Check(singleSource, singleSource.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable),
+                "the current malformed abort must be diagnosed as a source issue");
+
+            fixture.WriteSession("valid-archive", prefix + AbortRow(kind, "tied-second", At.AddSeconds(10), 1, "1"), archived: true);
+            var withArchive = await monitor.RefreshAsync(Now);
+            ExpectTiedStarts(withArchive, null, false, "a valid archived abort settles the tie", partial: true);
+            Check(withArchive, withArchive.SourceCount == 2
+                && withArchive.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable),
+                "legal archived closure cannot suppress the current malformed-source diagnosis");
+        }
+
+        var secondTurn = Turn("tied-second");
+        foreach (var kind in new[] { "task_aborted", "turn_aborted" })
+        {
+            await Case($"CON-13 {kind} duplicate payload version stays partial after archived closure", () =>
+                ExpectMalformedAbort($"ambiguous-version-{kind}", kind,
+                    AbortEnvelope($$"""{"type":"{{kind}}","turn_id":"{{secondTurn}}","schema_version":2,"schema_version":1}""")));
+        }
+
+        var validPayload = $$"""{"type":"turn_aborted","turn_id":"{{secondTurn}}"}""";
+        var malformedCases = new (string Name, string Row)[]
+        {
+            ("duplicate-payload-kind", AbortEnvelope(
+                $$"""{"type":"turn_aborted","turn_id":"{{secondTurn}}","type":"user_message"}""")),
+            ("duplicate-turn-id", AbortEnvelope(
+                $$"""{"type":"turn_aborted","turn_id":"{{Turn("tied-first")}}","turn_id":"{{secondTurn}}"}""")),
+            ("duplicate-envelope-kind", AbortEnvelope(validPayload).Replace(
+                "\"type\":\"event_msg\"", "\"type\":\"event_msg\",\"type\":\"response_item\"", StringComparison.Ordinal)),
+            ("duplicate-payload-structure", AbortEnvelope(validPayload).Replace(
+                validPayload, validPayload + ""","payload":null""", StringComparison.Ordinal)),
+            ("duplicate-timestamp", AbortEnvelope(validPayload, "\"invalid\",\"timestamp\":\"2026-10-21T12:00:10+08:00\"")),
+            ("invalid-timestamp", AbortEnvelope(validPayload, "\"2026-10-21 12:00:10 +08:00\"")),
+            ("missing-turn-id", AbortEnvelope("""{"type":"turn_aborted"}""")),
+            ("blank-turn-id", AbortEnvelope("""{"type":"turn_aborted","turn_id":" "}""")),
+            ("numeric-turn-id", AbortEnvelope("""{"type":"turn_aborted","turn_id":1}"""))
+        };
+        foreach (var (name, row) in malformedCases)
+        {
+            await Case($"CON-14 {name} on an abort is a source issue", () =>
+                ExpectMalformedAbort(name, "turn_aborted", row));
+        }
+
+        await Case("CON-15 duplicate fields in a non-statistics payload do not diagnose an abort", async () =>
+        {
+            using var fixture = new Fixture("unrelated-abort-text", Now);
+            var prefix = TiedStartRows() + Complete("tied-first", At.AddSeconds(10))
+                + AbortRow("turn_aborted", "tied-second", At.AddSeconds(10), "1", 1);
+            var ignored = AbortEnvelope("""
+                {"type":"user_message","schema_version":1,"schema_version":2,"turn_id":null,"turn_id":"ignored","message":"task_aborted turn_aborted"}
+                """);
+            fixture.WriteSession("current", prefix + ignored);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            var snapshot = await monitor.RefreshAsync(Now);
+            ExpectTiedStarts(snapshot, 9, false, "a supported abort resolves activity while unrelated text stays ignored");
+            Check(snapshot, !snapshot.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable),
+                "abort words outside the event kind are not an abort record");
+        });
+
+        const string escapedKind = @"turn_\u0061borted";
+        await Case("CON-16 JSON-escaped supported abort kind closes the turn", async () =>
+        {
+            using var fixture = new Fixture("legal-escaped-kind", Now);
+            var prefix = TiedStartRows() + Complete("tied-first", At.AddSeconds(10));
+            fixture.WriteSession("current", prefix + AbortEnvelope(
+                $$"""{"type":"{{escapedKind}}","turn_id":"{{secondTurn}}"}"""));
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, false, "the decoded abort kind supplies closure");
+        });
+        await Case("CON-16 JSON-escaped abort kind with duplicate version stays partial", () =>
+            ExpectMalformedAbort("ambiguous-escaped-kind", "turn_aborted", AbortEnvelope(
+                $$"""{"type":"{{escapedKind}}","turn_id":"{{secondTurn}}","schema_version":2,"schema_version":1}""")));
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));
@@ -370,6 +451,12 @@ internal static class ClosureCoverageTests
         var envelope = new Dictionary<string, object> { ["type"] = "event_msg", ["timestamp"] = timestamp, ["payload"] = payload };
         if (envelopeVersion is not null) envelope["schema_version"] = envelopeVersion;
         return JsonSerializer.Serialize(envelope) + "\n";
+    }
+
+    private static string AbortEnvelope(string payload, string? timestamp = null)
+    {
+        timestamp ??= JsonSerializer.Serialize(At.AddSeconds(10));
+        return "{\"type\":\"event_msg\",\"timestamp\":" + timestamp + ",\"payload\":" + payload + "}\n";
     }
 
     private static string EarlyChildRows() => ChildMetadata("A", "parent", At.AddMinutes(-1))

@@ -8,7 +8,7 @@ using CodexUsage.Daily;
 
 namespace CodexUsage.DailyPanel;
 
-/// <summary>Projects only hashed identities and tool timestamps. The lifecycle is deliberately
+/// <summary>Projects timing and abort facts with hashed identities. Active-turn tracking is
 /// independent of token parser context, which late usage corrections can move to an older turn.</summary>
 internal sealed class DailyToolTimingParser(string sourceKey)
 {
@@ -19,8 +19,10 @@ internal sealed class DailyToolTimingParser(string sourceKey)
     private bool _lifecycleUncertain;
     internal string SessionKey => _session;
 
-    public IReadOnlyList<StatsEvent> Parse(string line, IReadOnlyList<StatsEvent> statistics)
+    public IReadOnlyList<StatsEvent> Parse(string line, IReadOnlyList<StatsEvent> statistics,
+        string abortSessionKey, out bool malformedAbort)
     {
+        malformedAbort = false;
         try
         {
             using var document = JsonDocument.Parse(line.TrimStart('\uFEFF'), new JsonDocumentOptions { MaxDepth = 64 });
@@ -38,19 +40,22 @@ internal sealed class DailyToolTimingParser(string sourceKey)
                 return [];
             }
             if (outer is not ("response_item" or "event_msg")) return [];
-            if (outer == "event_msg" && kind is not ("task_started" or "task_complete" or "task_aborted" or "turn_aborted")) return [];
+            bool abort = outer == "event_msg" && kind is ("task_aborted" or "turn_aborted");
+            if (outer == "event_msg" && !abort && kind is not ("task_started" or "task_complete")) return [];
             if (!Unique(root) || !Unique(payload) || !HasSupportedVersion(root) || !HasSupportedVersion(payload))
             {
+                malformedAbort = abort;
                 _lifecycleUncertain |= outer == "event_msg";
                 // Ambiguous envelope/schema can conceal ownership outside the current active turn.
                 return SessionUnavailable(Time(root));
             }
-            var time = Time(root);
+            var time = abort ? AbortTime(root) : Time(root);
             if (outer == "event_msg")
             {
                 string? turn = Hash(payload, "turn_id", "turn");
                 if (turn is null || time == DateTimeOffset.MinValue)
                 {
+                    malformedAbort = abort;
                     _lifecycleUncertain = true;
                     // A lifecycle row without identity/time may refer to any turn in this session.
                     return SessionUnavailable(time);
@@ -77,7 +82,11 @@ internal sealed class DailyToolTimingParser(string sourceKey)
                     }
                     _active.Add(turn);
                 }
-                else _active.Remove(turn);
+                else
+                {
+                    _active.Remove(turn);
+                    if (abort) return [new DailyTurnAbortedEvent(abortSessionKey, turn, time)];
+                }
                 return [];
             }
             if (kind is "message" or "agent_message" or "additional_tools" or "reasoning" or "compaction" or "compaction_summary") return [];
@@ -120,9 +129,11 @@ internal sealed class DailyToolTimingParser(string sourceKey)
     private static string? Hash(JsonElement node, string name, string category) => Text(node, name) is { } value ? EventParser.Key(category, value) : null;
     private static DateTimeOffset Time(JsonElement root) => Text(root, "timestamp") is { } text
         && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var time) ? time : DateTimeOffset.MinValue;
+    private static DateTimeOffset AbortTime(JsonElement root) => Field(root, "timestamp") is { ValueKind: JsonValueKind.String } timestamp
+        && timestamp.TryGetDateTimeOffset(out var time) ? time : DateTimeOffset.MinValue;
     private static bool Unique(JsonElement node) => node.ValueKind == JsonValueKind.Object
         && node.EnumerateObject().Select(p => p.Name).Distinct(StringComparer.Ordinal).Count() == node.EnumerateObject().Count();
-    internal static bool HasSupportedVersion(JsonElement node) => Field(node, "schema_version") is var value
+    private static bool HasSupportedVersion(JsonElement node) => Field(node, "schema_version") is var value
         && (value.ValueKind == JsonValueKind.Undefined || value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out int n) && n == 1
             || value.ValueKind == JsonValueKind.String && value.GetString() == "1");
 }
