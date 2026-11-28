@@ -38,8 +38,11 @@ internal readonly record struct DailyTimingWindow(DateTimeOffset Start, DateTime
         var rows = endpoints.Take(3).ToArray();
         if (rows.Length != 2) return null;
         var (call, result) = rows[0].Phase == DailyToolPhase.Call ? (rows[0], rows[1]) : (rows[1], rows[0]);
-        return call.Phase == DailyToolPhase.Call && result.Phase == DailyToolPhase.Result
+        return FromOrderedEndpoints(call, result, now);
+    }
+
+    internal static DailyTimingWindow? FromOrderedEndpoints(DailyToolEndpoint call, DailyToolEndpoint result, DateTimeOffset now) =>
+        call.Phase == DailyToolPhase.Call && result.Phase == DailyToolPhase.Result
             && call.Timestamp != DateTimeOffset.MinValue && call.Timestamp < result.Timestamp && result.Timestamp <= now
             ? new(call.Timestamp, result.Timestamp) : null;
-    }
 }

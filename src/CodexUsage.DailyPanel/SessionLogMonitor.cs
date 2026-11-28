@@ -385,6 +385,16 @@ public sealed class SessionLogMonitor : IDisposable
         var historyMatches = new Dictionary<(DailyLogReader, ToolOwnershipHistory), bool>();
         var provenOwnership = new HashSet<string>(StringComparer.Ordinal);
         foreach (var group in ownershipGroups)
+        {
+            var anchor = group.First();
+            // Distinct spans matter for timing. Equivalent spans retain the
+            // original raw witness instead of replacing it with another row.
+            var seen = group.Select(x => x.Guard.ObservedPair?.Window).OfType<DailyTimingWindow>().ToHashSet();
+            var additions = timingSources.Select(source => source.Pairs.GetValueOrDefault(group.Key))
+                .OfType<ObservedToolPair>().OrderBy(x => x.CallDigest, StringComparer.Ordinal)
+                .ThenBy(x => x.ResultDigest, StringComparer.Ordinal).Where(pair => seen.Add(pair.Window))
+                .Select(pair => (anchor.Loss, Guard: anchor.Guard with { ObservedPair = pair })).ToArray();
+            var constraints = group.Concat(additions);
             foreach (var source in timingSources)
             {
                 if (!source.Timing.Contains(group.Key)) continue;
@@ -397,35 +407,32 @@ public sealed class SessionLogMonitor : IDisposable
                     var key = (source.Reader, history);
                     if (!historyMatches.TryGetValue(key, out var matches))
                         historyMatches[key] = matches = history.Facts.Split('\n').All(source.Digests.Contains);
-                    return matches && (item.Guard.ObservedPair is null
-                            || source.Pairs.GetValueOrDefault(item.Guard.Digest) == item.Guard.ObservedPair)
+                    return matches && (item.Guard.ObservedPair is not { } pair
+                            || source.Pairs.ContainsKey(pair.CallDigest) && source.Pairs.ContainsKey(pair.ResultDigest))
                         && (owned && completeSources.TryGetValue(item.Loss, out var covered) && covered.Contains(source.Reader)
                         || unavailable.Any(row => CoversTiming(row, item.Guard.Evidence, starts)));
                 }
-                if (!group.All(ProvesConstraint)) continue;
+                if (!constraints.All(ProvesConstraint)) continue;
                 provenOwnership.Add(group.Key);
                 break;
             }
-
-        // A late counterpart is relevant only beside the exact retained raw
-        // anchor. Keep the first witnessed pair, including the new dependency.
-        var newPairs = new Dictionary<string, ObservedToolPair>(StringComparer.Ordinal);
-        foreach (var group in ownershipGroups.Where(group => !provenOwnership.Contains(group.Key)
-                     && group.All(x => x.Guard.ObservedPair is null)))
-        {
-            var candidates = timingSources.Select(source => source.Pairs.GetValueOrDefault(group.Key))
-                .OfType<ObservedToolPair>().Distinct().Take(2).ToArray();
-            if (candidates is [var pair]) newPairs.Add(group.Key, pair);
+            if (provenOwnership.Contains(group.Key)) continue;
+            foreach (var (loss, guard) in additions)
+            {
+                if (_coverageEvidenceCount >= MaximumRetainedEvents)
+                {
+                    _unprovableCoverage = true;
+                    break;
+                }
+                loss.Guards.Add(guard);
+                _coverageEvidenceCount++;
+            }
         }
         foreach (var loss in _coverageLosses.ToArray())
         {
             int before = GuardEvidenceCount(loss.Guards);
             loss.Guards.RemoveAll(guard => HasOwnershipHistory(guard)
                 ? provenOwnership.Contains(guard.Digest) : ProvesGuard(guard));
-            for (int i = 0; i < loss.Guards.Count; i++)
-                if (loss.Guards[i] is TimingGuard { Ownership: not null } pending
-                    && newPairs.TryGetValue(pending.Digest, out var pair))
-                    loss.Guards[i] = pending with { ObservedPair = pair };
             _coverageEvidenceCount -= before - GuardEvidenceCount(loss.Guards);
             if (!loss.PositiveResolved || loss.Guards.Count > 0) continue;
             _coverageLosses.Remove(loss);
@@ -471,8 +478,8 @@ public sealed class SessionLogMonitor : IDisposable
         private readonly int _hash = StringComparer.Ordinal.GetHashCode(Facts);
         public override int GetHashCode() => _hash;
     }
-    // One exact pair per existing bounded guard. Its bounds are used for
-    // relevance only; both original row identities are required for release.
+    // Each observed alternative consumes an existing guard budget entry.
+    // Bounds decide relevance; raw row identities decide restoration.
     private sealed record ObservedToolPair(string CallDigest, string ResultDigest, DailyTimingWindow Window);
     private readonly record struct RawToolEndpoint(string Digest, string Session, string Call, DailyToolEndpoint Endpoint, bool Uncertain);
     private sealed record TimingGuard(string Hash, StatsEvent Evidence, ToolOwnershipHistory? Ownership = null,
@@ -507,32 +514,41 @@ public sealed class SessionLogMonitor : IDisposable
             _ => null
         } : null;
 
-    private static IEnumerable<(string Session, ObservedToolPair Pair, bool Uncertain)> SourceWaitPairs(
+    private static IEnumerable<(RawToolEndpoint Anchor, ObservedToolPair Pair)> SourceWaitPairs(
         IEnumerable<DailySourceEvidence> evidence, DateTimeOffset now)
     {
         var endpoints = evidence.Select(ToolEndpoint).OfType<RawToolEndpoint>()
             .Where(x => x.Endpoint.Timestamp != DateTimeOffset.MinValue && x.Endpoint.Timestamp <= now);
         foreach (var group in endpoints.GroupBy(x => (x.Session, x.Call)))
         {
-            // Multiple projections and byte-identical replays are one endpoint.
-            var raw = group.DistinctBy(x => x.Digest).Take(3).ToArray();
-            if (DailyTimingWindow.TryPair(raw.Select(x => x.Endpoint), now) is not { } window) continue;
-            var call = raw.Single(x => x.Endpoint.Phase == DailyToolPhase.Call);
-            var result = raw.Single(x => x.Endpoint.Phase == DailyToolPhase.Result);
-            yield return (group.Key.Session, new(call.Digest, result.Digest, window), group.Any(x => x.Uncertain));
+            var raw = group.GroupBy(x => x.Digest, StringComparer.Ordinal)
+                .Select(rows => rows.First() with { Uncertain = rows.Any(x => x.Uncertain) }).ToArray();
+            RawToolEndpoint? firstCall = null;
+            RawToolEndpoint? lastResult = null;
+            foreach (var row in raw)
+            {
+                if (row.Endpoint.Phase == DailyToolPhase.Call
+                    && (firstCall is null || row.Endpoint.Timestamp < firstCall.Value.Endpoint.Timestamp))
+                    firstCall = row;
+                if (row.Endpoint.Phase == DailyToolPhase.Result
+                    && (lastResult is null || row.Endpoint.Timestamp > lastResult.Value.Endpoint.Timestamp))
+                    lastResult = row;
+            }
+            if (firstCall is not { } earliest || lastResult is not { } latest) continue;
+            // For a fixed raw endpoint the farthest valid mate is itself
+            // observed in this source and covers all its shorter possibilities.
+            foreach (var anchor in raw)
+            {
+                var call = anchor.Endpoint.Phase == DailyToolPhase.Call ? anchor : earliest;
+                var result = anchor.Endpoint.Phase == DailyToolPhase.Result ? anchor : latest;
+                if (DailyTimingWindow.FromOrderedEndpoints(call.Endpoint, result.Endpoint, now) is { } window)
+                    yield return (anchor, new(call.Digest, result.Digest, window));
+            }
         }
     }
 
-    private static Dictionary<string, ObservedToolPair> IndexPairs(IEnumerable<(string Session, ObservedToolPair Pair, bool Uncertain)> pairs)
-    {
-        var indexed = new Dictionary<string, ObservedToolPair>(StringComparer.Ordinal);
-        foreach (var (_, pair, _) in pairs)
-        {
-            indexed.Add(pair.CallDigest, pair);
-            indexed.Add(pair.ResultDigest, pair);
-        }
-        return indexed;
-    }
+    private static Dictionary<string, ObservedToolPair> IndexPairs(IEnumerable<(RawToolEndpoint Anchor, ObservedToolPair Pair)> pairs) =>
+        pairs.ToDictionary(x => x.Anchor.Digest, x => x.Pair, StringComparer.Ordinal);
 
     private IEnumerable<ExclusionGuard> CaptureGuards(Source source, HashSet<StatsEvent> exclusions,
         ISet<(string Session, string Request)> conflicts)
@@ -1012,9 +1028,9 @@ public sealed class SessionLogMonitor : IDisposable
                     yield return item;
                 }
                 if (hasScopedTool)
-                    foreach (var (session, pair, uncertain) in SourceWaitPairs(Evidence, now))
-                        if (uncertain)
-                            yield return new DailyTimingUnavailableEvent(session, null, pair.Window.Start) { ObservedToolWait = pair.Window };
+                    foreach (var (session, window) in SourceWaitPairs(Evidence, now).Where(x => x.Anchor.Uncertain)
+                                 .Select(x => (x.Anchor.Session, x.Pair.Window)).Distinct())
+                        yield return new DailyTimingUnavailableEvent(session, null, window.Start) { ObservedToolWait = window };
             }
             // This evidence is transient for a half-line/backlog, and persistent for damaged or
             // capped input. Token totals keep their existing partial semantics.

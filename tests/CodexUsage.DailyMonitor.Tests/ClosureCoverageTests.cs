@@ -772,6 +772,68 @@ internal static class ClosureCoverageTests
             });
         }
 
+        foreach (bool equivalent in new[] { true, false })
+        {
+            await Case($"CON-29 extra {(equivalent ? "equivalent" : "conflicting")} return preserves the unresolved range", async () =>
+            {
+                var sample = midnight.AddMinutes(20);
+                using var fixture = new Fixture(equivalent ? "equivalent-return" : "conflicting-return", sample);
+                string call = Tool("function_call", "many-returns", midnight.AddSeconds(1));
+                string result = Tool("function_call_output", "many-returns", midnight.AddSeconds(20));
+                string completed = Modern("midnight", "many-returns", "inferred-C", midnight.AddSeconds(14))
+                    + Complete("inferred-C", midnight.AddSeconds(15));
+                string live = fixture.WriteSession("live", midnightMeta + firstStart + competingStart + call + result + completed);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample), timed: false, lost: false, "the first observed pair encloses C");
+
+                fixture.AppendSession(live, equivalent ? " " + result : Tool("function_call_output", "many-returns", midnight.AddSeconds(21)));
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(1)), timed: false, lost: false,
+                    "an extra result does not remove the observed interval");
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(2)), timed: false, lost: false, "idle preserves the exclusion");
+                using var cold = new SessionLogMonitor(fixture.Home, Zone);
+                ExpectMidnightTiming(await cold.RefreshAsync(sample.AddSeconds(2)), timed: false, lost: false, "the same bytes also exclude C on cold read");
+            });
+        }
+
+        foreach (string scenario in new[] { "two-readers", "short-first", "long-first", "disjoint" })
+        {
+            await Case($"CON-30 source-proven alternative waits ({scenario})", async () =>
+            {
+                var sample = midnight.AddMinutes(20);
+                using var fixture = new Fixture("alternative-wait-" + scenario, sample);
+                string call = Tool("function_call", "alternative-wait", midnight.AddSeconds(1));
+                string Result(int second) => Tool("function_call_output", "alternative-wait", midnight.AddSeconds(second));
+                int end = scenario == "disjoint" ? 40 : 15;
+                string completed = Modern("midnight", "alternative-wait", "inferred-C", midnight.AddSeconds(end - 1))
+                    + Complete("inferred-C", midnight.AddSeconds(end));
+                string live = fixture.WriteSession("live", midnightMeta + firstStart + competingStart + call + completed);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample), timed: true, lost: false, "one point alone is outside C");
+
+                string replacement = midnightMeta + Start("older", priorDay.AddSeconds(-1)) + call;
+                ReplaceSession(fixture, live, replacement + completed);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(1)), timed: true, lost: false, "the pending old anchor is still a point");
+                if (scenario is "two-readers" or "disjoint")
+                {
+                    fixture.WriteSession("one-pair", replacement + Result(20), archived: true);
+                    fixture.WriteSession("other-pair", replacement + Result(25), archived: true);
+                }
+                else
+                {
+                    bool shortFirst = scenario == "short-first";
+                    fixture.AppendSession(live, Result(shortFirst ? 4 : 20));
+                    ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(2)), timed: shortFirst, lost: !shortFirst,
+                        "the first witnessed pair has its own scope");
+                    ReplaceSession(fixture, live, replacement + completed + Result(shortFirst ? 20 : 4));
+                }
+                bool disjoint = scenario == "disjoint";
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(3)), timed: disjoint, lost: !disjoint,
+                    "each interval has both source-local endpoints and either overlaps or is independent");
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(4)), timed: disjoint, lost: !disjoint,
+                    "observation order cannot hide an overlapping wait on idle");
+            });
+        }
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));
