@@ -141,11 +141,13 @@ public static class DailyAggregator
         // An invalid row must make its scope unavailable, never masquerade as no wait.
         var toolRows = usable.OfType<DailyToolEvent>().Distinct().ToArray();
         var timingUnavailable = usable.OfType<DailyTimingUnavailableEvent>().Distinct().ToArray();
-        var untimedSessions = timingUnavailable.Where(x => string.IsNullOrWhiteSpace(x.TurnKey)).Select(x => x.SessionKey)
+        var untimedSessions = timingUnavailable.Where(x => x.StartTimestamp is null && string.IsNullOrWhiteSpace(x.TurnKey)).Select(x => x.SessionKey)
             .Concat(toolRows.Where(x => string.IsNullOrWhiteSpace(x.TurnKey)).Select(x => x.SessionKey))
             .ToHashSet(StringComparer.Ordinal);
         var untimedTurns = timingUnavailable.Where(x => !string.IsNullOrWhiteSpace(x.TurnKey))
             .Select(x => (Session: x.SessionKey, Turn: x.TurnKey!)).ToHashSet();
+        var untimedStarts = timingUnavailable.Where(x => x.StartTimestamp.HasValue)
+            .Select(x => (x.SessionKey, x.StartTimestamp!.Value)).ToHashSet();
         // A call identity crossing turn boundaries is ambiguous even when both
         // sides carry turn keys. Do not independently pair a replay under a new turn.
         foreach (var group in toolRows.Where(x => !string.IsNullOrWhiteSpace(x.CallKey))
@@ -306,6 +308,7 @@ public static class DailyAggregator
                 continue;
             }
             if (untimedSessions.Contains(turn.Session) || untimedTurns.Contains((turn.Session, turn.Key))
+                || startEvidence.Length == 1 && untimedStarts.Contains((turn.Session, startEvidence[0]))
                 || !TryExcludedWait(durationStart!.Value, explicitStart, completed.Timestamp,
                     completed.TimeToFirstTokenMs.Value,
                     toolsByTurn.GetValueOrDefault((turn.Session, turn.Key)) ?? [], now, out var waitMs)

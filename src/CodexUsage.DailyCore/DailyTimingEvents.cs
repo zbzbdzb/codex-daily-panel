@@ -8,4 +8,4 @@ public sealed record DailyToolEvent(string SessionKey, string? TurnKey, string? 
     DailyToolPhase Phase, DateTimeOffset Timestamp) : StatsEvent(SessionKey, Timestamp);
 
 public sealed record DailyTimingUnavailableEvent(string SessionKey, string? TurnKey,
-    DateTimeOffset Timestamp) : StatsEvent(SessionKey, Timestamp);
+    DateTimeOffset Timestamp, DateTimeOffset? StartTimestamp = null) : StatsEvent(SessionKey, Timestamp);

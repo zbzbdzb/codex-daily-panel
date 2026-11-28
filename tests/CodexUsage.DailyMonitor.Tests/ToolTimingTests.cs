@@ -186,6 +186,77 @@ internal static class ToolTimingTests
                 Check(successor.TurnCount == oldTurns + 1, $"{oldTurns} ended old identities remain observable");
             }
 
+            foreach (int count in new[] { 128, 129 })
+            {
+                var cohort = new StringBuilder(metadata + began);
+                for (int index = 1; index < count; index++)
+                {
+                    string identity = $"peer-{index}";
+                    cohort.Append(Row("event_msg", start, new { type = "task_started", turn_id = identity }));
+                    cohort.Append(Row("event_msg", start.AddSeconds(1), new { type = "task_aborted", turn_id = identity }));
+                }
+                string unknownTools = Tool("function_call", 2, turn: "never-started")
+                    + Tool("function_call_output", 5, turn: "never-started");
+                CheckLifecycleTiming(await ReadRows(cohort.ToString() + unknownTools + finish), null, false, 10,
+                    $"an unverified explicit tool owner cannot become zero wait in a {count}-turn cohort");
+                CheckLifecycleTiming(await ReadRows(cohort.ToString() + explicitTools + finish), 6, false, 10,
+                    $"a verified explicit tool owner retains timing in a {count}-turn cohort");
+            }
+
+            string successorRows = Row("event_msg", start.AddSeconds(20), new { type = "task_started", turn_id = "successor" })
+                + Tool("function_call", 22, "successor-call", "successor")
+                + Tool("function_call_output", 25, "successor-call", "successor")
+                + Row("token_usage_record", start.AddSeconds(29), new
+                {
+                    thread_id = "timing-session", session_id = "run", turn_id = "successor", root_turn_id = "successor",
+                    response_id = "successor-request", usage = tokens40, turn_token_usage = tokens40
+                })
+                + Row("event_msg", start.AddSeconds(30),
+                    new { type = "task_complete", turn_id = "successor", duration_ms = 10000, time_to_first_token_ms = 1000 });
+            string siblingAbort = Row("event_msg", start.AddSeconds(8),
+                new { type = "task_aborted", turn_id = "another-turn" });
+            foreach (bool siblingKnown in new[] { false, true })
+            {
+                string earlierRows = siblingKnown ? siblingStart + implicitTools + finish : implicitTools + finish + siblingStart;
+                var snapshot = await ReadRows(metadata + began + earlierRows + siblingAbort + successorRows);
+                Check(snapshot.InputTokens == 200 && snapshot.OutputTokens == 80 && snapshot.TimedTurnCount == 1
+                    && snapshot.ExcludedTimingTurnCount == 1 && snapshot.ProcessingSeconds == 6
+                    && snapshot.AverageTps is { } retainedTps && Math.Abs(retainedTps - 40d / 6) < 0.000001,
+                    $"ambiguity in an earlier ordinary cohort leaves a verified successor timed (sibling known: {siblingKnown})");
+            }
+            CheckLifecycleTiming(await ReadRows(metadata + successorRows), 6, false, 10,
+                "the successor times identically when it is the only cohort");
+
+            string unsignedStart = JsonSerializer.Serialize(new
+            {
+                type = "event_msg", timestamp = "2026-10-21T12:00:00",
+                payload = new { type = "task_started", turn_id = "turn" }
+            }) + "\n";
+            CheckLifecycleTiming(await ReadRows(metadata + unsignedStart + implicitTools + finish), 6, false, 10,
+                "an offsetless start uses the same assumed UTC instant for implicit ownership and statistics");
+            CheckLifecycleTiming(await ReadRows(metadata + unsignedStart + explicitTools + finish), 6, false, 10,
+                "the offsetless start with explicit ownership gives the same result");
+            CheckLifecycleTiming(await ReadRows(metadata + began + implicitTools + finish), 6, false, 10,
+                "an explicit UTC start gives the same result");
+
+            string earlySiblingAbort = Row("event_msg", start.AddSeconds(1),
+                new { type = "task_aborted", turn_id = "another-turn" });
+            string futureSiblingAbort = Row("event_msg", start.AddHours(1),
+                new { type = "task_aborted", turn_id = "another-turn" });
+            Write(tied + earlySiblingAbort + implicitTools + finish + futureSiblingAbort);
+            using (var futureMonitor = new SessionLogMonitor(home, TimeZoneInfo.Utc))
+            {
+                var before = await futureMonitor.RefreshAsync(start.AddMinutes(1));
+                CheckLifecycleTiming(before, 6, false, 10, "a future terminal cannot invalidate current tool timing yet");
+                Check(before.Issues.Any(issue => issue.Code == DailyIssueCodes.TimestampFuture),
+                    "a future terminal remains reported during the current snapshot");
+                var after = await futureMonitor.RefreshAsync(start.AddHours(1).AddSeconds(1));
+                CheckLifecycleTiming(after, null, true, 10,
+                    "the same Monitor reassesses timing once the terminal timestamp is reached", terminalConflict: true);
+                Check(!after.Issues.Any(issue => issue.Code == DailyIssueCodes.TimestampFuture),
+                    "a terminal that has reached its timestamp is no longer reported as future");
+            }
+
             var overflowRows = new StringBuilder(metadata);
             var oldBegan = start.AddSeconds(-20);
             for (int index = 0; index < 129; index++)

@@ -8,6 +8,8 @@ using CodexUsage.Daily;
 
 namespace CodexUsage.DailyPanel;
 
+internal readonly record struct DailySourceEvidence(StatsEvent Event, string? RawTimingDigest = null);
+
 /// <summary>Projects timing and abort facts with hashed identities. Active-turn tracking is
 /// independent of token parser context, which late usage corrections can move to an older turn.</summary>
 internal sealed class DailyToolTimingParser(string sourceKey)
@@ -23,7 +25,8 @@ internal sealed class DailyToolTimingParser(string sourceKey)
 
     // This source-local fact is normalized before aggregation and coverage hashing.
     internal sealed record InferredTool(string SessionKey, string? TurnKey, string CallKey, DailyToolPhase Phase,
-        DateTimeOffset Timestamp, DateTimeOffset Start, bool Overflow) : StatsEvent(SessionKey, Timestamp);
+        DateTimeOffset Timestamp, DateTimeOffset Start, bool Overflow, string? DeclaredTurn = null)
+        : StatsEvent(SessionKey, Timestamp);
 
     public IReadOnlyList<StatsEvent> Parse(string line, IReadOnlyList<StatsEvent> statistics,
         string abortSessionKey, out bool malformedAbort)
@@ -136,8 +139,9 @@ internal sealed class DailyToolTimingParser(string sourceKey)
             if (!knownTurn || callKey is null || time == DateTimeOffset.MinValue)
             {
                 // Only bad call/time data with otherwise proven ownership can be limited to one turn.
-                if (_cohortOverflow && !_lifecycleUncertain && !malformedTurn && explicitTurn is not null)
-                    return TurnUnavailable(time, explicitTurn);
+                if (_cohortOverflow && !_lifecycleUncertain && !malformedTurn && explicitTurn is not null
+                    && _latestStart is { } groupStart && callKey is not null && time != DateTimeOffset.MinValue)
+                    return [new InferredTool(_session, null, callKey, phase, time, groupStart, true, explicitTurn)];
                 return knownTurn ? TurnUnavailable(time, turnKey!) : SessionUnavailable(time);
             }
             return [new DailyToolEvent(_session, turnKey, callKey, phase, time)];
@@ -160,59 +164,68 @@ internal sealed class DailyToolTimingParser(string sourceKey)
         return owner;
     }
 
-    internal static IEnumerable<StatsEvent> ProjectOwnership(IReadOnlyList<StatsEvent> retained)
+    internal static IEnumerable<DailySourceEvidence> ProjectOwnership(IReadOnlyList<DailySourceEvidence> retained,
+        DateTimeOffset now, out DateTimeOffset? nextChange)
     {
-        if (!retained.Any(row => row is InferredTool)) return retained;
+        nextChange = null;
+        if (!retained.Any(row => row.Event is InferredTool)) return retained;
 
         // The input is one physical source's retained events. Never join
         // ambiguous tool ownership across files or resurrect discarded history.
-        var starts = retained.OfType<StartEvent>().GroupBy(row => (row.SessionKey, row.Timestamp))
+        var lifecycle = retained.Select(row => row.Event)
+            .Where(row => row is StartEvent or CompletionEvent or DailyTurnAbortedEvent);
+        nextChange = lifecycle.Where(row => row.Timestamp > now).Select(row => (DateTimeOffset?)row.Timestamp).Min();
+        var observed = lifecycle.Where(row => row.Timestamp <= now).ToArray();
+        var starts = observed.OfType<StartEvent>().GroupBy(row => (row.SessionKey, row.Timestamp))
             .ToDictionary(group => group.Key, group => group.Select(row => row.TurnKey).Distinct().ToArray());
         var startTimes = starts.Keys.GroupBy(key => key.SessionKey, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.Select(key => key.Timestamp).Order().ToArray(), StringComparer.Ordinal);
-        var ends = retained.OfType<CompletionEvent>().Select(row => (row.SessionKey, row.TurnKey, row.Timestamp))
-            .Concat(retained.OfType<DailyTurnAbortedEvent>().Select(row => (row.SessionKey, row.TurnKey, row.Timestamp)))
+        var ends = observed.OfType<CompletionEvent>().Select(row => (row.SessionKey, row.TurnKey, row.Timestamp))
+            .Concat(observed.OfType<DailyTurnAbortedEvent>().Select(row => (row.SessionKey, row.TurnKey, row.Timestamp)))
             .GroupBy(row => (row.SessionKey, row.TurnKey)).ToDictionary(group => group.Key, group => group.Max(row => row.Timestamp));
-        var confirmed = new HashSet<InferredTool>();
-        var overflow = new HashSet<(string SessionKey, DateTimeOffset Start)>();
-        foreach (var tool in retained.OfType<InferredTool>())
+        var confirmed = new Dictionary<InferredTool, string>();
+        var eventGroups = new Dictionary<InferredTool, DateTimeOffset>();
+        foreach (var tool in retained.Select(row => row.Event).OfType<InferredTool>())
         {
             var key = (tool.SessionKey, tool.Start);
-            if (!starts.TryGetValue(key, out var turns)) continue;
-            if (tool.Overflow || turns.Length > MaximumTrackedTurns)
-            {
-                overflow.Add(key);
-                continue;
-            }
-            var times = startTimes[tool.SessionKey];
+            if (!startTimes.TryGetValue(tool.SessionKey, out var times)) continue;
             var index = Array.BinarySearch(times, tool.Timestamp);
             if (index < 0) index = ~index - 1;
-            if (index >= 0 && times[index] == tool.Start && tool.TurnKey is { } owner)
+            if (index < 0) continue;
+            eventGroups[tool] = times[index];
+            if (times[index] != tool.Start || !starts.TryGetValue(key, out var turns)) continue;
+            bool CanOwn(string turn) => !ends.TryGetValue((tool.SessionKey, turn), out var end)
+                || end < tool.Start || end >= tool.Timestamp;
+            if (tool.DeclaredTurn is { } declared)
             {
-                var possible = turns.Where(turn => !ends.TryGetValue((tool.SessionKey, turn), out var end)
-                    || end < tool.Start || end >= tool.Timestamp);
-                if (possible.Take(2).SequenceEqual([owner])) confirmed.Add(tool);
+                if (turns.Contains(declared) && CanOwn(declared)) confirmed[tool] = declared;
+            }
+            else if (!tool.Overflow && turns.Length <= MaximumTrackedTurns)
+            {
+                var possible = turns.Where(CanOwn).Take(2).ToArray();
+                if (possible is [var owner] && (tool.TurnKey is null || tool.TurnKey == owner))
+                    confirmed[tool] = owner;
             }
         }
         // Cache decisions, not another set of retained events. Coverage and
         // the final subtotal both enumerate the same normalized facts.
         return ProjectedRows();
 
-        IEnumerable<StatsEvent> ProjectedRows()
+        IEnumerable<DailySourceEvidence> ProjectedRows()
         {
             foreach (var row in retained)
             {
-                if (row is not InferredTool tool) yield return row;
-                else if (confirmed.Contains(tool))
-                    yield return new DailyToolEvent(tool.SessionKey, tool.TurnKey, tool.CallKey, tool.Phase, tool.Timestamp);
-                else if (!overflow.Contains((tool.SessionKey, tool.Start)))
-                    yield return new DailyTimingUnavailableEvent(tool.SessionKey, null, tool.Timestamp);
+                if (row.Event is not InferredTool tool) yield return row;
+                else if (confirmed.TryGetValue(tool, out var owner))
+                    yield return row with { Event = new DailyToolEvent(tool.SessionKey, owner, tool.CallKey, tool.Phase, tool.Timestamp) };
+                else
+                {
+                    var start = starts.ContainsKey((tool.SessionKey, tool.Start)) ? tool.Start : (DateTimeOffset?)null;
+                    yield return row with { Event = new DailyTimingUnavailableEvent(tool.SessionKey, null, tool.Timestamp, start) };
+                    if (start is not null && eventGroups.TryGetValue(tool, out var actualStart) && actualStart != start)
+                        yield return row with { Event = new DailyTimingUnavailableEvent(tool.SessionKey, null, tool.Timestamp, actualStart) };
+                }
             }
-            // An overflowing group cannot prove implicit ownership. Emit at
-            // most one exclusion per retained start identity in that group.
-            foreach (var key in overflow)
-                foreach (var turn in starts[key])
-                    yield return new DailyTimingUnavailableEvent(key.SessionKey, turn, key.Start);
         }
     }
 
@@ -224,9 +237,9 @@ internal sealed class DailyToolTimingParser(string sourceKey)
     private static string? Text(JsonElement node, string name) => Field(node, name) is var field && field.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(field.GetString()) ? field.GetString() : null;
     private static string? Hash(JsonElement node, string name, string category) => Text(node, name) is { } value ? EventParser.Key(category, value) : null;
     private static DateTimeOffset Time(JsonElement root) => Text(root, "timestamp") is { } text
-        && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var time) ? time : DateTimeOffset.MinValue;
+        && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var time) ? time : DateTimeOffset.MinValue;
     private static DateTimeOffset AbortTime(JsonElement root) => Field(root, "timestamp") is { ValueKind: JsonValueKind.String } timestamp
-        && timestamp.TryGetDateTimeOffset(out var time) ? time : DateTimeOffset.MinValue;
+        && timestamp.TryGetDateTimeOffset(out _) ? Time(root) : DateTimeOffset.MinValue;
     private static bool Unique(JsonElement node) => node.ValueKind == JsonValueKind.Object
         && node.EnumerateObject().Select(p => p.Name).Distinct(StringComparer.Ordinal).Count() == node.EnumerateObject().Count();
     private static bool HasSupportedVersion(JsonElement node) => Field(node, "schema_version") is var value

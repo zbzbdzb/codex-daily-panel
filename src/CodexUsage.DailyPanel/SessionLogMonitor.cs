@@ -60,6 +60,7 @@ public sealed class SessionLogMonitor : IDisposable
             cancellationToken.ThrowIfCancellationRequested();
             var day = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(now, _zone).DateTime);
             _refreshAt = now;
+            foreach (var source in _sources.Values) source.SampleAt(now);
             if (_day != day)
             {
                 // Daily numeric gaps expire. Missing classification facts remain
@@ -74,7 +75,8 @@ public sealed class SessionLogMonitor : IDisposable
                     exclusionProof: exclusions, requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory(), closureFacts: ClosureFacts(),
                     requestConflicts: RequestConflicts(), requestConflictProof: conflicts);
                 var guardCapacity = MaximumRetainedEvents - _observedMetadataConflicts.Count;
-                var guards = Guards().Concat(exclusions.Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>())
+                var guards = Guards().Concat(_sources.Values.SelectMany(x => x.Evidence)
+                    .Where(x => exclusions.Contains(x.Event)).Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>())
                     .Distinct().Take(guardCapacity + 1).ToList();
                 var overflow = guards.Count > guardCapacity;
                 if (overflow) guards.RemoveAt(guardCapacity);
@@ -113,7 +115,7 @@ public sealed class SessionLogMonitor : IDisposable
                     if (existing.Reader.IsStopped) existing.Reader.RetryAccessDenied();
                     continue;
                 }
-                try { _sources.Add(path, new Source(path, day, _zone, () => _retainedEvents < MaximumRetainedEvents,
+                try { _sources.Add(path, new Source(path, day, _zone, now, () => _retainedEvents < MaximumRetainedEvents,
                     delta => _retainedEvents += delta, RecordLoss, CoverageTargets)); }
                 catch (ArgumentException) { discoveryPartial = true; }
             }
@@ -275,8 +277,8 @@ public sealed class SessionLogMonitor : IDisposable
         DailyAggregator.Summarize(_sources.Values.SelectMany(x => x.Events).Concat(ChildEvidence()), _day!.Value, _zone, _refreshAt,
             exclusionProof: exclusions, requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory(), closureFacts: ClosureFacts(),
             requestConflicts: RequestConflicts(), requestConflictProof: conflicts);
-        _unreadableGuards.AddRange(_sources.Values.Where(x => x.ReadFailed).SelectMany(x => x.Events)
-            .Where(exclusions.Contains).Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>().Distinct());
+        _unreadableGuards.AddRange(_sources.Values.Where(x => x.ReadFailed).SelectMany(x => x.Evidence)
+            .Where(x => exclusions.Contains(x.Event)).Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>().Distinct());
     }
 
     private void RecordLoss(Source source, DailyCoverageState coverage)
@@ -293,11 +295,11 @@ public sealed class SessionLogMonitor : IDisposable
             requestConflicts: RequestConflicts(), requestConflictProof: conflicts);
         // Child metadata is a conditional decision fact, rather than a daily
         // contribution. It is needed only while its session still has candidates.
-        var events = new Dictionary<string, (string Session, string? Turn)?>(StringComparer.Ordinal);
-        foreach (var row in source.Events.Where(x => required.Contains(x) && x is not MetadataEvent { IsChild: true }))
-            events.TryAdd(EventDigest(row), TimingScope(row));
+        var events = new HashSet<(string Digest, TimingScopeKey? Scope)>();
+        foreach (var row in source.Evidence.Where(x => required.Contains(x.Event) && x.Event is not MetadataEvent { IsChild: true }))
+            events.Add((CoverageDigest(row), TimingScope(row.Event)));
 
-        var guards = source.Events.Where(exclusions.Contains).Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>()
+        var guards = source.Evidence.Where(x => exclusions.Contains(x.Event)).Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>()
             .Distinct().ToList();
         if (events.Count == 0 && guards.Count == 0 && !source.BadStatistics && !source.PendingLine && !source.HasMore
             && !source.ReadFailed && !source.UncertainTail && !coverage.Incomplete) return;
@@ -310,11 +312,10 @@ public sealed class SessionLogMonitor : IDisposable
                 || coverage.Stamp.Bytes == 0 && (source.ReadFailed || source.HasMore),
             source.BadStatistics, source.OversizedLine, source.ReadFailed || source.UncertainTail,
             guards, source.Events.Select(x => x.SessionKey).Distinct(StringComparer.Ordinal).ToArray(),
-            events.Values.Where(x => x?.Turn is not null).Distinct().Count());
+            events.Select(x => x.Scope).Where(x => x is { } scope && (scope.Turn is not null || scope.Start is not null)).Distinct().Count());
         if (_coverageLosses.Any(x => !x.PositiveResolved && x.RawPrefix == loss.RawPrefix && x.Unprovable == loss.Unprovable
             && x.BadStatistics == loss.BadStatistics && x.OversizedLine == loss.OversizedLine
-            && x.ReadFailed == loss.ReadFailed && x.Events.Count == events.Count
-            && events.Keys.All(x.Events.ContainsKey) && x.Guards.ToHashSet().SetEquals(guards))) return;
+            && x.ReadFailed == loss.ReadFailed && x.Events.SetEquals(events) && x.Guards.ToHashSet().SetEquals(guards))) return;
         // Repeated generations must not circumvent the existing bounded retention.
         if (_coverageLosses.Count >= MaximumRetainedEvents || _coverageEvidenceCount + loss.EvidenceCount > MaximumRetainedEvents)
         {
@@ -328,7 +329,8 @@ public sealed class SessionLogMonitor : IDisposable
         _coverageEvidenceCount += loss.EvidenceCount;
     }
 
-    private sealed record VerifiedTimingEvidence(HashSet<string> Digests, Dictionary<string, DateTimeOffset> RootTimes);
+    private sealed record VerifiedTimingEvidence(HashSet<string> CoverageDigests,
+        HashSet<(string Coverage, string Projection)> Projections, Dictionary<string, DateTimeOffset> RootTimes);
 
     private IEnumerable<Source> DrainedSources() => _sources.Values.Where(x => x.VerifiedThisRefresh && !x.HasMore
         && !x.PendingLine && !x.ReadFailed && !x.UncertainTail && x.Reader.Coverage.Stable);
@@ -336,25 +338,51 @@ public sealed class SessionLogMonitor : IDisposable
     private VerifiedTimingEvidence ReconcileCoverage()
     {
         var drained = DrainedSources().ToArray();
-        var verifiedRows = drained.Where(x => !x.BadStatistics).SelectMany(x => x.Events);
-        var hashes = verifiedRows.Where(e => e is not QuotaEvent).Select(EventDigest).ToHashSet(StringComparer.Ordinal);
+        var verified = drained.Where(x => !x.BadStatistics).SelectMany(x => x.Evidence)
+            .Where(x => x.Event is not QuotaEvent).ToArray();
+        var current = verified.Select(x => x.Event).ToArray();
+        var hashes = verified.Select(CoverageDigest).ToHashSet(StringComparer.Ordinal);
+        var projections = verified.Select(ProjectionIdentity).ToHashSet();
+        var timing = verified.Where(x => x.RawTimingDigest is not null)
+            .ToLookup(x => x.RawTimingDigest!, x => x.Event, StringComparer.Ordinal);
+        var starts = current.OfType<StartEvent>().Concat(StartHistory())
+            .ToLookup(x => (x.SessionKey, x.TurnKey), x => x.Timestamp);
+        bool ProvesGuard(ExclusionGuard guard) => hashes.Contains(guard.Digest)
+            && (guard is not TimingGuard old || !timing.Contains(guard.Digest)
+                || projections.Contains((guard.Digest, EventDigest(old.Evidence)))
+                || timing[guard.Digest].OfType<DailyTimingUnavailableEvent>().Any(row => CoversTiming(row, old.Evidence, starts)));
         foreach (var loss in _coverageLosses.ToArray())
         {
-            var proven = loss.Guards.RemoveAll(x => hashes.Contains(x.Digest));
+            var proven = loss.Guards.RemoveAll(ProvesGuard);
             _coverageEvidenceCount -= proven;
-            if (!loss.Unprovable && loss.Events.Keys.All(hashes.Contains)
+            if (!loss.Unprovable && loss.Events.All(x => hashes.Contains(x.Digest))
                 && (loss.RawPrefix is not { } prefix || drained.Any(x => x.Reader.Proves(prefix)))) loss.PositiveResolved = true;
             if (!loss.PositiveResolved || loss.Guards.Count > 0) continue;
             _coverageLosses.Remove(loss);
             _coverageEvidenceCount -= loss.EvidenceCount;
         }
-        return new(hashes, RootTimes(verifiedRows.OfType<MetadataEvent>().Concat(ChildEvidence())));
+        return new(hashes, projections, RootTimes(current.OfType<MetadataEvent>().Concat(ChildEvidence())));
+    }
+
+    private static bool CoversTiming(DailyTimingUnavailableEvent current, StatsEvent previous,
+        ILookup<(string Session, string Turn), DateTimeOffset> starts)
+    {
+        if (current.SessionKey != previous.SessionKey || TimingScope(previous) is not { } prior) return false;
+        if (current.StartTimestamp is { } start)
+            return prior.Start == start || prior.Turn is { } turn && starts[(prior.Session, turn)].Contains(start);
+        return current.TurnKey is null || current.TurnKey == prior.Turn;
     }
 
     private static string EventDigest(StatsEvent item) => item.GetType().FullName + ":"
         + Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(item, item.GetType())));
+    private static string CoverageDigest(DailySourceEvidence fact) => fact.RawTimingDigest ?? EventDigest(fact.Event);
+    private static (string Coverage, string Projection) ProjectionIdentity(DailySourceEvidence fact)
+    {
+        var projection = EventDigest(fact.Event);
+        return (fact.RawTimingDigest ?? projection, projection);
+    }
 
-    private sealed record CoverageLoss(Dictionary<string, (string Session, string? Turn)?> Events, DailyCoverageStamp? RawPrefix, bool Unprovable,
+    private sealed record CoverageLoss(HashSet<(string Digest, TimingScopeKey? Scope)> Events, DailyCoverageStamp? RawPrefix, bool Unprovable,
         bool BadStatistics, bool OversizedLine, bool ReadFailed, List<ExclusionGuard> Guards, string[] Sessions,
         int TimedScopeCount)
     {
@@ -371,16 +399,16 @@ public sealed class SessionLogMonitor : IDisposable
     private sealed record StartOrderGuard(string Hash, StartEvent Evidence) : ExclusionGuard(Hash, Evidence.SessionKey);
     private sealed record ClosureGuard(string Hash, DailyClosureFact Fact) : ExclusionGuard(Hash, Fact.Session);
 
-    private static ExclusionGuard? CreateGuard(StatsEvent row, ISet<(string Session, string Request)> conflicts) => row switch
+    private static ExclusionGuard? CreateGuard(DailySourceEvidence fact, ISet<(string Session, string Request)> conflicts) => fact.Event switch
     {
         UsageEvent { RequestKey: { } request } usage when conflicts.Contains((usage.SessionKey, request)) =>
-            new RequestConflictGuard(EventDigest(row), usage.SessionKey, request),
-        UsageEvent { RequestKey: { } request } usage => new OriginGuard(EventDigest(row), usage.SessionKey, request, usage.Timestamp),
-        MetadataEvent { IsChild: true } metadata => new ChildGuard(EventDigest(row), metadata),
-        DailyToolEvent or DailyTimingUnavailableEvent => new TimingGuard(EventDigest(row), row),
-        StartEvent start => new StartOrderGuard(EventDigest(row), start),
-        CompletionEvent end => new ClosureGuard(EventDigest(row), DailyClosureFact.From(end)),
-        DailyTurnAbortedEvent abort => new ClosureGuard(EventDigest(row), DailyClosureFact.From(abort)),
+            new RequestConflictGuard(EventDigest(usage), usage.SessionKey, request),
+        UsageEvent { RequestKey: { } request } usage => new OriginGuard(EventDigest(usage), usage.SessionKey, request, usage.Timestamp),
+        MetadataEvent { IsChild: true } metadata => new ChildGuard(EventDigest(metadata), metadata),
+        DailyToolEvent or DailyTimingUnavailableEvent => new TimingGuard(CoverageDigest(fact), fact.Event),
+        StartEvent start => new StartOrderGuard(EventDigest(start), start),
+        CompletionEvent end => new ClosureGuard(EventDigest(end), DailyClosureFact.From(end)),
+        DailyTurnAbortedEvent abort => new ClosureGuard(EventDigest(abort), DailyClosureFact.From(abort)),
         _ => null
     };
 
@@ -410,27 +438,33 @@ public sealed class SessionLogMonitor : IDisposable
 
     // Metadata and unscoped legacy rows participate in coverage without supplying
     // a turn's timing. A timing row with no turn still constrains the session.
-    private static (string Session, string? Turn)? TimingScope(StatsEvent row) =>
+    private readonly record struct TimingScopeKey(string Session, string? Turn, DateTimeOffset? Start = null)
+    {
+        public DailyTimingUnavailableEvent UnavailableAt(DateTimeOffset now) => new(Session, Turn, now, Start);
+    }
+
+    private static TimingScopeKey? TimingScope(StatsEvent row) =>
         row is MetadataEvent or QuotaEvent or UsageEvent { Legacy: true, TurnKey: null }
-            ? null : (row.SessionKey, TimingTurn(row)?.Turn);
+            ? null : new(row.SessionKey, TimingTurn(row)?.Turn, (row as DailyTimingUnavailableEvent)?.StartTimestamp);
 
     private static IEnumerable<DailyTimingUnavailableEvent> UnverifiedTiming(Source[] sources,
         VerifiedTimingEvidence verified, DateTimeOffset now)
     {
         // Keep cached rows for the existing partial subtotal, but don't time them
         // from this cache alone. A checked source can independently prove a row.
-        var scopes = new HashSet<(string Session, string? Turn)>();
-        foreach (var row in sources.SelectMany(source => source.Events))
+        var scopes = new HashSet<TimingScopeKey>();
+        foreach (var fact in sources.SelectMany(source => source.Evidence))
         {
+            var row = fact.Event;
             if (row is MetadataEvent metadata)
             {
                 if (!verified.RootTimes.ContainsKey(metadata.SessionKey))
-                    scopes.Add((metadata.SessionKey, null));
+                    scopes.Add(new(metadata.SessionKey, null));
             }
-            else if (TimingScope(row) is { } scope && !verified.Digests.Contains(EventDigest(row)))
+            else if (TimingScope(row) is { } scope && !verified.Projections.Contains(ProjectionIdentity(fact)))
                 scopes.Add(scope);
         }
-        return scopes.Select(x => new DailyTimingUnavailableEvent(x.Session, x.Turn, now));
+        return scopes.Select(x => x.UnavailableAt(now));
     }
 
     private HashSet<(string Session, string Turn)> CandidateTurns(StatsEvent[] rows)
@@ -454,7 +488,8 @@ public sealed class SessionLogMonitor : IDisposable
     private sealed record CoverageView(StatsEvent[] Rows, HashSet<(string Session, string Turn)> Turns,
         HashSet<string> Roots, HashSet<(string Session, string Request)> TodayRequests, HashSet<string> CandidateSessions,
         Dictionary<string, DateTimeOffset> MetadataTimes,
-        Dictionary<(string Session, string Call), (string Session, string Turn)[]> Calls);
+        Dictionary<(string Session, string Call), (string Session, string Turn)[]> Calls,
+        HashSet<(string Session, DateTimeOffset Start)> Starts);
 
     private static IEnumerable<(string Session, DateTimeOffset At, MetadataEvent[] Rows)> LatestMetadata(IEnumerable<MetadataEvent> metadata) =>
         metadata.GroupBy(x => x.SessionKey).Select(group =>
@@ -483,8 +518,14 @@ public sealed class SessionLogMonitor : IDisposable
         var calls = rows.OfType<DailyToolEvent>().Where(x => x.CallKey is not null && TimingTurn(x) is { } turn && turns.Contains(turn))
             .GroupBy(x => (Session: x.SessionKey, Call: x.CallKey!))
             .ToDictionary(x => x.Key, x => x.Select(TimingTurn).Select(t => t!.Value).Distinct().ToArray());
-        return new(rows, turns, roots, todayRequests, sessions, times, calls);
+        var starts = rows.OfType<StartEvent>().Concat(StartHistory())
+            .Where(x => turns.Contains((x.SessionKey, x.TurnKey))).Select(x => (x.SessionKey, x.Timestamp)).ToHashSet();
+        return new(rows, turns, roots, todayRequests, sessions, times, calls, starts);
     }
+
+    private static bool ScopeRelevant(TimingScopeKey scope, CoverageView view) => scope.Start is { } start
+        ? view.Starts.Contains((scope.Session, start))
+        : scope.Turn is { } turn ? view.Turns.Contains((scope.Session, turn)) : view.CandidateSessions.Contains(scope.Session);
 
     private static bool GuardActive(ExclusionGuard guard, CoverageView view) => guard switch
     {
@@ -492,9 +533,9 @@ public sealed class SessionLogMonitor : IDisposable
         RequestConflictGuard conflict => view.Roots.Contains(conflict.Session) && view.TodayRequests.Contains((conflict.Session, conflict.Request)),
         ChildGuard child => view.CandidateSessions.Contains(child.Session)
             && (!view.MetadataTimes.TryGetValue(child.Session, out var latest) || latest <= child.Relation.Timestamp),
-        TimingGuard timing => view.Roots.Contains(timing.Session) && (TimingTurn(timing.Evidence) is { } own && view.Turns.Contains(own)
-            || timing.Evidence is DailyToolEvent { CallKey: { } call } && view.Calls.ContainsKey((timing.Session, call))
-            || TimingTurn(timing.Evidence) is null && view.CandidateSessions.Contains(timing.Session)),
+        TimingGuard timing => view.Roots.Contains(timing.Session)
+            && (TimingScope(timing.Evidence) is { } scope && ScopeRelevant(scope, view)
+                || timing.Evidence is DailyToolEvent { CallKey: { } call } && view.Calls.ContainsKey((timing.Session, call))),
         // Activity qualification is compared in Summarize itself, using the same
         // closure/latest/recent rules that decide ActiveTurns and ActiveSeconds.
         StartOrderGuard or ClosureGuard => false,
@@ -519,36 +560,35 @@ public sealed class SessionLogMonitor : IDisposable
     private IEnumerable<StatsEvent> MissingTiming(CoverageView view, CoverageLoss[] losses,
         VerifiedTimingEvidence? verified, string[] metadataTimingGaps, DateTimeOffset now)
     {
-        var scopes = new HashSet<(string Session, string? Turn)>();
-        foreach (var session in metadataTimingGaps) scopes.Add((session, null));
+        var scopes = new HashSet<TimingScopeKey>();
+        foreach (var session in metadataTimingGaps) scopes.Add(new(session, null));
         var calls = new HashSet<(string Session, string Call)>();
         if (_unprovableCoverage || _metadataConflictHistoryOverflow)
             foreach (var session in view.Rows.Select(x => x.SessionKey).Distinct(StringComparer.Ordinal))
-                scopes.Add((session, null));
+                scopes.Add(new(session, null));
         foreach (var loss in losses)
         {
             if (!loss.PositiveResolved)
             {
                 if (loss.RawPrefix.HasValue || loss.Unprovable)
                     foreach (var session in loss.Sessions.Length > 0 ? loss.Sessions : view.Rows.Select(x => x.SessionKey).Distinct(StringComparer.Ordinal))
-                        scopes.Add((session, null));
+                        scopes.Add(new(session, null));
                 else
                     // A known lost row only disqualifies its own turn (or session if unassociated).
                     // Use current verified digests; cached rows from a blocked source prove nothing.
                     foreach (var (digest, scope) in loss.Events)
-                        if (scope is { } timingScope && verified?.Digests.Contains(digest) != true) scopes.Add(timingScope);
+                        if (scope is { } timingScope && verified?.CoverageDigests.Contains(digest) != true) scopes.Add(timingScope);
             }
             foreach (var guard in loss.Guards.OfType<TimingGuard>())
             {
                 if (!view.Roots.Contains(guard.Session)) continue;
-                if (TimingTurn(guard.Evidence) is { } turn && view.Turns.Contains(turn)) scopes.Add((turn.Session, turn.Turn));
+                if (TimingScope(guard.Evidence) is { } timingScope && ScopeRelevant(timingScope, view)) scopes.Add(timingScope);
                 if (guard.Evidence is DailyToolEvent { CallKey: { } call }) calls.Add((guard.Session, call));
-                if (TimingTurn(guard.Evidence) is null && view.CandidateSessions.Contains(guard.Session)) scopes.Add((guard.Session, null));
             }
         }
         foreach (var call in calls)
-            foreach (var turn in view.Calls.GetValueOrDefault(call) ?? []) scopes.Add((turn.Session, turn.Turn));
-        return scopes.Select(x => new DailyTimingUnavailableEvent(x.Session, x.Turn, now));
+            foreach (var turn in view.Calls.GetValueOrDefault(call) ?? []) scopes.Add(new(turn.Session, turn.Turn));
+        return scopes.Select(x => x.UnavailableAt(now));
     }
 
     private List<string> Discover(DateTime midnightUtc, CancellationToken cancellationToken,
@@ -674,11 +714,15 @@ public sealed class SessionLogMonitor : IDisposable
         private readonly Action<int> _changeCount;
         private SourceContext _context;
         private DailyToolTimingParser _timing;
-        private readonly List<StatsEvent> _events = [];
-        private IEnumerable<StatsEvent>? _projectedEvents;
+        private readonly List<DailySourceEvidence> _events = [];
+        private IEnumerable<DailySourceEvidence>? _projectedEvents;
+        private DateTimeOffset _sampleAt;
+        private DateTimeOffset? _nextTimingChange;
         private bool _unassociatedTiming;
         public DailyLogReader Reader { get; }
-        public IEnumerable<StatsEvent> Events => _projectedEvents ??= DailyToolTimingParser.ProjectOwnership(_events);
+        public IEnumerable<DailySourceEvidence> Evidence => _projectedEvents ??=
+            DailyToolTimingParser.ProjectOwnership(_events, _sampleAt, out _nextTimingChange);
+        public IEnumerable<StatsEvent> Events => Evidence.Select(x => x.Event);
         public bool HasMore { get; set; } = true;
         public bool VerifiedThisRefresh { get; set; }
         public bool MetadataNeedsObservation { get; set; }
@@ -691,12 +735,13 @@ public sealed class SessionLogMonitor : IDisposable
         public bool TimingUnavailable { get; set; }
         public bool UnassociatedTiming => _unassociatedTiming;
 
-        public Source(string path, DateOnly day, TimeZoneInfo zone, Func<bool> canRetain, Action<int> changeCount,
+        public Source(string path, DateOnly day, TimeZoneInfo zone, DateTimeOffset now, Func<bool> canRetain, Action<int> changeCount,
             Action<Source, DailyCoverageState> recordLoss, Func<DailyCoverageStamp[]> coverageTargets)
         {
             _key = EventParser.Key("daily-source", path);
             _day = day;
             _zone = zone;
+            _sampleAt = now;
             _canRetain = canRetain;
             _changeCount = changeCount;
             _context = new SourceContext(_key);
@@ -715,6 +760,12 @@ public sealed class SessionLogMonitor : IDisposable
                 ReadFailed = false;
                 UncertainTail = false;
             };
+        }
+
+        public void SampleAt(DateTimeOffset now)
+        {
+            if (now < _sampleAt || _nextTimingChange is { } next && now >= next) _projectedEvents = null;
+            _sampleAt = now;
         }
 
         public void Apply(DailyReadBatchResult result)
@@ -748,20 +799,24 @@ public sealed class SessionLogMonitor : IDisposable
                 if (item is QuotaEvent quota)
                 {
                     // Keep only the latest per bucket in each file, preserving sample time.
-                    var old = _events.FindLastIndex(e => e is QuotaEvent existing && existing.LimitKey == quota.LimitKey);
+                    var old = _events.FindLastIndex(e => e.Event is QuotaEvent existing && existing.LimitKey == quota.LimitKey);
                     if (old >= 0)
                     {
-                        if (_events[old].Timestamp < quota.Timestamp)
+                        if (_events[old].Event.Timestamp < quota.Timestamp)
                         {
-                            _events[old] = quota;
+                            _events[old] = new(quota);
                             _projectedEvents = null;
                             continue;
                         }
-                        if (_events[old] == quota || _events[old].Timestamp > quota.Timestamp) continue;
+                        if (_events[old].Event == quota || _events[old].Event.Timestamp > quota.Timestamp) continue;
                     }
                 }
                 if (_events.Count >= MaximumEventsPerFile || !_canRetain()) { BadStatistics = true; return; }
-                _events.Add(item);
+                // Coverage tracks the original timing row and its source-local
+                // session, independently of the current ownership projection.
+                var rawTiming = item is DailyToolEvent or DailyTimingUnavailableEvent or DailyToolTimingParser.InferredTool
+                    ? EventParser.Key("daily-raw-timing", item.SessionKey, line) : null;
+                _events.Add(new(item, rawTiming));
                 _projectedEvents = null;
                 if (item is MetadataEvent) MetadataNeedsObservation = true;
                 _changeCount(1);
@@ -781,6 +836,7 @@ public sealed class SessionLogMonitor : IDisposable
             _changeCount(-_events.Count);
             _events.Clear();
             _projectedEvents = null;
+            _nextTimingChange = null;
         }
         public void Dispose() { ClearEvents(); Reader.Dispose(); }
     }

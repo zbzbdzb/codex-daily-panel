@@ -421,6 +421,83 @@ internal static class ClosureCoverageTests
             ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, false, "only the actual abort event closes the tie");
         });
 
+        const string toolSession = "tool-coverage";
+        const string timedTurn = "timed";
+        var toolStart = RootMetadata(toolSession, At.AddSeconds(-10)) + Start(timedTurn, At);
+        var toolCall = Tool("function_call", "original", At.AddSeconds(2));
+        var toolOutput = Tool("function_call_output", "original", At.AddSeconds(5));
+        var toolCompletion = Modern(toolSession, "timed-request", timedTurn, At.AddSeconds(9))
+            + Complete(timedTurn, At.AddSeconds(10));
+        var originalTools = toolStart + toolCall + toolOutput + toolCompletion;
+        var lateSibling = Start("late-sibling", At) + AbortRow("task_aborted", "late-sibling", At.AddSeconds(8));
+        foreach (var change in new[] { "append", "replace", "archive", "exact-replace", "missing", "substitute" })
+        {
+            await Case($"CON-21 tool coverage after {change} uses the same raw facts", async () =>
+            {
+                using var fixture = new Fixture("tool-coverage-" + change, Now);
+                var live = fixture.WriteSession("current", originalTools);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                ExpectToolCoverage(await monitor.RefreshAsync(Now), 1, timed: true, lost: false, "initial inferred pair");
+
+                var final = originalTools + lateSibling;
+                var current = live;
+                switch (change)
+                {
+                    case "append":
+                        fixture.AppendSession(live, lateSibling);
+                        break;
+                    case "archive":
+                        current = Path.Combine(fixture.Home, "archived_sessions", Path.GetFileName(live));
+                        File.Move(live, current);
+                        fixture.AppendSession(current, lateSibling);
+                        break;
+                    case "replace":
+                    case "exact-replace":
+                    {
+                        if (change == "exact-replace") final = originalTools;
+                        // With an unchanged prefix and no coverage-replay request, a reset
+                        // on this separately created replacement proves identity changed.
+                        using var identityProbe = new DailyLogReader(live);
+                        var first = await identityProbe.ReadAvailableAsync(_ => { });
+                        if (first.ResetDetected || first.BytesRead != Utf8.GetByteCount(originalTools))
+                            throw new InvalidOperationException("Identity probe did not establish the original cursor.");
+                        ReplaceSession(fixture, live, final);
+                        var replaced = await identityProbe.ReadAvailableAsync(_ => { });
+                        if (!replaced.ResetDetected || replaced.BytesRead != Utf8.GetByteCount(final))
+                            throw new InvalidOperationException("The byte-preserving replacement did not reset by identity.");
+                        break;
+                    }
+                    case "missing":
+                        final = toolStart + toolCall + toolCompletion + lateSibling;
+                        ReplaceSession(fixture, live, final);
+                        break;
+                    case "substitute":
+                        final = toolStart + Tool("function_call", "different-call", At.AddSeconds(2))
+                            + Tool("function_call_output", "different-call", At.AddSeconds(5)) + toolCompletion;
+                        ReplaceSession(fixture, live, final);
+                        using (var cold = new SessionLogMonitor(fixture.Home, Zone))
+                            ExpectToolCoverage(await cold.RefreshAsync(Now), 1, timed: true, lost: false,
+                                "the substituted pair is independently complete but does not cover the original pair");
+                        break;
+                }
+                if (!File.ReadAllBytes(current).SequenceEqual(Utf8.GetBytes(final)))
+                    throw new InvalidOperationException("The fixture did not preserve the intended synthetic bytes.");
+
+                bool lost = change is "missing" or "substitute";
+                bool timed = change == "exact-replace";
+                var turns = change is "exact-replace" or "substitute" ? 1 : 2;
+                ExpectToolCoverage(await monitor.RefreshAsync(Now.AddSeconds(1)), turns, timed, lost, "after updating the source");
+                ExpectToolCoverage(await monitor.RefreshAsync(Now.AddSeconds(2)), turns, timed, lost, "idle refresh");
+
+                if (change == "missing")
+                {
+                    ReplaceSession(fixture, live, originalTools + lateSibling);
+                    ExpectToolCoverage(await monitor.RefreshAsync(Now.AddSeconds(3)), 2, timed: false, lost: false,
+                        "restoring the identical tool output clears coverage loss while ownership remains ambiguous");
+                }
+            });
+        }
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));
@@ -435,6 +512,27 @@ internal static class ClosureCoverageTests
     private static void ExpectUnavailableTiming(DailySnapshot actual, string context) => Check(actual,
         actual.AverageTps is null && actual.ProcessingSeconds is null && actual.TimedTurnCount == 0,
         context + ": expected unavailable TPS and processing seconds with no timed completed turn");
+
+    private static void ExpectToolCoverage(DailySnapshot actual, int turns, bool timed, bool lost, string context)
+    {
+        Expect(actual, 100, 60, 40, 10, lost, context);
+        Check(actual, actual.SourceCount == 1 && actual.TurnCount == turns && actual.ActiveTurns == 0
+            && actual.ActiveSeconds == 10
+            && actual.Issues.Any(issue => issue.Code == DailyIssueCodes.CoverageLost) == lost
+            && actual.Issues.Any(issue => issue.Code == DailyIssueCodes.SourcePartial) == lost,
+            context + ": expected unchanged activities and an independent coverage diagnostic");
+        if (timed)
+            Check(actual, actual.ProcessingSeconds == 6 && actual.TimedTurnCount == 1 && actual.ExcludedTimingTurnCount == 0
+                && actual.AverageTps is { } tps && Math.Abs(tps - 40d / 6) < 0.000001, context + ": expected the observed six-second TPS");
+        else
+        {
+            ExpectUnavailableTiming(actual, context);
+            Check(actual, actual.ExcludedTimingTurnCount == 1, context + ": expected one excluded completion");
+        }
+    }
+
+    private static void ReplaceSession(Fixture fixture, string path, string contents) =>
+        File.Move(fixture.WriteSession("replacement", contents), path, overwrite: true);
 
     private static void ExpectAbortSourceDiagnostics(DailySnapshot actual, string context) => Check(actual,
         actual.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable)
@@ -505,6 +603,9 @@ internal static class ClosureCoverageTests
     {
         type = "task_complete", turn_id = Turn(turn), duration_ms = 10000, time_to_first_token_ms = 1000
     });
+
+    private static string Tool(string kind, string call, DateTimeOffset time) =>
+        Row("response_item", time, new { type = kind, call_id = call });
 
     private static string AbortRow(string kind, string turn, DateTimeOffset timestamp, object? envelopeVersion = null, object? payloadVersion = null)
     {
