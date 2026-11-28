@@ -175,12 +175,14 @@ public static class DailyAggregator
             }
         }
         foreach (var request in accepted) Get(request.Latest.SessionKey, request.Latest.TurnKey!).Requests.Add(request);
-        Dictionary<string, (DateTimeOffset At, string? Key)> LatestStarts(IEnumerable<StartEvent> values, bool reportConflicts) =>
+        var unresolvedLatestStarts = new HashSet<(string Session, string Turn)>();
+        Dictionary<string, (DateTimeOffset At, string? Key)> LatestStarts(IEnumerable<StartEvent> values, bool collectAmbiguities) =>
             values.GroupBy(x => x.SessionKey).ToDictionary(x => x.Key, x =>
             {
                 var timestamp = x.Max(start => start.Timestamp);
                 var keys = x.Where(start => start.Timestamp == timestamp).Select(start => start.TurnKey).Distinct().ToArray();
-                if (reportConflicts && keys.Length > 1 && InDay(timestamp)) Issue(DailyIssueCodes.CurrentStartConflict, "当前回合启动关系冲突");
+                if (collectAmbiguities && keys.Length > 1 && InDay(timestamp))
+                    unresolvedLatestStarts.UnionWith(keys.Select(key => (x.Key, key)));
                 return (At: timestamp, Key: keys.Length == 1 ? keys[0] : null);
             }, StringComparer.Ordinal);
         var rawLastStarts = LatestStarts(observed.OfType<StartEvent>(), true);
@@ -236,6 +238,13 @@ public static class DailyAggregator
                 continue;
             }
             DateTimeOffset? explicitStart = starts.Length == 1 ? starts[0] : null;
+            // A tied start matters for current activity only while a candidate
+            // lacks an observed, consistent end. Retired evidence may expose a
+            // conflict above, but cannot stand in for a current terminal event.
+            if (unresolvedLatestStarts.Count != 0 && explicitStart is { } started
+                && ((aborts.Length == 1 && aborts[0] >= started)
+                    || (completions.Length > 0 && completions[0].Timestamp >= started)))
+                unresolvedLatestStarts.Remove((turn.Session, turn.Key));
             if (aborts.Length == 1)
             {
                 if (explicitStart is { } began) AddInterval(began, aborts[0]);
@@ -312,6 +321,8 @@ public static class DailyAggregator
             timedTurns++;
         }
 
+        if (unresolvedLatestStarts.Count > 0)
+            Issue(DailyIssueCodes.CurrentStartConflict, "当前回合启动关系冲突");
         var status = dayRequests.Length > 0 ? "本地日志 · 根会话" : "暂无今日可核验 token 记录";
         if (active > 0) status += $"；观察到 {active} 个运行中回合（最近15分钟启动）";
         if (timedTurns > 0) status += "；平均 TPS 为扣除首字与工具等待后的估算";

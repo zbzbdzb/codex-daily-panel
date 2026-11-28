@@ -171,6 +171,44 @@ internal static class ClosureCoverageTests
                 "expired abort evidence does not leave permanent activity or partiality on idle");
         });
 
+        await Case("CON-07 appending an abort settles the tied start and its archived replay", async () =>
+        {
+            using var fixture = new Fixture("tied-start-abort-and-archive", Now);
+            var prefix = TiedStartRows() + Complete("tied-first", At.AddSeconds(10));
+            var path = fixture.WriteSession("tied-starts", prefix);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, true,
+                "one known completion cannot resolve the other tied start");
+            var abort = Row("event_msg", At.AddSeconds(10), new { type = "task_aborted", turn_id = Turn("tied-second") });
+            fixture.AppendSession(path, abort);
+            ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, false,
+                "a current completion and abort close both tied candidates without changing timing or totals");
+            fixture.WriteSession("mirror", prefix + abort, archived: true);
+            var replay = await monitor.RefreshAsync(Now);
+            Check(replay, replay.SourceCount == 2, "the archived replay must be read");
+            ExpectTiedStarts(replay, 9, false,
+                "exact archived duplicates of starts, requests and closures leave the resolved state unchanged");
+        });
+
+        await Case("CON-08 a retired terminal alone cannot settle a tied start", async () =>
+        {
+            using var fixture = new Fixture("tied-start-terminal-loss", Now);
+            var prefix = TiedStartRows() + Complete("tied-first", At.AddSeconds(10));
+            var last = Complete("tied-second", At.AddSeconds(10));
+            var path = fixture.WriteSession("tied-starts", prefix + last);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            ExpectTiedStarts(await monitor.RefreshAsync(Now), 18, false,
+                "all tied starts have known current completions");
+            fixture.TruncateSession(path, Utf8.GetByteCount(prefix));
+            ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, true,
+                "the removed closure cannot settle the current tie or provide completed-turn TPS");
+            ExpectTiedStarts(await monitor.RefreshAsync(Now.AddSeconds(1)), 9, true,
+                "an idle refresh cannot promote the retained closure");
+            fixture.AppendSession(path, last);
+            ExpectTiedStarts(await monitor.RefreshAsync(Now.AddSeconds(1)), 18, false,
+                "restoring the exact original bytes resolves the current tie again");
+        });
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));
@@ -192,6 +230,17 @@ internal static class ClosureCoverageTests
         Check(actual, actual.Day == new DateOnly(2026, 10, 21) && actual.ActiveTurns == 0 && actual.ActiveSeconds is null,
             context + ": expected today's active turns=0 and no active seconds");
         ExpectUnavailableTiming(actual, context);
+    }
+
+    private static void ExpectTiedStarts(DailySnapshot actual, double processing, bool conflict, string context)
+    {
+        Expect(actual, 200, 120, 80, 20, conflict, context);
+        Check(actual, actual.Issues.Any(issue => issue.Code == DailyIssueCodes.CurrentStartConflict) == conflict,
+            context + ": expected current-start conflict to track the unresolved tie");
+        Check(actual, actual.TurnCount == 2 && actual.ActiveTurns == 0 && actual.ActiveSeconds == 10
+            && actual.ProcessingSeconds == processing && actual.TimedTurnCount == processing / 9
+            && actual.AverageTps is { } tps && Math.Abs(tps - 40d / 9) < 0.000001,
+            context + ": expected two turns, zero running, ten active seconds, and retained completed-turn timing");
     }
 
     private static void Check(DailySnapshot actual, bool condition, string context)
@@ -244,6 +293,11 @@ internal static class ClosureCoverageTests
         + Start("same-day-turn", At) + Modern("A", "shared-request", "same-day-turn", At.AddSeconds(9))
         + Complete("same-day-turn", At.AddSeconds(10));
 
+    private static string TiedStartRows() => RootMetadata("tied", At.AddMinutes(-1))
+        + Start("tied-first", At) + Start("tied-second", At)
+        + Modern("tied", "tied-first-request", "tied-first", At.AddSeconds(9))
+        + Modern("tied", "tied-second-request", "tied-second", At.AddSeconds(9));
+
     private static string OldOpenRows() => RootMetadata("activity", OldStart.AddHours(-1)) + Start("old-turn", OldStart);
 
     private static string OpenSuccessorRows() => RootMetadata("activity", SuccessorStart.AddMinutes(-1))
@@ -277,12 +331,12 @@ internal static class ClosureCoverageTests
             if (!string.IsNullOrWhiteSpace(archiveRoot)) _archiveDirectory = Path.Combine(archiveRoot, name);
         }
 
-        public string WriteSession(string name, string contents)
+        public string WriteSession(string name, string contents, bool archived = false)
         {
             // Both destinations receive the same bytes from this fixture's synthetic
             // string. Archival never reads or enumerates any existing log directory.
             var bytes = Utf8.GetBytes(contents);
-            var path = Path.Combine(Home, "sessions", name + ".jsonl");
+            var path = Path.Combine(Home, archived ? "archived_sessions" : "sessions", name + ".jsonl");
             File.WriteAllBytes(path, bytes);
             File.SetLastWriteTimeUtc(path, _modifiedAt.UtcDateTime);
             if (_archiveDirectory is not null)
@@ -293,6 +347,18 @@ internal static class ClosureCoverageTests
                 archive.Write(bytes);
             }
             return path;
+        }
+
+        public void AppendSession(string path, string contents)
+        {
+            File.AppendAllText(path, contents, Utf8);
+            File.SetLastWriteTimeUtc(path, _modifiedAt.UtcDateTime);
+        }
+
+        public void TruncateSession(string path, long byteLength)
+        {
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Write)) stream.SetLength(byteLength);
+            File.SetLastWriteTimeUtc(path, _modifiedAt.UtcDateTime);
         }
 
         public void Dispose() => Directory.Delete(Home, recursive: true);

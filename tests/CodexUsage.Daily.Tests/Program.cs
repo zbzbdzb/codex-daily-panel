@@ -285,5 +285,6 @@ Test("Same-bucket equal-time quota mirrors across chats remain one allowance", (
 
 LegacyIntegrityTests.Run(Test);
 HistoricalDurationTests.Run(Test);
+ClosedStartQualityTests.Run(Test);
 Console.WriteLine($"Daily aggregation: {checks - failures}/{checks} passed; {failures} failed.");
 return failures == 0 ? 0 : 1;
