@@ -20,7 +20,13 @@ public static class DailyAggregator
         ArgumentNullException.ThrowIfNull(zone);
         var rows = events.ToArray();
         var issues = new HashSet<string>(StringComparer.Ordinal);
-        if (partial) issues.Add("来源仍在读取或部分来源不可用");
+        var diagnostics = new Dictionary<string, DailyIssue>(StringComparer.Ordinal);
+        void Issue(string code, string compatibilityReason)
+        {
+            issues.Add(compatibilityReason);
+            diagnostics.TryAdd(code, new(code));
+        }
+        if (partial) Issue(DailyIssueCodes.SourcePartial, "来源仍在读取或部分来源不可用");
         var lower = DayBoundary(day, zone);
         var upper = DayBoundary(day.AddDays(1), zone);
         bool InDay(DateTimeOffset value) => value != DateTimeOffset.MinValue && value >= lower && value < upper;
@@ -41,13 +47,13 @@ public static class DailyAggregator
             else roots.Add(group.Key);
         }
         bool Root(StatsEvent value) => roots.Contains(value.SessionKey);
-        if (rows.Any(x => metadataConflicts.Contains(x.SessionKey) && Relevant(x))) issues.Add("会话关系冲突");
+        if (rows.Any(x => metadataConflicts.Contains(x.SessionKey) && Relevant(x))) Issue(DailyIssueCodes.MetadataConflict, "会话关系冲突");
         if (rows.Any(x => x is not MetadataEvent && x is not QuotaEvent && Relevant(x)
             && !roots.Contains(x.SessionKey) && !children.Contains(x.SessionKey) && !metadataConflicts.Contains(x.SessionKey)))
-            issues.Add("缺少会话元数据，无法确认根会话范围");
+            Issue(DailyIssueCodes.MetadataMissing, "缺少会话元数据，无法确认根会话范围");
         var usable = rows.Where(Root).Where(x => x is not MetadataEvent && x is not QuotaEvent).ToArray();
-        if (usable.Any(x => x.Timestamp == DateTimeOffset.MinValue)) issues.Add("统计事件缺少时间");
-        if (usable.Any(x => x.Timestamp > now && InDay(x.Timestamp))) issues.Add("统计事件时间超前");
+        if (usable.Any(x => x.Timestamp == DateTimeOffset.MinValue)) Issue(DailyIssueCodes.TimestampMissing, "统计事件缺少时间");
+        if (usable.Any(x => x.Timestamp > now && InDay(x.Timestamp))) Issue(DailyIssueCodes.TimestampFuture, "统计事件时间超前");
         var observed = usable.Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now).ToArray();
         var today = observed.Where(x => InDay(x.Timestamp)).ToArray();
 
@@ -58,7 +64,7 @@ public static class DailyAggregator
             || string.IsNullOrWhiteSpace(x.SessionKey) || string.IsNullOrWhiteSpace(x.TurnKey)
             || string.IsNullOrWhiteSpace(x.RootTurnKey)))
         {
-            if (Relevant(missing)) issues.Add("请求身份缺失");
+            if (Relevant(missing)) Issue(DailyIssueCodes.RequestIdentityMissing, "请求身份缺失");
             if (missing.TurnKey is { } turn) rejectedTurns.Add((missing.SessionKey, turn));
         }
         foreach (var group in modern.Where(x => !string.IsNullOrWhiteSpace(x.RequestKey)
@@ -71,7 +77,9 @@ public static class DailyAggregator
             var missingTime = versions.Any(x => x.Timestamp == DateTimeOffset.MinValue);
             if (conflict || invalid || missingTime)
             {
-                if (versions.Any(Relevant)) issues.Add(conflict ? "请求修订冲突" : invalid ? "请求 token 字段无效" : "统计事件缺少时间");
+                if (versions.Any(Relevant)) Issue(conflict ? DailyIssueCodes.RequestRevisionConflict
+                    : invalid ? DailyIssueCodes.RequestTokensInvalid : DailyIssueCodes.TimestampMissing,
+                    conflict ? "请求修订冲突" : invalid ? "请求 token 字段无效" : "统计事件缺少时间");
                 foreach (var value in versions) rejectedTurns.Add((value.SessionKey, value.TurnKey!));
                 continue;
             }
@@ -109,14 +117,14 @@ public static class DailyAggregator
 
         var dayRequests = accepted.Where(x => InDay(x.OccurredAt)).ToArray();
         TokenVector? totals = dayRequests.Length == 0 ? null : Sum(dayRequests);
-        if (dayRequests.Any(x => !x.Latest.Usage!.IsComplete)) issues.Add("部分 token 字段未提供");
-        if (totals is { IsComplete: false } && dayRequests.All(x => x.Latest.Usage!.IsComplete)) issues.Add("累计数值超出范围");
+        if (dayRequests.Any(x => !x.Latest.Usage!.IsComplete)) Issue(DailyIssueCodes.TokenFieldsMissing, "部分 token 字段未提供");
+        if (totals is { IsComplete: false } && dayRequests.All(x => x.Latest.Usage!.IsComplete)) Issue(DailyIssueCodes.TokenOverflow, "累计数值超出范围");
         var legacy = today.OfType<UsageEvent>().Where(x => x.Legacy).ToArray();
         if (legacy.Length > 0)
         {
             var covered = BuildLegacyCoverage(accepted);
             if (legacy.Any(x => !LegacyCovered(x, covered)))
-                issues.Add("旧格式快照覆盖关系未知，无法还原全部今日用量");
+                Issue(DailyIssueCodes.LegacyCoverageUnknown, "旧格式快照覆盖关系未知，无法还原全部今日用量");
         }
         // Revision arrival alone is not a new daily chat or turn. Lifecycle rows
         // and legacy snapshots establish observed chat/turn presence on their own
@@ -133,11 +141,15 @@ public static class DailyAggregator
         // An invalid row must make its scope unavailable, never masquerade as no wait.
         var toolRows = usable.OfType<DailyToolEvent>().Distinct().ToArray();
         var timingUnavailable = usable.OfType<DailyTimingUnavailableEvent>().Distinct().ToArray();
-        var untimedSessions = timingUnavailable.Where(x => string.IsNullOrWhiteSpace(x.TurnKey)).Select(x => x.SessionKey)
+        var untimedSessions = timingUnavailable.Where(x => x.ObservedToolWait is null && x.StartTimestamp is null
+                && string.IsNullOrWhiteSpace(x.TurnKey)).Select(x => x.SessionKey)
             .Concat(toolRows.Where(x => string.IsNullOrWhiteSpace(x.TurnKey)).Select(x => x.SessionKey))
             .ToHashSet(StringComparer.Ordinal);
         var untimedTurns = timingUnavailable.Where(x => !string.IsNullOrWhiteSpace(x.TurnKey))
             .Select(x => (Session: x.SessionKey, Turn: x.TurnKey!)).ToHashSet();
+        var untimedStarts = timingUnavailable.Where(x => x.StartTimestamp.HasValue)
+            .Select(x => (x.SessionKey, x.StartTimestamp!.Value)).ToHashSet();
+        var uncertainToolWindows = UncertainToolWindows(timingUnavailable, now);
         // A call identity crossing turn boundaries is ambiguous even when both
         // sides carry turn keys. Do not independently pair a replay under a new turn.
         foreach (var group in toolRows.Where(x => !string.IsNullOrWhiteSpace(x.CallKey))
@@ -167,12 +179,14 @@ public static class DailyAggregator
             }
         }
         foreach (var request in accepted) Get(request.Latest.SessionKey, request.Latest.TurnKey!).Requests.Add(request);
-        Dictionary<string, (DateTimeOffset At, string? Key)> LatestStarts(IEnumerable<StartEvent> values, bool reportConflicts) =>
+        var unresolvedLatestStarts = new HashSet<(string Session, string Turn)>();
+        Dictionary<string, (DateTimeOffset At, string? Key)> LatestStarts(IEnumerable<StartEvent> values, bool collectAmbiguities) =>
             values.GroupBy(x => x.SessionKey).ToDictionary(x => x.Key, x =>
             {
                 var timestamp = x.Max(start => start.Timestamp);
                 var keys = x.Where(start => start.Timestamp == timestamp).Select(start => start.TurnKey).Distinct().ToArray();
-                if (reportConflicts && keys.Length > 1 && InDay(timestamp)) issues.Add("当前回合启动关系冲突");
+                if (collectAmbiguities && keys.Length > 1 && InDay(timestamp))
+                    unresolvedLatestStarts.UnionWith(keys.Select(key => (x.Key, key)));
                 return (At: timestamp, Key: keys.Length == 1 ? keys[0] : null);
             }, StringComparer.Ordinal);
         var rawLastStarts = LatestStarts(observed.OfType<StartEvent>(), true);
@@ -182,12 +196,11 @@ public static class DailyAggregator
             .Concat(startHistory.Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now)), false);
         // A retired closure may disqualify activity, but cannot supply an old
         // completion, duration, TTFT or interval to the current statistics.
-        var historicalClosedTurns = closureHistory?.Where(x => x.At != DateTimeOffset.MinValue && x.At <= now
+        var historicalEndTimes = (closureHistory ?? []).Where(x => x.At != DateTimeOffset.MinValue && x.At <= now
             && !string.IsNullOrWhiteSpace(x.Session) && !string.IsNullOrWhiteSpace(x.Turn))
-            .Select(x => (x.Session, x.Turn)).ToHashSet() ?? [];
+            .GroupBy(x => (x.Session, x.Turn)).ToDictionary(x => x.Key, x => x.Max(end => end.At));
         var knownClosures = (closureFacts ?? []).Where(x => x.At != DateTimeOffset.MinValue && x.At <= now)
             .GroupBy(x => (x.Session, x.Turn)).ToDictionary(x => x.Key, x => x.Distinct().ToArray());
-        historicalClosedTurns.UnionWith(knownClosures.Keys);
         var knownStarts = (startHistory ?? []).Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now)
             .GroupBy(x => (x.SessionKey, x.TurnKey)).ToDictionary(x => x.Key, x => x.Select(s => s.Timestamp).Distinct().ToArray());
         var intervals = new List<(DateTimeOffset Start, DateTimeOffset End)>();
@@ -223,46 +236,49 @@ public static class DailyAggregator
                 || (completionCount > 0 && abortCount > 0);
             if (timingConflict)
             {
-                if (relevantTurn) issues.Add("回合时间事件冲突");
+                if (relevantTurn) Issue(DailyIssueCodes.TurnTimeConflict, "回合时间事件冲突");
                 if (completions.Any(x => InDay(x.Timestamp))) unavailableTiming++;
                 continue;
             }
             DateTimeOffset? explicitStart = starts.Length == 1 ? starts[0] : null;
-            if (aborts.Length == 1)
+            var endAt = aborts.Length == 1 ? aborts[0] : completions.FirstOrDefault()?.Timestamp;
+            // Compare the sole observed end to the start of this same turn.
+            // Retain all terminal facts above for conflict detection first.
+            bool endInOrder = endAt is { } ended && (startEvidence.Length == 0 || ended >= startEvidence[0]);
+            // A tied start matters for current activity only while a candidate
+            // lacks an observed, consistent end. Retired evidence may expose a
+            // conflict above, but cannot stand in for a current terminal event.
+            if (endInOrder && explicitStart is not null)
+                unresolvedLatestStarts.Remove((turn.Session, turn.Key));
+            if (endInOrder && aborts.Length == 1)
             {
                 if (explicitStart is { } began) AddInterval(began, aborts[0]);
                 continue;
             }
-            if (completions.Length == 0)
+            // The latest observed start may still indicate activity if the
+            // only end was premature. A log start is not proof of liveness.
+            if (!endInOrder && explicitStart is { } currentStart && InDay(now) && now - currentStart <= RecentObservation
+                && rawLastStarts.TryGetValue(turn.Session, out var rawLatest) && currentStart == rawLatest.At && turn.Key == rawLatest.Key)
             {
-                // A log start is only an observation, not proof the process is alive.
-                // Require the latest start in its root session and a short age limit.
-                if (explicitStart is { } began && InDay(now) && now - began <= RecentObservation
-                    && rawLastStarts.TryGetValue(turn.Session, out var rawLatest) && began == rawLatest.At && turn.Key == rawLatest.Key)
+                if (retiredClosures.Any(end => end.At >= currentStart)
+                    || historicalEndTimes.TryGetValue((turn.Session, turn.Key), out var pastEnd) && pastEnd >= currentStart)
+                    Issue(DailyIssueCodes.HistoricalClosureMissing, "历史回合闭合依据缺失，活动状态无法确认");
+                else if (lastStarts.TryGetValue(turn.Session, out var latest) && currentStart == latest.At && turn.Key == latest.Key)
                 {
-                    if (historicalClosedTurns.Contains((turn.Session, turn.Key)))
-                        issues.Add("历史回合闭合依据缺失，活动状态无法确认");
-                    else if (lastStarts.TryGetValue(turn.Session, out var latest) && began == latest.At && turn.Key == latest.Key)
-                    {
-                        coverageTurns?.Add((turn.Session, turn.Key));
-                        active++;
-                        AddInterval(began, now);
-                    }
-                    else issues.Add("历史回合启动依据缺失，活动状态无法确认");
+                    coverageTurns?.Add((turn.Session, turn.Key));
+                    active++;
+                    AddInterval(currentStart, now);
                 }
-                continue;
+                else Issue(DailyIssueCodes.HistoricalStartMissing, "历史回合启动依据缺失，活动状态无法确认");
             }
+            if (completions.Length == 0) continue;
 
             var completed = completions[0];
             var duration = completed.DurationMs is > 0 ? completed.DurationMs : null;
-            DateTimeOffset? durationStart = null;
-            if (duration is { } millis)
-            {
-                try { durationStart = completed.Timestamp.AddMilliseconds(-millis); }
-                catch (ArgumentOutOfRangeException) { }
-            }
+            var durationWindow = DailyTimingWindow.FromCompletion(completed);
+            var durationStart = durationWindow?.Start;
             var beganAt = explicitStart ?? durationStart;
-            if (beganAt is { } intervalStart) AddInterval(intervalStart, completed.Timestamp);
+            if (endInOrder && beganAt is { } intervalStart) AddInterval(intervalStart, completed.Timestamp);
             if (!InDay(completed.Timestamp)) continue;
             // The completion's declared duration and an explicit start/end pair are
             // independent evidence for the same turn. Allow modest write/scheduling
@@ -273,10 +289,10 @@ public static class DailyAggregator
             var durationMismatch = startEvidence.Length == 1 && duration is { } declared
                 && Math.Abs((completed.Timestamp - startEvidence[0]).TotalMilliseconds - declared)
                     > Math.Max(1000d, declared * .05d);
-            if (durationMismatch) issues.Add("回合声明耗时与起止时间不一致");
+            if (durationMismatch) Issue(DailyIssueCodes.DurationMismatch, "回合声明耗时与起止时间不一致");
             var reconciliation = Reconcile(turn.Requests, rejectedTurns.Contains((turn.Session, turn.Key)));
-            if (!reconciliation && relevantTurn) issues.Add("完成回合快照缺失或对账不一致");
-            var sameDay = durationStart is { } inferred && InDay(inferred) && beganAt is { } beganSameDay
+            if (!reconciliation && relevantTurn) Issue(DailyIssueCodes.CompletionReconciliation, "完成回合快照缺失或对账不一致");
+            var sameDay = endInOrder && durationStart is { } inferred && InDay(inferred) && beganAt is { } beganSameDay
                 && InDay(beganSameDay) && beganSameDay <= completed.Timestamp
                 && turn.Requests.All(x => InDay(x.OccurredAt) && x.OccurredAt >= beganSameDay && x.OccurredAt <= completed.Timestamp);
             if (!reconciliation || duration is null || !sameDay || durationMismatch)
@@ -290,6 +306,9 @@ public static class DailyAggregator
                 continue;
             }
             if (untimedSessions.Contains(turn.Session) || untimedTurns.Contains((turn.Session, turn.Key))
+                || startEvidence.Length == 1 && untimedStarts.Contains((turn.Session, startEvidence[0]))
+                || explicitStart is null && uncertainToolWindows.TryGetValue(turn.Session, out var uncertain)
+                    && Overlaps(uncertain, durationWindow!.Value)
                 || !TryExcludedWait(durationStart!.Value, explicitStart, completed.Timestamp,
                     completed.TimeToFirstTokenMs.Value,
                     toolsByTurn.GetValueOrDefault((turn.Session, turn.Key)) ?? [], now, out var waitMs)
@@ -304,6 +323,8 @@ public static class DailyAggregator
             timedTurns++;
         }
 
+        if (unresolvedLatestStarts.Count > 0)
+            Issue(DailyIssueCodes.CurrentStartConflict, "当前回合启动关系冲突");
         var status = dayRequests.Length > 0 ? "本地日志 · 根会话" : "暂无今日可核验 token 记录";
         if (active > 0) status += $"；观察到 {active} 个运行中回合（最近15分钟启动）";
         if (timedTurns > 0) status += "；平均 TPS 为扣除首字与工具等待后的估算";
@@ -314,6 +335,21 @@ public static class DailyAggregator
         if (issues.Count > 0) status += "；统计不完整：" + string.Join("、", issues.Order(StringComparer.Ordinal));
         var weekly = LatestWeekly(rows.OfType<QuotaEvent>(), now, out var multipleWeekly);
         if (multipleWeekly) status += "；日志报告多个独立周额度窗口，未合并显示";
+        // Informational diagnostics share the transport but do not alter the
+        // established partial reasons or compatibility Status string above.
+        var invariant = System.Globalization.CultureInfo.InvariantCulture;
+        var scopeCode = dayRequests.Length > 0 ? DailyIssueCodes.LocalRootScope : DailyIssueCodes.NoTokens;
+        diagnostics.Add(scopeCode, new(scopeCode));
+        if (active > 0) diagnostics.Add(DailyIssueCodes.ObservedActive,
+            DailyIssue.With(DailyIssueCodes.ObservedActive, ("count", active.ToString(invariant))));
+        if (timedTurns > 0) diagnostics.Add(DailyIssueCodes.EstimatedTps, new(DailyIssueCodes.EstimatedTps));
+        if (unavailableTiming > 0)
+        {
+            var code = timedTurns > 0 ? DailyIssueCodes.TimingCoveragePartial : DailyIssueCodes.TimingUnavailable;
+            diagnostics.Add(code, DailyIssue.With(code, ("included", timedTurns.ToString(invariant)),
+                ("excluded", unavailableTiming.ToString(invariant))));
+        }
+        if (multipleWeekly) diagnostics.Add(DailyIssueCodes.MultipleWeekly, new(DailyIssueCodes.MultipleWeekly));
         if (exclusionProof is not null)
         {
             // These dependencies can be dormant: a request's first occurrence,
@@ -404,6 +440,7 @@ public static class DailyAggregator
             timedTurns > 0 ? (double)(matchedOutput / (processingMs / 1000m)) : null,
             chats, turnKeys, active, 0, issues.Count > 0, status, weekly)
         {
+            Issues = Array.AsReadOnly(diagnostics.Values.OrderBy(x => x.Code, StringComparer.Ordinal).ToArray()),
             TimedTurnCount = timedTurns,
             ExcludedTimingTurnCount = unavailableTiming,
             ExcludedWaitSeconds = timedTurns > 0 ? (double)(excludedWaitMs / 1000m) : null
@@ -610,6 +647,38 @@ public static class DailyAggregator
         return last.Length == 1 && last[0] is { IsComplete: true, IsValid: true } snapshot && snapshot == total;
     }
 
+    private static Dictionary<string, DailyTimingWindow[]> UncertainToolWindows(
+        DailyTimingUnavailableEvent[] unavailable, DateTimeOffset now)
+    {
+        // A duration-derived interval has no explicit start identity to match
+        // against the tool's group. Keep bounded time evidence for that case.
+        var windows = unavailable.Where(x => x.ObservedToolWait is null && x.StartTimestamp.HasValue)
+            .Select(x => (Session: x.SessionKey, Window: new DailyTimingWindow(x.Timestamp, x.Timestamp)))
+            .Concat(unavailable.Where(x => x.ObservedToolWait.HasValue)
+                .Select(x => (Session: x.SessionKey, Window: x.ObservedToolWait!.Value)));
+        return windows.Where(x => x.Window.IsObservedAt(now)).GroupBy(x => x.Session, StringComparer.Ordinal).ToDictionary(group => group.Key, group =>
+        {
+            var ordered = group.Select(x => x.Window).OrderBy(x => x.Start).ToArray();
+            // The running maximum makes overlap checks logarithmic even for
+            // nested intervals or many calls in the same source.
+            for (int i = 1; i < ordered.Length; i++)
+                if (ordered[i - 1].End > ordered[i].End) ordered[i] = ordered[i] with { End = ordered[i - 1].End };
+            return ordered;
+        }, StringComparer.Ordinal);
+    }
+
+    private static bool Overlaps(DailyTimingWindow[] windows, DailyTimingWindow completion)
+    {
+        int low = 0, high = windows.Length;
+        while (low < high)
+        {
+            int middle = low + (high - low) / 2;
+            if (windows[middle].Start <= completion.End) low = middle + 1;
+            else high = middle;
+        }
+        return low > 0 && windows[low - 1].Overlaps(completion);
+    }
+
     private static bool TryExcludedWait(DateTimeOffset declaredStart, DateTimeOffset? explicitStart,
         DateTimeOffset completedAt, long ttftMs, DailyToolEvent[] tools, DateTimeOffset now, out decimal waitMs)
     {
@@ -624,10 +693,9 @@ public static class DailyAggregator
                 || x.Timestamp == DateTimeOffset.MinValue || x.Timestamp > now
                 || x.Timestamp < declaredStart || x.Timestamp > completedAt
                 || explicitStart is { } began && x.Timestamp < began)) return false;
-            var starts = rows.Where(x => x.Phase == DailyToolPhase.Call).ToArray();
-            var ends = rows.Where(x => x.Phase == DailyToolPhase.Result).ToArray();
-            if (starts.Length != 1 || ends.Length != 1 || ends[0].Timestamp <= starts[0].Timestamp) return false;
-            intervals.Add((starts[0].Timestamp, ends[0].Timestamp));
+            if (DailyTimingWindow.TryPair(rows.Select(x => new DailyToolEndpoint(x.Phase, x.Timestamp)), now) is not { } pair)
+                return false;
+            intervals.Add((pair.Start, pair.End));
         }
         if (intervals.Count == 0) return true;
         var ordered = intervals.OrderBy(x => x.Start).ThenBy(x => x.End).ToArray();

@@ -1,0 +1,40 @@
+[
+  {
+    "id": "microsoft.netcore.app.runtime.win-x64",
+    "version": "10.0.13",
+    "file": "microsoft.netcore.app.runtime.win-x64.10.0.13.nupkg",
+    "source": "https://api.nuget.org/v3-flatcontainer/microsoft.netcore.app.runtime.win-x64/10.0.13/microsoft.netcore.app.runtime.win-x64.10.0.13.nupkg",
+    "catalog": "https://api.nuget.org/v3/catalog0/data/2026.10.13.17.53.21/microsoft.netcore.app.runtime.win-x64.10.0.13.json",
+    "sha512Base64": "55suoRAIf6dVjOdPhHxIElDa2GBoqVZI70bG4zq+f2pHQbGV6yDvztsXdit4pxc3Ea79X0Kfo78Kncjt9NauIQ==",
+    "notices": [
+      {
+        "entry": "LICENSE.TXT",
+        "path": "licenses/dotnet-10.0.13/NETCore-LICENSE.TXT",
+        "sha256": "D7A68596AB69B06F51CA278A6545148E4269A9381C26D597C13DF5D88E08CF5B",
+        "bytes": 1139
+      },
+      {
+        "entry": "THIRD-PARTY-NOTICES.TXT",
+        "path": "licenses/dotnet-10.0.13/NETCore-THIRD-PARTY-NOTICES.TXT",
+        "sha256": "6D15E10A101C6BFFF2AB4429ED061BF76C456FC4B23AD6B03E0D0F8377148A21",
+        "bytes": 78041
+      }
+    ]
+  },
+  {
+    "id": "microsoft.windowsdesktop.app.runtime.win-x64",
+    "version": "10.0.13",
+    "file": "microsoft.windowsdesktop.app.runtime.win-x64.10.0.13.nupkg",
+    "source": "https://api.nuget.org/v3-flatcontainer/microsoft.windowsdesktop.app.runtime.win-x64/10.0.13/microsoft.windowsdesktop.app.runtime.win-x64.10.0.13.nupkg",
+    "catalog": "https://api.nuget.org/v3/catalog0/data/2026.10.13.17.43.17/microsoft.windowsdesktop.app.runtime.win-x64.10.0.13.json",
+    "sha512Base64": "g8vz2rWeSNYimFNYUqXUy7yVkKJOQycy9ksNt59122iv+y7Y5KrR/PwoSCQgXO3KBJbf4uEdK0LuCr8OaVwQcw==",
+    "notices": [
+      {
+        "entry": "LICENSE",
+        "path": "licenses/dotnet-10.0.13/WindowsDesktop-LICENSE.txt",
+        "sha256": "A89886665765362EB77E0F8E26602C924520041D1711B2EEDC136434FE4D01AB",
+        "bytes": 1137
+      }
+    ]
+  }
+]

@@ -1,7 +1,8 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [string]$DotNetExecutable = 'dotnet'
 )
 
 Set-StrictMode -Version Latest
@@ -23,6 +24,13 @@ $taskEnvironment = [ordered]@{
     DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
     DOTNET_GENERATE_ASPNET_CERTIFICATE = 'false'
+    DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE = 'true'
+    DOTNET_NOLOGO = '1'
+    TEMP = Join-Path $taskOutput 'temp'
+    TMP = Join-Path $taskOutput 'temp'
+    NUGET_PACKAGES = Join-Path $taskOutput 'packages'
+    NUGET_HTTP_CACHE_PATH = Join-Path $taskOutput 'http-cache'
+    NUGET_PLUGINS_CACHE_PATH = Join-Path $taskOutput 'plugin-cache'
 }
 $taskPreviousEnvironment = [ordered]@{}
 foreach ($taskKey in $taskEnvironment.Keys) {
@@ -76,7 +84,7 @@ function Test-FileBytesEqual {
 
 $taskExpectedSdk = '9.0.318'
 $taskExpectedHash = '6B3D5C61F342C68D3C356DE726341AE93DD1C7321E7384C3892D42618A363EEE'
-$taskProject = Join-Path $taskRepository 'src/CodexUsage.Core/CodexUsage.Core.csproj'
+$taskProject = Join-Path $taskRepository 'historical/core-sdk9/CodexUsage.Core.csproj'
 $taskNuGetConfig = Join-Path $taskRepository 'NuGet.Config'
 $taskFrozen = Join-Path $taskRepository 'frozen-core/CodexUsage.Core.dll'
 # Keep this explicit: no session, log, authentication or other user-data discovery.
@@ -123,17 +131,19 @@ try {
     foreach ($taskKey in $taskEnvironment.Keys) {
         [Environment]::SetEnvironmentVariable($taskKey, $taskEnvironment[$taskKey], 'Process')
     }
-    [void](New-Item -ItemType Directory -Path $taskEnvironment.DOTNET_CLI_HOME)
-    Push-Location -LiteralPath $taskRepository
+    foreach ($taskDirectoryKey in @('DOTNET_CLI_HOME', 'TEMP', 'NUGET_PACKAGES', 'NUGET_HTTP_CACHE_PATH', 'NUGET_PLUGINS_CACHE_PATH')) {
+        [void](New-Item -ItemType Directory -Path $taskEnvironment[$taskDirectoryKey])
+    }
+    Push-Location -LiteralPath (Join-Path $taskRepository 'historical/core-sdk9')
     $taskLocationPushed = $true
 
-    & dotnet --version *> (Join-Path $taskOutput $taskResult.sdkVersionLog)
+    & $DotNetExecutable --version *> (Join-Path $taskOutput $taskResult.sdkVersionLog)
     if ($LASTEXITCODE -ne 0) { throw "dotnet --version failed with exit code $LASTEXITCODE." }
     $taskResult.sdk = (Get-Content -LiteralPath (Join-Path $taskOutput $taskResult.sdkVersionLog) -Raw).Trim()
     if ($taskResult.sdk -cne $taskExpectedSdk) {
         throw "Expected SDK $taskExpectedSdk; dotnet --version returned '$($taskResult.sdk)'."
     }
-    & dotnet --info *> (Join-Path $taskOutput $taskResult.dotnetInfoLog)
+    & $DotNetExecutable --info *> (Join-Path $taskOutput $taskResult.dotnetInfoLog)
     if ($LASTEXITCODE -ne 0) { throw "dotnet --info failed with exit code $LASTEXITCODE." }
 
     $taskResult.frozen = Get-FileEvidence -Path $taskFrozen
@@ -143,8 +153,8 @@ try {
     foreach ($taskSourceName in $taskSourceNames) {
         $taskResult.sourceFiles += Get-FileEvidence -Path (Join-Path $taskRepository "src/CodexUsage.Core/$taskSourceName")
     }
-    foreach ($taskInput in @($taskProject, (Join-Path $taskRepository 'Directory.Build.props'),
-            (Join-Path $taskRepository 'global.json'), $taskNuGetConfig)) {
+    foreach ($taskInput in @($taskProject, (Join-Path $taskRepository 'historical/core-sdk9/Directory.Build.props'),
+            (Join-Path $taskRepository 'historical/core-sdk9/global.json'), $taskNuGetConfig)) {
         $taskResult.buildInputs += Get-FileEvidence -Path $taskInput
     }
 
@@ -154,11 +164,11 @@ try {
         $taskBuildArguments = @('build', $taskProject, '--configuration', 'Release',
             '--artifacts-path', $taskArtifacts, '--configfile', $taskNuGetConfig,
             '--nologo', '--verbosity', 'minimal')
-        & dotnet @taskBuildArguments *> (Join-Path $taskOutput $taskBuildLog)
+        & $DotNetExecutable @taskBuildArguments *> (Join-Path $taskOutput $taskBuildLog)
         $taskBuildExitCode = $LASTEXITCODE
         $taskBuildResult = [ordered]@{
             pass = $taskPass
-            command = 'dotnet'
+            command = $DotNetExecutable
             arguments = $taskBuildArguments
             log = $taskBuildLog
             exitCode = $taskBuildExitCode

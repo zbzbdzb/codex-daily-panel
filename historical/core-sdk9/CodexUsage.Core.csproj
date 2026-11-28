@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>None</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/CodexUsage.Core/AccountQuota.cs" />
+    <Compile Include="../../src/CodexUsage.Core/CliThreadUsage.cs" />
+    <Compile Include="../../src/CodexUsage.Core/EventParser.cs" />
+    <Compile Include="../../src/CodexUsage.Core/IncrementalLogReader.cs" />
+    <Compile Include="../../src/CodexUsage.Core/LocalStateStore.cs" />
+    <Compile Include="../../src/CodexUsage.Core/LogMonitor.cs" />
+    <Compile Include="../../src/CodexUsage.Core/Models.cs" />
+    <Compile Include="../../src/CodexUsage.Core/OfficialAccountRpc.cs" />
+    <Compile Include="../../src/CodexUsage.Core/UsageEngine.cs" />
+  </ItemGroup>
+</Project>

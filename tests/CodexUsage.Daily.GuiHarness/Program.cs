@@ -36,11 +36,11 @@ internal static class Program
         Output = Path.GetFullPath(args[0]);
         Directory.CreateDirectory(Output);
         App = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
-        App.DispatcherUnhandledException += (_, e) => { Check("dispatcher_" + e.Exception.GetType().Name, false); e.Handled = true; App.Shutdown(1); };
+        App.DispatcherUnhandledException += (_, e) => { SaveError(e.Exception); Check("dispatcher_" + e.Exception.GetType().Name, false); e.Handled = true; App.Shutdown(1); };
         App.Startup += async (_, _) =>
         {
             try { await Run(); }
-            catch (Exception e) { Check("harness_" + e.GetType().Name, false); App.Shutdown(1); }
+            catch (Exception e) { SaveError(e); Check("harness_" + e.GetType().Name, false); App.Shutdown(1); }
         };
         var exit = App.Run();
         Controller?.Dispose();
@@ -57,29 +57,47 @@ internal static class Program
     {
         Window = new DailyWindow { ShowActivated = false, WindowStartupLocation = WindowStartupLocation.Manual, Left = -10000, Top = -10000 };
         App.MainWindow = Window;
-        var now = DateTimeOffset.Now;
+        Window.Configure(new PanelSettings(1, ThemePreference.Light, LanguagePreference.EnUS));
+        var zone = TimeZoneInfo.CreateCustomTimeZone("GuiHarnessUtcPlus8", TimeSpan.FromHours(8), "UTC+8", "UTC+8");
+        var now = new DateTimeOffset(2026, 10, 23, 12, 0, 0, TimeSpan.FromHours(8));
         var demo = new DailySnapshot(DateOnly.FromDateTime(now.DateTime), now, 120989545, 117878016, 639259, 353523,
             18252, 18041, 35.02, 4, 38, 0, 4, false, "演示数据 · 不读取真实日志", new WeeklyAllowance(27, now.AddDays(7), now.AddMinutes(-2)))
             { TimedTurnCount = 36, ExcludedTimingTurnCount = 2, ExcludedWaitSeconds = 4800 };
         Window.Update(demo, true);
+        Window.SetState(new DailyPresentationState { Snapshot = demo }, now, zone);
         Window.Show();
         await Idle();
         Check("window_460_by_640", Math.Abs(Window.ActualWidth - 460) < 1 && Math.Abs(Window.ActualHeight - 640) < 1);
         Check("popup_has_no_taskbar_entry", !Window.ShowInTaskbar);
         Check("popup_is_topmost", Window.Topmost);
-        Check("exact_input_subtitle", Texts().Contains("120,989,545 tokens"));
-        Check("exact_output_subtitle", Texts().Contains("639,259 tokens"));
+        Check("exact_input_subtitle", Texts().Contains("120,989,545") && ById<TextBlock>("TotalInput").ToolTip?.ToString() == "120,989,545");
+        Check("exact_output_subtitle", Texts().Contains("639,259") && ById<TextBlock>("TotalOutput").ToolTip?.ToString() == "639,259");
         Check("total_tokens_visible_and_exact", Texts().Contains("121.63M") && Window.CopyText.Contains("121,628,804"));
         Check("two_decimal_tps", Texts().Contains("35.02"));
-        Check("cache_rate_weighted", Texts().Contains("97.43%"));
-        Check("exact_reasoning", Texts().Contains("353,523"));
         Check("processing_includes_seconds", Texts().Contains("5h 04m 12s"));
         Check("copy_scope_and_precision", Window.CopyText.Contains("120,989,545") && Window.CopyText.Contains("subagents and cloud tasks excluded") && Window.CopyText.Contains("tool wait"));
-        Check("weekly_73_percent", Texts().Contains("73% left"));
+        Check("weekly_73_percent", Texts().Contains("73% remaining"));
         Check("normal_footer_visible", FooterFits());
-        Check("icon_actions_have_accessible_names", Descendants(Window).OfType<Button>().All(button => !string.IsNullOrWhiteSpace(AutomationProperties.GetName(button))));
-        Check("normal_body_fits", Descendants(Window).OfType<ScrollViewer>().First().ScrollableHeight < 1);
+        Check("icon_actions_have_accessible_names", new[] { "HidePanel", "CopyStats", "RefreshStats", "OpenLogs", "ExitPanel" }
+            .All(id => !string.IsNullOrWhiteSpace(AutomationProperties.GetName(ById<Button>(id)))));
+        Check("normal_body_fits", ById<ScrollViewer>("StatisticsScroll").ScrollableHeight < 1);
         Render("demo-640.png");
+        ById<Expander>("StatisticsDetails").IsExpanded = true;
+        await Idle();
+        Check("cache_rate_weighted", Texts().Contains("97.43%"));
+        Check("exact_reasoning", Texts().Contains("353,523"));
+        Check("expanded_details_scroll_without_hiding_footer", ById<ScrollViewer>("StatisticsScroll").ScrollableHeight > 0 && FooterFits());
+        ById<Expander>("Preferences").IsExpanded = true;
+        ById<ScrollViewer>("StatisticsScroll").ScrollToBottom();
+        await Idle();
+        Check("preferences_expanded_accessible_and_configured", ById<ComboBox>("ThemePreference").IsVisible
+            && ById<ComboBox>("LanguagePreference").IsVisible
+            && (ThemePreference)((ComboBoxItem)ById<ComboBox>("ThemePreference").SelectedItem).Tag == ThemePreference.Light
+            && (LanguagePreference)((ComboBoxItem)ById<ComboBox>("LanguagePreference").SelectedItem).Tag == LanguagePreference.EnUS);
+        Render("expanded-details-preferences.png");
+        ById<Expander>("Preferences").IsExpanded = false;
+        ById<Expander>("StatisticsDetails").IsExpanded = false;
+        ById<ScrollViewer>("StatisticsScroll").ScrollToTop();
 
         // Hand-derived: 100 output tokens / (10 seconds - 2 seconds TTFT) = 12.5 TPS.
         // This catches a displayed/exported fallback to the old full-turn denominator.
@@ -90,32 +108,50 @@ internal static class Program
             new StartEvent("timing-ui", "turn", finished.AddSeconds(-10)),
             new UsageEvent("timing-ui", "turn", "turn", "request", finished.AddSeconds(-1), 1, tokens, tokens, null),
             new CompletionEvent("timing-ui", "turn", finished, 10000, 2000)
-        }, DateOnly.FromDateTime(finished.UtcDateTime), TimeZoneInfo.Utc, now);
-        Window.Update(adjusted);
+        }, DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(finished, zone).DateTime), zone, now);
+        Window.SetDemo(false);
+        Window.SetState(new DailyPresentationState { Snapshot = adjusted }, now, zone);
         await Idle();
         Check("adjusted_timing_reaches_visible_tps_and_duration", Texts().Contains("12.50") && Texts().Contains("8.0s")
             && Window.CopyText.Contains("12.50 tok/s") && Window.CopyText.Contains("8.00 seconds"));
 
         var empty = demo with { InputTokens=null, CachedInputTokens=null, OutputTokens=null, ReasoningTokens=null, AverageTps=null,
-            ProcessingSeconds=null, ActiveSeconds=null, Weekly=null, ChatCount=0, TurnCount=0, SourceCount=0, Status="暂无今日可核验 token 记录" };
-        Window.Update(empty);
+            ProcessingSeconds=null, ActiveSeconds=null, Weekly=null, ChatCount=0, TurnCount=0, SourceCount=0, Status="暂无今日可核验 token 记录",
+            TimedTurnCount=0, ExcludedTimingTurnCount=0, ExcludedWaitSeconds=null, Issues=[new DailyIssue(DailyIssueCodes.NoTokens)] };
+        Window.SetState(new DailyPresentationState { Snapshot = empty }, now, zone);
         await Idle();
-        Check("unknown_does_not_become_zero", Texts().Contains("—") && !Texts().Contains("639.3K") && Window.CopyText.Contains("暂无数据"));
+        Check("unknown_does_not_become_zero", ById<TextBlock>("TotalTokens").Text == "—" && !Texts().Contains("639.3K") && Window.CopyText.Contains("Total tokens: Unavailable", StringComparison.Ordinal));
         Check("empty_badge", Texts().Contains("No data"));
         Render("empty.png");
 
-        Window.Update(demo with { IsPartial=true, Status="部分统计暂不可用；这是用于检查长状态提示和可读性的测试。", ActiveTurns=12 });
-        Window.SetBusy(true);
+        var legacyPartial = demo with { IsPartial=true, Status="部分统计暂不可用；这是用于检查长状态提示和可读性的测试。", ActiveTurns=12 };
+        Window.SetState(new DailyPresentationState { Snapshot = legacyPartial, IsBusy = true }, now, zone);
         await Idle();
-        Check("busy_refresh_disabled", !Descendants(Window).OfType<Button>().Single(b => b.ToolTip?.ToString()?.Contains("正在刷新") == true).IsEnabled);
-        Window.SetBusy(false);
+        var manualRequests = 0;
+        void Requested() => manualRequests++;
+        Window.RefreshRequested += Requested;
+        if (ById<Button>("RefreshStats").IsEnabled) ById<Button>("RefreshStats").RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        Window.RefreshRequested -= Requested;
+        Check("busy_manual_refresh_remains_actionable", ById<Button>("RefreshStats").IsEnabled
+            && ById<TextBlock>("UiActivity").Text.Contains("Refreshing", StringComparison.Ordinal) && manualRequests == 1);
+        Window.SetState(new DailyPresentationState { Snapshot = legacyPartial }, now, zone);
         await Idle();
-        Check("partial_badge_and_notice", Texts().Contains("Partial") && Texts().Any(t => t.StartsWith("部分统计暂不可用", StringComparison.Ordinal)));
+        Check("partial_badge_and_legacy_notice_compatibility", ById<TextBlock>("DataQuality").Text.Contains("Partial", StringComparison.Ordinal)
+            && ById<TextBlock>("DataIssues").Text.Contains("部分统计暂不可用", StringComparison.Ordinal)
+            && Window.CopyText.Contains("部分统计暂不可用", StringComparison.Ordinal));
         Render("partial.png");
+        var structuredPartial = legacyPartial with { Issues=[new DailyIssue(DailyIssueCodes.SourceUnreadable)] };
+        Window.SetState(new DailyPresentationState { Snapshot = structuredPartial }, now, zone);
+        await Idle();
+        Check("structured_partial_is_localized_without_guessing_status", ById<TextBlock>("DataQuality").Text == "Partial"
+            && ById<TextBlock>("DataIssues").Text.Contains("log", StringComparison.OrdinalIgnoreCase)
+            && !ById<TextBlock>("DataIssues").Text.Contains("部分统计暂不可用", StringComparison.Ordinal)
+            && Window.CopyText.Contains("verifiable subtotal", StringComparison.Ordinal));
+        ById<Expander>("StatisticsDetails").IsExpanded = true;
         Window.Height = 420;
         await Idle();
         Check("small_work_area_footer_visible", FooterFits());
-        var scroller = Descendants(Window).OfType<ScrollViewer>().First();
+        var scroller = ById<ScrollViewer>("StatisticsScroll");
         Check("small_work_area_scrolls", scroller.ScrollableHeight > 0);
         scroller.ScrollToBottom();
         await Idle();
@@ -131,21 +167,24 @@ internal static class Program
         var menu = (Forms.ContextMenuStrip)type.GetField("_menu", Flags)!.GetValue(Controller)!;
         Check("tray_visible", tray.Visible);
         Check("startup_is_tray_only", !Window.IsVisible && tray.Visible);
-        Check("tray_summary", tray.Text.Contains("35.0") && tray.Text.Contains("今日总 token 121.63M") && !tray.Text.Contains("输出"));
+        Check("tray_summary", tray.Text.Contains("35.0") && tray.Text.Contains("Daily total 121.63M tokens", StringComparison.Ordinal) && !tray.Text.Contains("output", StringComparison.OrdinalIgnoreCase));
         Window.Close();
         await Idle();
         Check("close_hides_but_retains_tray", !Window.IsVisible && tray.Visible);
-        var trayPoint = new System.Drawing.Point(Forms.Screen.FromPoint(Forms.Cursor.Position).WorkingArea.Right-24,
-            Forms.Screen.FromPoint(Forms.Cursor.Position).WorkingArea.Bottom-2);
-        var placementType=typeof(DailyWindow).Assembly.GetType("CodexUsage.DailyPanel.TrayPopupPlacement",true)!;
-        var anchorFixture=placementType.GetMethod("CaptureAnchor",BindingFlags.Static|BindingFlags.NonPublic,null,[typeof(System.Drawing.Point)],null)!.Invoke(null,[trayPoint]);
+        // Inject a synthetic offscreen work area. This tests placement through
+        // the controller/native bounds but is not physical-monitor acceptance.
+        var syntheticArea = new System.Drawing.Rectangle(-12000, -12000, 3840, 2088);
+        var trayPoint = new System.Drawing.Point(syntheticArea.Right - 24, syntheticArea.Bottom - 2);
+        var anchorType=typeof(DailyWindow).Assembly.GetType("CodexUsage.DailyPanel.TrayPopupAnchor",true)!;
+        var anchorFixture=Activator.CreateInstance(anchorType, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            null, [trayPoint, syntheticArea, 144u], null)!;
         type.GetField("_lastTrayPressAnchor",Flags)!.SetValue(Controller,anchorFixture);
         ((Forms.ToolStripMenuItem)menu.Items[0]).PerformClick();
         await Idle();
         Check("tray_open_restores_window", Window.IsVisible);
         var actualAnchor=type.GetField("_lastPopupAnchor",Flags)!.GetValue(Controller)!;
         Check("context_menu_reuses_actual_tray_anchor", (System.Drawing.Point)actualAnchor.GetType().GetProperty("Cursor")!.GetValue(actualAnchor)! == trayPoint);
-        Check("popup_stays_inside_current_monitor", InsideCurrentMonitor());
+        Check("popup_stays_inside_synthetic_work_area_geometry_only", InsideArea(syntheticArea));
         type.GetMethod("TogglePopup", Flags)!.Invoke(Controller, null);
         await Idle();
         Check("tray_second_click_hides_popup", !Window.IsVisible && tray.Visible);
@@ -158,11 +197,13 @@ internal static class Program
         await Idle();
         Check("outside_activation_hides_popup", !Window.IsVisible && tray.Visible);
         outside.Close();
-        var pause = menu.Items.OfType<Forms.ToolStripMenuItem>().Single(item => item.Text == "暂停自动刷新");
+        var pause = menu.Items.OfType<Forms.ToolStripMenuItem>().Single(item => item.Text == "Pause automatic refresh");
+        var scheduler = (RefreshCoordinator)type.GetField("_scheduler", Flags)!.GetValue(Controller)!;
         pause.PerformClick();
-        Check("pause_sets_state", pause.Checked && (bool)type.GetField("_paused", Flags)!.GetValue(Controller)!);
+        Check("pause_sets_state", pause.Checked && (bool)type.GetField("_paused", Flags)!.GetValue(Controller)! && scheduler.IsPaused
+            && Window.CopyText.Contains("Paused", StringComparison.Ordinal));
         pause.PerformClick();
-        Check("resume_clears_state", !pause.Checked && !(bool)type.GetField("_paused", Flags)!.GetValue(Controller)!);
+        Check("resume_clears_state", !pause.Checked && !(bool)type.GetField("_paused", Flags)!.GetValue(Controller)! && !scheduler.IsPaused);
         ((Forms.ToolStripMenuItem)menu.Items[2]).PerformClick();
         await Idle();
         Check("manual_refresh_completed", ((Task)type.GetField("_refresh", Flags)!.GetValue(Controller)!).IsCompletedSuccessfully);
@@ -171,7 +212,8 @@ internal static class Program
         Check("exit_removes_tray", !tray.Visible);
     }
 
-    private static void Check(string name, bool passed) { Checks.Add(new { name, passed }); Passed &= passed; }
+    private static void Check(string name, bool passed) { Checks.Add(new { name, passed }); Passed &= passed; Console.WriteLine((passed ? "PASS " : "FAIL ") + name); }
+    private static void SaveError(Exception error) => File.AppendAllText(Path.Combine(Output, "exceptions.log"), error + Environment.NewLine);
     private static Task Idle() => Window.Dispatcher.InvokeAsync(() => Window.UpdateLayout(), DispatcherPriority.ContextIdle).Task;
     private static IEnumerable<DependencyObject> Descendants(DependencyObject root)
     {
@@ -179,12 +221,12 @@ internal static class Program
         for (var i=0; i<VisualTreeHelper.GetChildrenCount(root); i++) foreach (var child in Descendants(VisualTreeHelper.GetChild(root,i))) yield return child;
     }
     private static string[] Texts() => Descendants(Window).OfType<TextBlock>().Where(text=>text.IsVisible).Select(text=>text.Text).ToArray();
-    private static bool FooterFits() => Descendants(Window).OfType<Button>().Where(button=>button.ToolTip?.ToString() is "退出面板" or "刷新统计")
-        .All(button => { var point=button.TranslatePoint(new Point(),Window); return point.Y>=0 && point.Y+button.ActualHeight<=Window.ActualHeight; });
-    private static bool InsideCurrentMonitor()
+    private static T ById<T>(string id) where T : DependencyObject => Descendants(Window).OfType<T>().Single(value => AutomationProperties.GetAutomationId(value) == id);
+    private static bool FooterFits() => new[] { "CopyStats", "RefreshStats", "OpenLogs", "ExitPanel" }.Select(ById<Button>)
+        .All(button => { var point=button.TranslatePoint(new Point(),Window); return button.IsVisible && button.ActualHeight > 0 && point.Y>=0 && point.Y+button.ActualHeight<=Window.ActualHeight; });
+    private static bool InsideArea(System.Drawing.Rectangle area)
     {
         GetWindowRect(new WindowInteropHelper(Window).Handle,out var rectangle);
-        var area=Forms.Screen.FromPoint(Forms.Cursor.Position).WorkingArea;
         return rectangle.Left>=area.Left && rectangle.Top>=area.Top && rectangle.Right<=area.Right && rectangle.Bottom<=area.Bottom;
     }
     [StructLayout(LayoutKind.Sequential)] private struct NativeRect { public int Left,Top,Right,Bottom; }

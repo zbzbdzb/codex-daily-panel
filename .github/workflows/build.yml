@@ -1,0 +1,55 @@
+name: Build and synthetic verification
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      DOTNET_GENERATE_ASPNET_CERTIFICATE: 'false'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.402
+            9.0.318
+      - name: Prepare explicit Microsoft runtime feed
+        shell: pwsh
+        run: |
+          $feed = Join-Path $env:RUNNER_TEMP 'codex-runtime-feed'
+          New-Item -ItemType Directory -Path $feed -ErrorAction Stop | Out-Null
+          $records = @()
+          foreach ($package in (Get-Content scripts/runtime-packages.json -Raw | ConvertFrom-Json)) {
+            $file = Join-Path $feed $package.file
+            Invoke-WebRequest -Uri $package.source -OutFile $file
+            $actual = [Convert]::ToBase64String([Security.Cryptography.SHA512]::HashData([IO.File]::ReadAllBytes($file)))
+            if ($actual -cne $package.sha512Base64) { throw "Microsoft package SHA512 mismatch: $($package.file)" }
+            $records += @{name=$package.file;url=$package.source;catalog=$package.catalog;sha512=$actual}
+          }
+          $records | ConvertTo-Json | Set-Content (Join-Path $feed 'download-verification.json')
+      - name: Verify build script behavior
+        shell: pwsh
+        run: |
+          ./scripts/test-build-scripts.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'codex-script-tests')
+      - name: Clean-source Release, regressions, historical bytes, package integrity
+        shell: pwsh
+        run: |
+          ./scripts/build-daily-panel.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'codex-build') -RuntimeFeed (Join-Path $env:RUNNER_TEMP 'codex-runtime-feed') -Package
+      - name: Preserve verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-synthetic-build-evidence
+          path: |
+            ${{ runner.temp }}/codex-script-tests
+            ${{ runner.temp }}/codex-build
+            ${{ runner.temp }}/codex-runtime-feed/download-verification.json
+          if-no-files-found: error
+          retention-days: 14

@@ -1,2 +1,6 @@
 # Preserve the recovered Core source bytes and their provenance checksums.
 src/CodexUsage.Core/*.cs -text
+# Preserve original historical build configuration and runtime redistribution notices.
+historical/core-sdk9/Directory.Build.props -text
+historical/core-sdk9/global.json -text
+licenses/dotnet-10.0.13/* -text
