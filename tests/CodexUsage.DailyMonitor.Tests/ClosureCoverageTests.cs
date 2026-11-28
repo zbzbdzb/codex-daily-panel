@@ -715,6 +715,63 @@ internal static class ClosureCoverageTests
             });
         }
 
+        await Case("CON-27 restoring starts alone cannot retire a missing return's range", async () =>
+        {
+            var sample = midnight.AddMinutes(20);
+            using var fixture = new Fixture("missing-return-rejoin", sample);
+            string call = Tool("function_call", "rejoin-pair", midnight.AddSeconds(1));
+            string result = Tool("function_call_output", "rejoin-pair", midnight.AddSeconds(20));
+            string completion = Modern("midnight", "rejoin-pair", "inferred-C", midnight.AddSeconds(14))
+                + Complete("inferred-C", midnight.AddSeconds(15));
+            string starts = firstStart + competingStart;
+            string older = Start("older", priorDay.AddSeconds(-1));
+            string live = fixture.WriteSession("live", midnightMeta + starts + call + completion);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            ExpectMidnightTiming(await monitor.RefreshAsync(sample), timed: true, lost: false, "one point only");
+
+            string anchorOnly = midnightMeta + older + call + completion;
+            ReplaceSession(fixture, live, anchorOnly);
+            ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(1)), timed: true, lost: false, "old call is still alone");
+            fixture.AppendSession(live, result);
+            ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(2)), timed: false, lost: true, "a genuine paired return extends the range");
+            ReplaceSession(fixture, live, anchorOnly);
+            ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(3)), timed: false, lost: true, "the observed return is missing");
+
+            ReplaceSession(fixture, live, midnightMeta + older + starts + call + completion);
+            ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(4)), timed: false, lost: true, "the original starts cannot stand in for the missing return");
+            ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(5)), timed: false, lost: true, "the pair stays pending on idle");
+            fixture.AppendSession(live, result);
+            ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(6)), timed: false, lost: false, "the exact return is restored; ownership remains ambiguous");
+            ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(7)), timed: false, lost: false, "complete but ambiguous on idle");
+        });
+
+        foreach (var (label, firstKind, firstSecond, nextKind, nextSecond) in new[]
+        {
+            ("two calls", "function_call", 1, "function_call", 20),
+            ("two returns", "function_call_output", 1, "function_call_output", 20),
+            ("backwards timestamps", "function_call", 20, "function_call_output", 1)
+        })
+        {
+            await Case($"CON-28 a raw anchor cannot pair with {label}", async () =>
+            {
+                var sample = midnight.AddMinutes(20);
+                using var fixture = new Fixture("unpaired-" + firstSecond + "-" + firstKind, sample);
+                string point = Tool(firstKind, "unpaired", midnight.AddSeconds(firstSecond));
+                string other = Tool(nextKind, "unpaired", midnight.AddSeconds(nextSecond));
+                string completion = Modern("midnight", "unpaired", "inferred-C", midnight.AddSeconds(14))
+                    + Complete("inferred-C", midnight.AddSeconds(15));
+                string live = fixture.WriteSession("live", midnightMeta + firstStart + competingStart + point + completion);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample), timed: true, lost: false, "the old singleton is outside the completion");
+                string anchorOnly = midnightMeta + Start("older", priorDay.AddSeconds(-1)) + point + completion;
+                ReplaceSession(fixture, live, anchorOnly);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(1)), timed: true, lost: false, "the raw old point remains outside");
+                fixture.AppendSession(live, other);
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(2)), timed: true, lost: false, "the new row does not prove a wait");
+                ExpectMidnightTiming(await monitor.RefreshAsync(sample.AddSeconds(3)), timed: true, lost: false, "no invented range on idle");
+            });
+        }
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));

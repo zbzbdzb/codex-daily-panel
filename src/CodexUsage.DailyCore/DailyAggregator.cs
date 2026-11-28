@@ -149,7 +149,7 @@ public static class DailyAggregator
             .Select(x => (Session: x.SessionKey, Turn: x.TurnKey!)).ToHashSet();
         var untimedStarts = timingUnavailable.Where(x => x.StartTimestamp.HasValue)
             .Select(x => (x.SessionKey, x.StartTimestamp!.Value)).ToHashSet();
-        var uncertainToolWindows = UncertainToolWindows(timingUnavailable, toolRows, now);
+        var uncertainToolWindows = UncertainToolWindows(timingUnavailable, now);
         // A call identity crossing turn boundaries is ambiguous even when both
         // sides carry turn keys. Do not independently pair a replay under a new turn.
         foreach (var group in toolRows.Where(x => !string.IsNullOrWhiteSpace(x.CallKey))
@@ -648,14 +648,12 @@ public static class DailyAggregator
     }
 
     private static Dictionary<string, DailyTimingWindow[]> UncertainToolWindows(
-        DailyTimingUnavailableEvent[] unavailable, DailyToolEvent[] tools, DateTimeOffset now)
+        DailyTimingUnavailableEvent[] unavailable, DateTimeOffset now)
     {
         // A duration-derived interval has no explicit start identity to match
         // against the tool's group. Keep bounded time evidence for that case.
-        var windows = DailyTimingWindow.UncertainCalls(unavailable, tools, now)
-            .Select(x => (Session: x.Key.Session, Window: x.Value))
-            .Concat(unavailable.Where(x => x.ObservedToolWait is null && x.StartTimestamp.HasValue && x.ToolCallKey is null)
-                .Select(x => (Session: x.SessionKey, Window: new DailyTimingWindow(x.Timestamp, x.Timestamp))))
+        var windows = unavailable.Where(x => x.ObservedToolWait is null && x.StartTimestamp.HasValue)
+            .Select(x => (Session: x.SessionKey, Window: new DailyTimingWindow(x.Timestamp, x.Timestamp)))
             .Concat(unavailable.Where(x => x.ObservedToolWait.HasValue)
                 .Select(x => (Session: x.SessionKey, Window: x.ObservedToolWait!.Value)));
         return windows.Where(x => x.Window.IsObservedAt(now)).GroupBy(x => x.Session, StringComparer.Ordinal).ToDictionary(group => group.Key, group =>
@@ -695,10 +693,9 @@ public static class DailyAggregator
                 || x.Timestamp == DateTimeOffset.MinValue || x.Timestamp > now
                 || x.Timestamp < declaredStart || x.Timestamp > completedAt
                 || explicitStart is { } began && x.Timestamp < began)) return false;
-            var starts = rows.Where(x => x.Phase == DailyToolPhase.Call).ToArray();
-            var ends = rows.Where(x => x.Phase == DailyToolPhase.Result).ToArray();
-            if (starts.Length != 1 || ends.Length != 1 || ends[0].Timestamp <= starts[0].Timestamp) return false;
-            intervals.Add((starts[0].Timestamp, ends[0].Timestamp));
+            if (DailyTimingWindow.TryPair(rows.Select(x => new DailyToolEndpoint(x.Phase, x.Timestamp)), now) is not { } pair)
+                return false;
+            intervals.Add((pair.Start, pair.End));
         }
         if (intervals.Count == 0) return true;
         var ordered = intervals.OrderBy(x => x.Start).ThenBy(x => x.End).ToArray();

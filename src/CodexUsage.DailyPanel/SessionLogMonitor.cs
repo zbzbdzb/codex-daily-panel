@@ -302,7 +302,7 @@ public sealed class SessionLogMonitor : IDisposable
         // contribution. It is needed only while its session still has candidates.
         var events = new HashSet<(string Digest, TimingScopeKey? Scope)>();
         foreach (var row in source.Evidence.Where(x => required.Contains(x.Event) && x.Event is not MetadataEvent { IsChild: true }))
-            events.Add((CoverageDigest(row), RetiredTimingScope(row.Event)));
+            events.Add((CoverageDigest(row), TimingScope(row.Event)));
 
         var guards = CaptureGuards(source, exclusions, conflicts).Distinct().ToList();
         if (events.Count == 0 && guards.Count == 0 && !source.BadStatistics && !source.PendingLine && !source.HasMore
@@ -364,7 +364,8 @@ public sealed class SessionLogMonitor : IDisposable
             ? checkedSources.Where(source => source.Facts.Any(x => x.RawTimingDigest is not null))
                 .Select(source => (source.Reader, Digests: source.Facts.Select(CoverageDigest).ToHashSet(StringComparer.Ordinal),
                     Timing: source.Facts.Where(x => x.RawTimingDigest is not null)
-                        .ToLookup(x => x.RawTimingDigest!, x => x.Event, StringComparer.Ordinal))).ToArray()
+                        .ToLookup(x => x.RawTimingDigest!, x => x.Event, StringComparer.Ordinal),
+                    Pairs: IndexPairs(SourceWaitPairs(source.Facts, _refreshAt)))).ToArray()
             : [];
         var completeSources = new Dictionary<CoverageLoss, HashSet<DailyLogReader>>(ReferenceEqualityComparer.Instance);
         foreach (var loss in _coverageLosses)
@@ -396,7 +397,9 @@ public sealed class SessionLogMonitor : IDisposable
                     var key = (source.Reader, history);
                     if (!historyMatches.TryGetValue(key, out var matches))
                         historyMatches[key] = matches = history.Facts.Split('\n').All(source.Digests.Contains);
-                    return matches && (owned && completeSources.TryGetValue(item.Loss, out var covered) && covered.Contains(source.Reader)
+                    return matches && (item.Guard.ObservedPair is null
+                            || source.Pairs.GetValueOrDefault(item.Guard.Digest) == item.Guard.ObservedPair)
+                        && (owned && completeSources.TryGetValue(item.Loss, out var covered) && covered.Contains(source.Reader)
                         || unavailable.Any(row => CoversTiming(row, item.Guard.Evidence, starts)));
                 }
                 if (!group.All(ProvesConstraint)) continue;
@@ -404,10 +407,16 @@ public sealed class SessionLogMonitor : IDisposable
                 break;
             }
 
-        var pendingAnchors = ownershipGroups.Where(group => !provenOwnership.Contains(group.Key))
-            .ToDictionary(group => group.Key, group => (DailyTimingUnavailableEvent)group.First().Guard.Evidence,
-                StringComparer.Ordinal);
-        var observedWaits = ExtendRetiredWaits(timingSources.Select(source => source.Timing), pendingAnchors, _refreshAt);
+        // A late counterpart is relevant only beside the exact retained raw
+        // anchor. Keep the first witnessed pair, including the new dependency.
+        var newPairs = new Dictionary<string, ObservedToolPair>(StringComparer.Ordinal);
+        foreach (var group in ownershipGroups.Where(group => !provenOwnership.Contains(group.Key)
+                     && group.All(x => x.Guard.ObservedPair is null)))
+        {
+            var candidates = timingSources.Select(source => source.Pairs.GetValueOrDefault(group.Key))
+                .OfType<ObservedToolPair>().Distinct().Take(2).ToArray();
+            if (candidates is [var pair]) newPairs.Add(group.Key, pair);
+        }
         foreach (var loss in _coverageLosses.ToArray())
         {
             int before = GuardEvidenceCount(loss.Guards);
@@ -415,39 +424,14 @@ public sealed class SessionLogMonitor : IDisposable
                 ? provenOwnership.Contains(guard.Digest) : ProvesGuard(guard));
             for (int i = 0; i < loss.Guards.Count; i++)
                 if (loss.Guards[i] is TimingGuard { Ownership: not null } pending
-                    && observedWaits.TryGetValue(pending.Digest, out var wait))
-                    loss.Guards[i] = pending with { ObservedWait = pending.ObservedWait?.Include(wait) ?? wait };
+                    && newPairs.TryGetValue(pending.Digest, out var pair))
+                    loss.Guards[i] = pending with { ObservedPair = pair };
             _coverageEvidenceCount -= before - GuardEvidenceCount(loss.Guards);
             if (!loss.PositiveResolved || loss.Guards.Count > 0) continue;
             _coverageLosses.Remove(loss);
             _coverageEvidenceCount -= loss.EvidenceCount;
         }
         return new(hashes, projections, RootTimes(current.OfType<MetadataEvent>().Concat(ChildEvidence())));
-    }
-
-    private static Dictionary<string, DailyTimingWindow> ExtendRetiredWaits(
-        IEnumerable<ILookup<string, StatsEvent>> checkedTiming, Dictionary<string, DailyTimingUnavailableEvent> pending,
-        DateTimeOffset now)
-    {
-        var observed = new Dictionary<string, DailyTimingWindow>(StringComparer.Ordinal);
-        if (pending.Count == 0) return observed;
-        foreach (var timing in checkedTiming)
-        {
-            var anchors = timing.Where(group => pending.ContainsKey(group.Key))
-                .Select(group => (Digest: group.Key, Point: pending[group.Key]))
-                .Where(x => x.Point.ToolCallKey is not null && x.Point.Timestamp != DateTimeOffset.MinValue && x.Point.Timestamp <= now)
-                .ToArray();
-            if (anchors.Length == 0) continue;
-            // The exact old raw row must be present beside the newly observed
-            // endpoint. A matching call key in another reader is not proof.
-            var events = timing.SelectMany(group => group);
-            var windows = DailyTimingWindow.UncertainCalls(anchors.Select(x => x.Point)
-                .Concat(events.OfType<DailyTimingUnavailableEvent>()), events.OfType<DailyToolEvent>(), now);
-            foreach (var (digest, point) in anchors)
-                if (windows.TryGetValue((point.SessionKey, point.ToolCallKey!), out var wait) && wait.Start != wait.End)
-                    observed[digest] = observed.TryGetValue(digest, out var previous) ? previous.Include(wait) : wait;
-        }
-        return observed;
     }
 
     private static bool CoversTiming(DailyTimingUnavailableEvent current, StatsEvent previous,
@@ -487,8 +471,12 @@ public sealed class SessionLogMonitor : IDisposable
         private readonly int _hash = StringComparer.Ordinal.GetHashCode(Facts);
         public override int GetHashCode() => _hash;
     }
+    // One exact pair per existing bounded guard. Its bounds are used for
+    // relevance only; both original row identities are required for release.
+    private sealed record ObservedToolPair(string CallDigest, string ResultDigest, DailyTimingWindow Window);
+    private readonly record struct RawToolEndpoint(string Digest, string Session, string Call, DailyToolEndpoint Endpoint, bool Uncertain);
     private sealed record TimingGuard(string Hash, StatsEvent Evidence, ToolOwnershipHistory? Ownership = null,
-        DailyTimingWindow? ObservedWait = null)
+        ObservedToolPair? ObservedPair = null)
         : ExclusionGuard(Hash, Evidence.SessionKey);
     private sealed record StartOrderGuard(string Hash, StartEvent Evidence) : ExclusionGuard(Hash, Evidence.SessionKey);
     private sealed record ClosureGuard(string Hash, DailyClosureFact Fact) : ExclusionGuard(Hash, Fact.Session);
@@ -509,27 +497,62 @@ public sealed class SessionLogMonitor : IDisposable
     private static int GuardEvidenceCount(List<ExclusionGuard> guards) => guards.Count
         + guards.OfType<TimingGuard>().Select(x => x.Ownership).OfType<ToolOwnershipHistory>().Distinct().Sum(x => x.Count);
 
+    private static RawToolEndpoint? ToolEndpoint(DailySourceEvidence fact) => fact.RawTimingDigest is { } digest
+        ? fact.Event switch
+        {
+            DailyToolEvent { CallKey: { } key } tool =>
+                new(digest, tool.SessionKey, key, new(tool.Phase, tool.Timestamp), false),
+            DailyTimingUnavailableEvent { StartTimestamp: not null, ToolCallKey: { } key, ToolPhase: { } phase } row =>
+                new(digest, row.SessionKey, key, new(phase, row.Timestamp), true),
+            _ => null
+        } : null;
+
+    private static IEnumerable<(string Session, ObservedToolPair Pair, bool Uncertain)> SourceWaitPairs(
+        IEnumerable<DailySourceEvidence> evidence, DateTimeOffset now)
+    {
+        var endpoints = evidence.Select(ToolEndpoint).OfType<RawToolEndpoint>()
+            .Where(x => x.Endpoint.Timestamp != DateTimeOffset.MinValue && x.Endpoint.Timestamp <= now);
+        foreach (var group in endpoints.GroupBy(x => (x.Session, x.Call)))
+        {
+            // Multiple projections and byte-identical replays are one endpoint.
+            var raw = group.DistinctBy(x => x.Digest).Take(3).ToArray();
+            if (DailyTimingWindow.TryPair(raw.Select(x => x.Endpoint), now) is not { } window) continue;
+            var call = raw.Single(x => x.Endpoint.Phase == DailyToolPhase.Call);
+            var result = raw.Single(x => x.Endpoint.Phase == DailyToolPhase.Result);
+            yield return (group.Key.Session, new(call.Digest, result.Digest, window), group.Any(x => x.Uncertain));
+        }
+    }
+
+    private static Dictionary<string, ObservedToolPair> IndexPairs(IEnumerable<(string Session, ObservedToolPair Pair, bool Uncertain)> pairs)
+    {
+        var indexed = new Dictionary<string, ObservedToolPair>(StringComparer.Ordinal);
+        foreach (var (_, pair, _) in pairs)
+        {
+            indexed.Add(pair.CallDigest, pair);
+            indexed.Add(pair.ResultDigest, pair);
+        }
+        return indexed;
+    }
+
     private IEnumerable<ExclusionGuard> CaptureGuards(Source source, HashSet<StatsEvent> exclusions,
         ISet<(string Session, string Request)> conflicts)
     {
-        var guards = source.Evidence.Where(x => exclusions.Contains(x.Event)).Select(x => CreateGuard(x, conflicts))
+        var evidence = source.Evidence.ToArray();
+        var guards = evidence.Where(x => exclusions.Contains(x.Event)).Select(x => CreateGuard(x, conflicts))
             .OfType<ExclusionGuard>().ToArray();
-        var timingRows = guards.OfType<TimingGuard>().Select(x => x.Evidence).ToArray();
-        var uncertainRows = timingRows.OfType<DailyTimingUnavailableEvent>().ToArray();
-        var cohorts = uncertainRows.Where(x => x.StartTimestamp.HasValue)
+        var cohorts = guards.OfType<TimingGuard>().Select(x => x.Evidence).OfType<DailyTimingUnavailableEvent>()
+            .Where(x => x.StartTimestamp.HasValue)
             .Select(x => (x.SessionKey, x.StartTimestamp!.Value)).ToHashSet();
         if (cohorts.Count == 0) return guards;
 
-        // Capture bounds while both endpoints can still be checked in this
-        // source. Both guards retain the bound in case only one is later proved.
-        var waits = DailyTimingWindow.UncertainCalls(uncertainRows, timingRows.OfType<DailyToolEvent>(), _refreshAt);
+        var pairs = IndexPairs(SourceWaitPairs(evidence, _refreshAt));
         // ProjectOwnership uses the starts in the tool's group and the latest
         // observed end per member. Save those exact dependencies, not all prior
         // history or the subset that contributes to today's counters.
-        var ends = source.Events.Where(x => x is CompletionEvent or DailyTurnAbortedEvent && x.Timestamp <= _refreshAt)
+        var ends = evidence.Select(x => x.Event).Where(x => x is CompletionEvent or DailyTurnAbortedEvent && x.Timestamp <= _refreshAt)
             .Select(x => (Event: x, Turn: TimingTurn(x))).Where(x => x.Turn.HasValue).GroupBy(x => x.Turn!.Value)
             .ToDictionary(x => x.Key, x => x.MaxBy(y => y.Event.Timestamp).Event);
-        var histories = source.Events.OfType<StartEvent>().Where(x => cohorts.Contains((x.SessionKey, x.Timestamp)))
+        var histories = evidence.Select(x => x.Event).OfType<StartEvent>().Where(x => cohorts.Contains((x.SessionKey, x.Timestamp)))
             .GroupBy(x => (x.SessionKey, x.Timestamp)).ToDictionary(group => group.Key, group =>
             {
                 var facts = new HashSet<string>(StringComparer.Ordinal);
@@ -541,22 +564,9 @@ public sealed class SessionLogMonitor : IDisposable
                 }
                 return new ToolOwnershipHistory(string.Join('\n', facts.Order(StringComparer.Ordinal)), facts.Count);
             });
-        return guards.Select(guard =>
-        {
-            if (guard is not TimingGuard timing) return guard;
-            var key = timing.Evidence switch
-            {
-                DailyTimingUnavailableEvent row => row.ToolCallKey,
-                DailyToolEvent tool => tool.CallKey,
-                _ => null
-            };
-            var ownership = timing.Evidence is DailyTimingUnavailableEvent { StartTimestamp: { } at }
-                ? histories.GetValueOrDefault((timing.Session, at)) : null;
-            var time = timing.Evidence.Timestamp;
-            DailyTimingWindow? wait = time != DateTimeOffset.MinValue && time <= _refreshAt && key is not null
-                && waits.TryGetValue((timing.Session, key), out var bound) ? bound : null;
-            return timing with { Ownership = ownership, ObservedWait = wait };
-        });
+        return guards.Select(guard => guard is TimingGuard { Evidence: DailyTimingUnavailableEvent { StartTimestamp: { } at } } timing
+            && histories.TryGetValue((timing.Session, at), out var ownership)
+                ? timing with { Ownership = ownership, ObservedPair = pairs.GetValueOrDefault(timing.Digest) } : guard);
     }
 
     private IEnumerable<ExclusionGuard> Guards() => _coverageLosses.SelectMany(x => x.Guards).Concat(_unreadableGuards);
@@ -586,21 +596,18 @@ public sealed class SessionLogMonitor : IDisposable
     // Metadata and unscoped legacy rows participate in coverage without supplying
     // a turn's timing. A timing row with no turn still constrains the session.
     private readonly record struct TimingScopeKey(string Session, string? Turn, DateTimeOffset? Start = null,
-        DateTimeOffset? At = null, string? ToolCall = null)
+        DateTimeOffset? At = null)
     {
-        public DailyTimingUnavailableEvent UnavailableAt(DateTimeOffset now) => new(Session, Turn, At ?? now, Start, ToolCall);
+        public DailyTimingUnavailableEvent UnavailableAt(DateTimeOffset now) => new(Session, Turn, At ?? now, Start);
     }
 
     private static TimingScopeKey? TimingScope(StatsEvent row) => row switch
     {
         MetadataEvent or QuotaEvent or UsageEvent { Legacy: true, TurnKey: null } => null,
         DailyTimingUnavailableEvent { StartTimestamp: { } start } tool =>
-            new(tool.SessionKey, tool.TurnKey, start, tool.Timestamp, tool.ToolCallKey),
+            new(tool.SessionKey, tool.TurnKey, start, tool.Timestamp),
         _ => new(row.SessionKey, TimingTurn(row)?.Turn)
     };
-
-    private static TimingScopeKey? RetiredTimingScope(StatsEvent row) =>
-        TimingScope(row) is { } scope ? scope with { ToolCall = null } : null;
 
     private static IEnumerable<DailyTimingUnavailableEvent> UnverifiedTiming(Source[] sources,
         VerifiedTimingEvidence verified, DateTimeOffset now)
@@ -703,7 +710,7 @@ public sealed class SessionLogMonitor : IDisposable
             && (!view.MetadataTimes.TryGetValue(child.Session, out var latest) || latest <= child.Relation.Timestamp),
         TimingGuard timing => view.Roots.Contains(timing.Session)
             && (TimingScope(timing.Evidence) is { } scope && ScopeRelevant(scope, view)
-                || timing.ObservedWait is { } wait && WaitRelevant(timing.Session, wait, view)
+                || timing.ObservedPair is { Window: var wait } && WaitRelevant(timing.Session, wait, view)
                 || timing.Evidence is DailyToolEvent { CallKey: { } call } && view.Calls.ContainsKey((timing.Session, call))),
         // Activity qualification is compared in Summarize itself, using the same
         // closure/latest/recent rules that decide ActiveTurns and ActiveSeconds.
@@ -752,8 +759,8 @@ public sealed class SessionLogMonitor : IDisposable
             foreach (var guard in loss.Guards.OfType<TimingGuard>())
             {
                 if (!view.Roots.Contains(guard.Session)) continue;
-                if (RetiredTimingScope(guard.Evidence) is { } timingScope && ScopeRelevant(timingScope, view)) scopes.Add(timingScope);
-                if (guard.ObservedWait is { } wait && WaitRelevant(guard.Session, wait, view)) waits.Add((guard.Session, wait));
+                if (TimingScope(guard.Evidence) is { } timingScope && ScopeRelevant(timingScope, view)) scopes.Add(timingScope);
+                if (guard.ObservedPair is { Window: var wait } && WaitRelevant(guard.Session, wait, view)) waits.Add((guard.Session, wait));
                 if (guard.Evidence is DailyToolEvent { CallKey: { } call }) calls.Add((guard.Session, call));
             }
         }
@@ -996,7 +1003,19 @@ public sealed class SessionLogMonitor : IDisposable
         }
         public IEnumerable<StatsEvent> SummaryEvents(DateTimeOffset now)
         {
-            if (!ReadFailed) foreach (var item in Events) yield return item;
+            if (!ReadFailed)
+            {
+                bool hasScopedTool = false;
+                foreach (var item in Events)
+                {
+                    hasScopedTool |= item is DailyTimingUnavailableEvent { StartTimestamp: not null, ToolPhase: not null };
+                    yield return item;
+                }
+                if (hasScopedTool)
+                    foreach (var (session, pair, uncertain) in SourceWaitPairs(Evidence, now))
+                        if (uncertain)
+                            yield return new DailyTimingUnavailableEvent(session, null, pair.Window.Start) { ObservedToolWait = pair.Window };
+            }
             // This evidence is transient for a half-line/backlog, and persistent for damaged or
             // capped input. Token totals keep their existing partial semantics.
             if (HasMore || PendingLine || ReadFailed || UncertainTail || BadStatistics || TimingUnavailable || _unassociatedTiming)

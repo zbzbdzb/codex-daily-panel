@@ -221,9 +221,11 @@ internal sealed class DailyToolTimingParser(string sourceKey)
                 else
                 {
                     var start = starts.ContainsKey((tool.SessionKey, tool.Start)) ? tool.Start : (DateTimeOffset?)null;
-                    yield return row with { Event = new DailyTimingUnavailableEvent(tool.SessionKey, null, tool.Timestamp, start, tool.CallKey) };
+                    var unavailable = new DailyTimingUnavailableEvent(tool.SessionKey, null, tool.Timestamp, start, tool.CallKey)
+                        { ToolPhase = tool.Phase };
+                    yield return row with { Event = unavailable };
                     if (start is not null && eventGroups.TryGetValue(tool, out var actualStart) && actualStart != start)
-                        yield return row with { Event = new DailyTimingUnavailableEvent(tool.SessionKey, null, tool.Timestamp, actualStart, tool.CallKey) };
+                        yield return row with { Event = unavailable with { StartTimestamp = actualStart } };
                 }
             }
         }
