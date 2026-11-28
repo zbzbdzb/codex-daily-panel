@@ -128,8 +128,8 @@ internal static class ToolTimingTests
                 null, "unsupported tool kind cannot be treated as zero wait");
             await CheckRows(metadata + began + Row("event_msg", start, new { type = "task_started", turn_id = "another-turn" })
                 + Tool("function_call", 2) + Tool("function_call_output", 5) + usage + complete, null, "ambiguous active lifecycles exclude tool timing");
-            string tied = metadata + began
-                + Row("event_msg", start, new { type = "task_started", turn_id = "another-turn" });
+            string siblingStart = Row("event_msg", start, new { type = "task_started", turn_id = "another-turn" });
+            string tied = metadata + began + siblingStart;
             var tokens40 = new { input_tokens = 100, cached_input_tokens = 50, output_tokens = 40, reasoning_output_tokens = 0, total_tokens = 140 };
             string finish = Row("token_usage_record", start.AddSeconds(9), new
             {
@@ -138,6 +138,38 @@ internal static class ToolTimingTests
             }) + complete;
             string implicitTools = Tool("function_call", 2) + Tool("function_call_output", 5);
             string explicitTools = Tool("function_call", 2, turn: "turn") + Tool("function_call_output", 5, turn: "turn");
+            foreach (string endType in new[] { "task_aborted", "turn_aborted", "task_complete" })
+            {
+                bool completedSibling = endType == "task_complete";
+                string EndSibling(int seconds) => Row("event_msg", start.AddSeconds(seconds), new
+                {
+                    type = endType, turn_id = "another-turn", duration_ms = seconds * 1000, time_to_first_token_ms = 0
+                });
+                foreach (int endAt in new[] { 2, 3, 20 })
+                {
+                    string end = EndSibling(endAt);
+                    foreach (bool endFirst in new[] { false, true })
+                    {
+                        string middle = endFirst ? end + implicitTools : implicitTools + end;
+                        CheckLifecycleTiming(await ReadRows(tied + middle + finish), null, false, Math.Max(10, endAt),
+                            $"{endType}: an untagged tool pair at +2/+5s with sibling end at +{endAt}s has uncertain ownership (end row first: {endFirst})",
+                            unreconciledSibling: completedSibling);
+                    }
+                }
+                string earlyEnd = EndSibling(1);
+                CheckLifecycleTiming(await ReadRows(tied + earlyEnd + earlyEnd + implicitTools + finish), 6, false, 10,
+                    $"{endType}: replayed early sibling end leaves one owner at both tool timestamps",
+                    unreconciledSibling: completedSibling);
+                CheckLifecycleTiming(await ReadRows(tied + earlyEnd + siblingStart + implicitTools + finish), 6, false, 10,
+                    $"{endType}: exact sibling start replay does not erase an observed end",
+                    unreconciledSibling: completedSibling);
+                CheckLifecycleTiming(await ReadRows(tied + EndSibling(20) + explicitTools + finish), 6, false, 20,
+                    $"{endType}: an overlapping sibling does not invalidate an explicitly owned tool pair",
+                    unreconciledSibling: completedSibling);
+                CheckLifecycleTiming(await ReadRows(tied + EndSibling(20) + finish + explicitTools), 6, false, 20,
+                    $"{endType}: delayed explicit tools fit their own completed turn's observed interval",
+                    unreconciledSibling: completedSibling);
+            }
             foreach (string abortType in new[] { "task_aborted", "turn_aborted" })
             {
                 string Abort(string turn, DateTimeOffset at) => Row("event_msg", at, new { type = abortType, turn_id = turn });

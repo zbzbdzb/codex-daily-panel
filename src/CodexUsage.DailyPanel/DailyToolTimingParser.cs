@@ -12,8 +12,9 @@ namespace CodexUsage.DailyPanel;
 /// independent of token parser context, which late usage corrections can move to an older turn.</summary>
 internal sealed class DailyToolTimingParser(string sourceKey)
 {
-    private const int MaximumActiveTurns = 128;
-    private readonly HashSet<string> _active = new(StringComparer.Ordinal);
+    private const int MaximumTrackedTurns = 128;
+    // Turns at the latest start timestamp, including any observed ends.
+    private readonly Dictionary<string, DateTimeOffset?> _turnEnds = new(StringComparer.Ordinal);
     private string _session = sourceKey;
     private DateTimeOffset? _latestStart;
     private bool _lifecycleUncertain;
@@ -35,7 +36,7 @@ internal sealed class DailyToolTimingParser(string sourceKey)
                 var metadata = statistics.OfType<MetadataEvent>().SingleOrDefault();
                 // Invalid metadata can change session identity, so it has no reliable turn scope.
                 if (metadata is null) return SessionUnavailable(DateTimeOffset.MinValue);
-                if (_session != metadata.SessionKey) { _active.Clear(); _latestStart = null; _lifecycleUncertain = false; }
+                if (_session != metadata.SessionKey) { _turnEnds.Clear(); _latestStart = null; _lifecycleUncertain = false; }
                 _session = metadata.SessionKey;
                 return [];
             }
@@ -72,24 +73,25 @@ internal sealed class DailyToolTimingParser(string sourceKey)
                     {
                         // Root-turn starts are successors: an older turn may have no completion
                         // after compaction/interruption. Same-time distinct starts remain ambiguous.
-                        _active.Clear();
+                        _turnEnds.Clear();
                         _latestStart = time;
                     }
-                    if (_active.Count >= MaximumActiveTurns && !_active.Contains(turn))
+                    if (_turnEnds.Count >= MaximumTrackedTurns && !_turnEnds.ContainsKey(turn))
                     {
                         _lifecycleUncertain = true;
                         // Dropped lifecycle state makes subsequent ownership uncertain session-wide.
                         return SessionUnavailable(time);
                     }
-                    _active.Add(turn);
+                    _turnEnds.TryAdd(turn, null);
                 }
                 else
                 {
-                    // All active identities share the latest start time. Keep
-                    // the terminal fact for aggregation even when it cannot
-                    // narrow this source's tool ownership candidates.
-                    if (_latestStart is not { } started || time >= started)
-                        _active.Remove(turn);
+                    // Retain the latest eligible end for this turn so delayed
+                    // tools are checked at their own timestamps. Preserve raw
+                    // terminal facts for aggregation, including conflicts.
+                    if (_latestStart is { } started && time >= started
+                        && _turnEnds.TryGetValue(turn, out var priorEnd) && (priorEnd is null || time > priorEnd.Value))
+                        _turnEnds[turn] = time;
                     if (abort) return [new DailyTurnAbortedEvent(abortSessionKey, turn, time)];
                 }
                 return [];
@@ -110,11 +112,11 @@ internal sealed class DailyToolTimingParser(string sourceKey)
             bool malformedTurn = Field(payload, "turn_id").ValueKind != JsonValueKind.Undefined && payloadTurn is null
                 || Field(root, "turn_id").ValueKind != JsonValueKind.Undefined && rootTurn is null
                 || rootTurn is not null && payloadTurn is not null && rootTurn != payloadTurn;
-            string? turnKey = explicitTurn ?? (_active.Count == 1 ? _active.Single() : null);
-            if (_lifecycleUncertain || malformedTurn || turnKey is null || !_active.Contains(turnKey)
-                || callKey is null || time == DateTimeOffset.MinValue)
+            string? turnKey = explicitTurn ?? UniqueOwnerAt(time);
+            bool knownTurn = !_lifecycleUncertain && !malformedTurn && turnKey is not null
+                && _turnEnds.TryGetValue(turnKey, out var end) && (end is null || time <= end.Value);
+            if (!knownTurn || callKey is null || time == DateTimeOffset.MinValue)
             {
-                bool knownTurn = !_lifecycleUncertain && !malformedTurn && turnKey is not null && _active.Contains(turnKey);
                 // Only bad call/time data with otherwise proven ownership can be limited to one turn.
                 return knownTurn ? TurnUnavailable(time, turnKey!) : SessionUnavailable(time);
             }
@@ -123,6 +125,19 @@ internal sealed class DailyToolTimingParser(string sourceKey)
         // Unparseable data provides no dependable ownership evidence.
         catch (JsonException) { return SessionUnavailable(DateTimeOffset.MinValue); }
         catch (InvalidOperationException) { return SessionUnavailable(DateTimeOffset.MinValue); }
+    }
+
+    private string? UniqueOwnerAt(DateTimeOffset time)
+    {
+        string? owner = null;
+        foreach (var (turn, end) in _turnEnds)
+        {
+            // Equal timestamps do not establish which event happened first.
+            if (end is { } ended && ended < time) continue;
+            if (owner is not null) return null;
+            owner = turn;
+        }
+        return owner;
     }
 
     private IReadOnlyList<StatsEvent> SessionUnavailable(DateTimeOffset time) =>
