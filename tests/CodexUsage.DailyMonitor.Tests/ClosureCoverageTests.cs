@@ -834,6 +834,59 @@ internal static class ClosureCoverageTests
             });
         }
 
+        foreach (string scenario in new[] { "both-removed", "short-removed", "both-present", "disjoint", "future-only" })
+        {
+            await Case($"CON-31 retained wait when sampling rewinds ({scenario})", async () =>
+            {
+                var origin = midnight.AddMinutes(20);
+                using var fixture = new Fixture("retired-wait-rewind-" + scenario, origin.AddSeconds(40));
+                string call = Tool("function_call", "rewind-pair", origin.AddSeconds(1));
+                string ReturnAt(int second) => Tool("function_call_output", "rewind-pair", origin.AddSeconds(second));
+                string completed = Modern("midnight", "rewind-pair", "inferred-C", origin.AddSeconds(14))
+                    + Complete("inferred-C", origin.AddSeconds(15));
+                string live = fixture.WriteSession("live", midnightMeta + firstStart + competingStart + call + completed);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                bool futureOnly = scenario == "future-only";
+                bool timed = scenario == "disjoint" || futureOnly;
+                int beforeArchive = futureOnly ? 16 : 35;
+                ExpectMidnightTiming(await monitor.RefreshAsync(origin.AddSeconds(beforeArchive)), timed: true, lost: false,
+                    "the initial singleton is outside C");
+                string older = midnightMeta + Start("older", priorDay.AddSeconds(-1));
+                ReplaceSession(fixture, live, older + completed);
+                await monitor.RefreshAsync(origin.AddSeconds(beforeArchive));
+                string returns = scenario switch
+                {
+                    "short-removed" => ReturnAt(8),
+                    "disjoint" => ReturnAt(3) + ReturnAt(4),
+                    "future-only" => ReturnAt(20),
+                    _ => ReturnAt(8) + ReturnAt(20)
+                };
+                string archive = fixture.WriteSession("tool-source", older + call + returns, archived: true);
+                var seen = await monitor.RefreshAsync(origin.AddSeconds(futureOnly ? 16 : 37));
+                Check(seen, timed ? seen.ProcessingSeconds == 9 : seen.ProcessingSeconds is null,
+                    "sample-valid same-source observations determine whether C can be timed");
+
+                if (scenario != "both-present") File.Delete(archive);
+                if (!futureOnly)
+                {
+                    var late = await monitor.RefreshAsync(origin.AddSeconds(38));
+                    Check(late, timed ? late.ProcessingSeconds == 9 : late.ProcessingSeconds is null,
+                        "the late sample preserves the original wait scope");
+                }
+                foreach (int second in futureOnly ? new[] { 17, 18 } : new[] { 16, 17, 40 })
+                {
+                    var snapshot = await monitor.RefreshAsync(origin.AddSeconds(second));
+                    Check(snapshot, snapshot.InputTokens == 100 && snapshot.OutputTokens == 40,
+                        "the independently verifiable subtotal survives");
+                    if (timed)
+                        Check(snapshot, snapshot.ProcessingSeconds == 9 && snapshot.AverageTps is { } tps
+                            && Math.Abs(tps - 40d / 9) < 0.000001, "no observed wait intersects C");
+                    else
+                        ExpectMidnightTiming(snapshot, timed: false, lost: true, $"retained overlap at sample +{second}");
+                }
+            });
+        }
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));

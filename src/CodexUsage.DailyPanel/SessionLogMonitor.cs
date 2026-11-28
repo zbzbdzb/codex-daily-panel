@@ -718,6 +718,15 @@ public sealed class SessionLogMonitor : IDisposable
     private static bool WaitRelevant(string session, DailyTimingWindow wait, CoverageView view) =>
         wait.IsObservedAt(view.SampleAt) && view.InferredWindows[session].Any(wait.Overlaps);
 
+    private static DailyTimingWindow? RelevantRetainedWait(TimingGuard guard, CoverageView view)
+    {
+        if (guard.ObservedPair is not { Window: var wait } || wait.Start > view.SampleAt) return null;
+        // A backwards sample still needs the already witnessed part of the
+        // wait. Clip the exclusion only; restoration uses both original rows.
+        if (wait.End > view.SampleAt) wait = wait with { End = view.SampleAt };
+        return WaitRelevant(guard.Session, wait, view) ? wait : null;
+    }
+
     private static bool GuardActive(ExclusionGuard guard, CoverageView view) => guard switch
     {
         OriginGuard origin => view.Roots.Contains(origin.Session) && view.TodayRequests.Contains((origin.Session, origin.Request)),
@@ -726,7 +735,7 @@ public sealed class SessionLogMonitor : IDisposable
             && (!view.MetadataTimes.TryGetValue(child.Session, out var latest) || latest <= child.Relation.Timestamp),
         TimingGuard timing => view.Roots.Contains(timing.Session)
             && (TimingScope(timing.Evidence) is { } scope && ScopeRelevant(scope, view)
-                || timing.ObservedPair is { Window: var wait } && WaitRelevant(timing.Session, wait, view)
+                || RelevantRetainedWait(timing, view).HasValue
                 || timing.Evidence is DailyToolEvent { CallKey: { } call } && view.Calls.ContainsKey((timing.Session, call))),
         // Activity qualification is compared in Summarize itself, using the same
         // closure/latest/recent rules that decide ActiveTurns and ActiveSeconds.
@@ -776,7 +785,7 @@ public sealed class SessionLogMonitor : IDisposable
             {
                 if (!view.Roots.Contains(guard.Session)) continue;
                 if (TimingScope(guard.Evidence) is { } timingScope && ScopeRelevant(timingScope, view)) scopes.Add(timingScope);
-                if (guard.ObservedPair is { Window: var wait } && WaitRelevant(guard.Session, wait, view)) waits.Add((guard.Session, wait));
+                if (RelevantRetainedWait(guard, view) is { } wait) waits.Add((guard.Session, wait));
                 if (guard.Evidence is DailyToolEvent { CallKey: { } call }) calls.Add((guard.Session, call));
             }
         }
