@@ -75,16 +75,21 @@ public sealed class SessionLogMonitor : IDisposable
                     exclusionProof: exclusions, requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory(), closureFacts: ClosureFacts(),
                     requestConflicts: RequestConflicts(), requestConflictProof: conflicts);
                 var guardCapacity = MaximumRetainedEvents - _observedMetadataConflicts.Count;
-                var guards = Guards().Concat(_sources.Values.SelectMany(x => x.Evidence)
-                    .Where(x => exclusions.Contains(x.Event)).Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>())
-                    .Distinct().Take(guardCapacity + 1).ToList();
-                var overflow = guards.Count > guardCapacity;
-                if (overflow) guards.RemoveAt(guardCapacity);
+                var guards = new List<ExclusionGuard>();
+                var histories = new HashSet<ToolOwnershipHistory>();
+                int guardCount = 0;
+                bool overflow = false;
+                foreach (var guard in Guards().Concat(_sources.Values.SelectMany(x => CaptureGuards(x, exclusions, conflicts))).Distinct())
+                {
+                    guardCount += 1 + (guard is TimingGuard { Ownership: { } history } && histories.Add(history) ? history.Count : 0);
+                    if (guardCount > guardCapacity) { overflow = true; break; }
+                    guards.Add(guard);
+                }
                 ClearSources();
                 _coverageLosses.Clear();
                 if (guards.Count > 0)
                     _coverageLosses.Add(new CoverageLoss([], null, false, false, false, false, guards, [], 0) { PositiveResolved = true });
-                _coverageEvidenceCount = guards.Count + _observedMetadataConflicts.Count;
+                _coverageEvidenceCount = GuardEvidenceCount(guards) + _observedMetadataConflicts.Count;
                 _unprovableCoverage = overflow;
                 _lostBadStatistics = _lostOversizedLine = _lostReadFailed = false;
                 _day = day;
@@ -277,8 +282,8 @@ public sealed class SessionLogMonitor : IDisposable
         DailyAggregator.Summarize(_sources.Values.SelectMany(x => x.Events).Concat(ChildEvidence()), _day!.Value, _zone, _refreshAt,
             exclusionProof: exclusions, requestOrigins: RequestOrigins(), startHistory: StartHistory(), closureHistory: ClosureHistory(), closureFacts: ClosureFacts(),
             requestConflicts: RequestConflicts(), requestConflictProof: conflicts);
-        _unreadableGuards.AddRange(_sources.Values.Where(x => x.ReadFailed).SelectMany(x => x.Evidence)
-            .Where(x => exclusions.Contains(x.Event)).Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>().Distinct());
+        _unreadableGuards.AddRange(_sources.Values.Where(x => x.ReadFailed)
+            .SelectMany(x => CaptureGuards(x, exclusions, conflicts)).Distinct());
     }
 
     private void RecordLoss(Source source, DailyCoverageState coverage)
@@ -299,8 +304,7 @@ public sealed class SessionLogMonitor : IDisposable
         foreach (var row in source.Evidence.Where(x => required.Contains(x.Event) && x.Event is not MetadataEvent { IsChild: true }))
             events.Add((CoverageDigest(row), TimingScope(row.Event)));
 
-        var guards = source.Evidence.Where(x => exclusions.Contains(x.Event)).Select(x => CreateGuard(x, conflicts)).OfType<ExclusionGuard>()
-            .Distinct().ToList();
+        var guards = CaptureGuards(source, exclusions, conflicts).Distinct().ToList();
         if (events.Count == 0 && guards.Count == 0 && !source.BadStatistics && !source.PendingLine && !source.HasMore
             && !source.ReadFailed && !source.UncertainTail && !coverage.Incomplete) return;
         // Unknown/unread bytes cannot be reconstructed from the remaining valid events.
@@ -352,30 +356,44 @@ public sealed class SessionLogMonitor : IDisposable
             && (guard is not TimingGuard old || !timing.Contains(guard.Digest)
                 || projections.Contains((guard.Digest, EventDigest(old.Evidence)))
                 || timing[guard.Digest].OfType<DailyTimingUnavailableEvent>().Any(row => CoversTiming(row, old.Evidence, starts)));
-        static bool WasUnownedTool(ExclusionGuard guard) =>
-            guard is TimingGuard { Evidence: DailyTimingUnavailableEvent { StartTimestamp: not null } };
-        var possibleRecoveries = _coverageLosses.Any(loss => loss.Guards.Any(WasUnownedTool))
-            ? checkedSources.Where(source => source.Facts.Any(x => x.RawTimingDigest is not null && x.Event is DailyToolEvent))
+        static bool HasOwnershipHistory(ExclusionGuard guard) => guard is TimingGuard { Ownership: not null };
+        var timingSources = _coverageLosses.Any(loss => loss.Guards.Any(HasOwnershipHistory))
+            ? checkedSources.Where(source => source.Facts.Any(x => x.RawTimingDigest is not null))
                 .Select(source => (source.Reader, Digests: source.Facts.Select(CoverageDigest).ToHashSet(StringComparer.Ordinal),
-                    OwnedTools: source.Facts.Where(x => x.RawTimingDigest is not null && x.Event is DailyToolEvent)
-                        .Select(x => x.RawTimingDigest!).ToArray())).ToArray()
+                    Timing: source.Facts.Where(x => x.RawTimingDigest is not null)
+                        .ToLookup(x => x.RawTimingDigest!, x => x.Event, StringComparer.Ordinal))).ToArray()
             : [];
+        var historyMatches = new Dictionary<(DailyLogReader, ToolOwnershipHistory), bool>();
         foreach (var loss in _coverageLosses.ToArray())
         {
             bool complete = !loss.Unprovable && loss.Events.All(x => hashes.Contains(x.Digest))
                 && (loss.RawPrefix is not { } prefix || drained.Any(x => x.Reader.Proves(prefix)));
             if (complete) loss.PositiveResolved = true;
-            // The same raw tool can become attributable after its sibling end
-            // arrives. Require one current source to prove all dependencies of
-            // the retired view before releasing that loss's old uncertainty.
-            var recovered = complete && loss.Guards.Any(WasUnownedTool)
-                ? possibleRecoveries.Where(source => loss.Events.All(x => source.Digests.Contains(x.Digest))
-                        && (loss.RawPrefix is not { } stamp || source.Reader.Proves(stamp)))
-                    .SelectMany(source => source.OwnedTools).ToHashSet(StringComparer.Ordinal)
+            var completeSources = complete && loss.Guards.Any(HasOwnershipHistory)
+                ? timingSources.Where(source => loss.Events.All(x => source.Digests.Contains(x.Digest))
+                        && (loss.RawPrefix is not { } stamp || source.Reader.Proves(stamp))).Select(x => x.Reader).ToHashSet()
                 : null;
-            var proven = loss.Guards.RemoveAll(guard => ProvesGuard(guard)
-                || WasUnownedTool(guard) && recovered?.Contains(guard.Digest) == true);
-            _coverageEvidenceCount -= proven;
+            bool ProvesOwnership(TimingGuard old, ToolOwnershipHistory history)
+            {
+                // The source must reestablish its old lifecycle and raw tool
+                // evidence together, even if the old starts belong to yesterday.
+                foreach (var source in timingSources)
+                {
+                    if (!source.Timing.Contains(old.Digest)) continue;
+                    var key = (source.Reader, history);
+                    if (!historyMatches.TryGetValue(key, out var matches))
+                        historyMatches[key] = matches = history.Facts.Split('\n').All(source.Digests.Contains);
+                    if (matches && source.Timing[old.Digest].Any(row =>
+                            row is DailyToolEvent && completeSources?.Contains(source.Reader) == true
+                            || row is DailyTimingUnavailableEvent unavailable && CoversTiming(unavailable, old.Evidence, starts)))
+                        return true;
+                }
+                return false;
+            }
+            int before = GuardEvidenceCount(loss.Guards);
+            loss.Guards.RemoveAll(guard => guard is TimingGuard { Ownership: { } history } old
+                ? ProvesOwnership(old, history) : ProvesGuard(guard));
+            _coverageEvidenceCount -= before - GuardEvidenceCount(loss.Guards);
             if (!loss.PositiveResolved || loss.Guards.Count > 0) continue;
             _coverageLosses.Remove(loss);
             _coverageEvidenceCount -= loss.EvidenceCount;
@@ -406,7 +424,7 @@ public sealed class SessionLogMonitor : IDisposable
         int TimedScopeCount)
     {
         public bool PositiveResolved { get; set; }
-        public int EvidenceCount => Events.Count + Guards.Count + Sessions.Length + TimedScopeCount;
+        public int EvidenceCount => Events.Count + GuardEvidenceCount(Guards) + Sessions.Length + TimedScopeCount;
     }
 
     // No retired UsageEvent or token counter is retained in a guard.
@@ -414,7 +432,14 @@ public sealed class SessionLogMonitor : IDisposable
     private sealed record OriginGuard(string Hash, string Key, string Request, DateTimeOffset At) : ExclusionGuard(Hash, Key);
     private sealed record RequestConflictGuard(string Hash, string Key, string Request) : ExclusionGuard(Hash, Key);
     private sealed record ChildGuard(string Hash, MetadataEvent Relation) : ExclusionGuard(Hash, Relation.SessionKey);
-    private sealed record TimingGuard(string Hash, StatsEvent Evidence) : ExclusionGuard(Hash, Evidence.SessionKey);
+    private sealed record ToolOwnershipHistory(string Facts, int Count)
+    {
+        // Multiple raw tools share one group's history.
+        private readonly int _hash = StringComparer.Ordinal.GetHashCode(Facts);
+        public override int GetHashCode() => _hash;
+    }
+    private sealed record TimingGuard(string Hash, StatsEvent Evidence, ToolOwnershipHistory? Ownership = null)
+        : ExclusionGuard(Hash, Evidence.SessionKey);
     private sealed record StartOrderGuard(string Hash, StartEvent Evidence) : ExclusionGuard(Hash, Evidence.SessionKey);
     private sealed record ClosureGuard(string Hash, DailyClosureFact Fact) : ExclusionGuard(Hash, Fact.Session);
 
@@ -430,6 +455,40 @@ public sealed class SessionLogMonitor : IDisposable
         DailyTurnAbortedEvent abort => new ClosureGuard(EventDigest(abort), DailyClosureFact.From(abort)),
         _ => null
     };
+
+    private static int GuardEvidenceCount(List<ExclusionGuard> guards) => guards.Count
+        + guards.OfType<TimingGuard>().Select(x => x.Ownership).OfType<ToolOwnershipHistory>().Distinct().Sum(x => x.Count);
+
+    private IEnumerable<ExclusionGuard> CaptureGuards(Source source, HashSet<StatsEvent> exclusions,
+        ISet<(string Session, string Request)> conflicts)
+    {
+        var guards = source.Evidence.Where(x => exclusions.Contains(x.Event)).Select(x => CreateGuard(x, conflicts))
+            .OfType<ExclusionGuard>().ToArray();
+        var cohorts = guards.OfType<TimingGuard>().Select(x => x.Evidence).OfType<DailyTimingUnavailableEvent>()
+            .Where(x => x.StartTimestamp.HasValue).Select(x => (x.SessionKey, x.StartTimestamp!.Value)).ToHashSet();
+        if (cohorts.Count == 0) return guards;
+
+        // ProjectOwnership uses the starts in the tool's group and the latest
+        // observed end per member. Save those exact dependencies, not all prior
+        // history or the subset that contributes to today's counters.
+        var ends = source.Events.Where(x => x is CompletionEvent or DailyTurnAbortedEvent && x.Timestamp <= _refreshAt)
+            .Select(x => (Event: x, Turn: TimingTurn(x))).Where(x => x.Turn.HasValue).GroupBy(x => x.Turn!.Value)
+            .ToDictionary(x => x.Key, x => x.MaxBy(y => y.Event.Timestamp).Event);
+        var histories = source.Events.OfType<StartEvent>().Where(x => cohorts.Contains((x.SessionKey, x.Timestamp)))
+            .GroupBy(x => (x.SessionKey, x.Timestamp)).ToDictionary(group => group.Key, group =>
+            {
+                var facts = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var start in group)
+                {
+                    facts.Add(EventDigest(start));
+                    if (ends.TryGetValue((start.SessionKey, start.TurnKey), out var end) && end.Timestamp >= start.Timestamp)
+                        facts.Add(EventDigest(end));
+                }
+                return new ToolOwnershipHistory(string.Join('\n', facts.Order(StringComparer.Ordinal)), facts.Count);
+            });
+        return guards.Select(guard => guard is TimingGuard { Evidence: DailyTimingUnavailableEvent { StartTimestamp: { } at } row } timing
+            && histories.TryGetValue((row.SessionKey, at), out var history) ? timing with { Ownership = history } : guard);
+    }
 
     private IEnumerable<ExclusionGuard> Guards() => _coverageLosses.SelectMany(x => x.Guards).Concat(_unreadableGuards);
     private IEnumerable<MetadataEvent> ChildEvidence() => Guards().OfType<ChildGuard>().Select(x => x.Relation).Distinct();

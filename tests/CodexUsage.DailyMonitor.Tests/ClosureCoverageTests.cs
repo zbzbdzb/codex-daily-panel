@@ -552,6 +552,56 @@ internal static class ClosureCoverageTests
             });
         }
 
+        var midnight = AfterMidnight.AddMinutes(-1);
+        var priorDay = midnight.AddSeconds(-1);
+        var midnightMeta = RootMetadata("midnight", midnight.AddSeconds(-10));
+        var firstStart = Start("prior-A", priorDay);
+        var competingStart = Start("prior-B", priorDay);
+        var earlyEnd = AbortRow("task_aborted", "prior-B", midnight);
+        var lateEnd = AbortRow("task_aborted", "prior-B", midnight.AddSeconds(8));
+        foreach (var change in new[] { "missing-start", "missing-start-midspan", "split-start", "complete-replacement", "late-end", "irrelevant-history" })
+        {
+            await Case($"CON-23 cross-day tool ownership after {change}", async () =>
+            {
+                using var fixture = new Fixture("midnight-ownership-" + change, AfterMidnight);
+                bool midspan = change == "missing-start-midspan";
+                string rows = Tool("function_call", "midnight-pair", midnight.AddSeconds(1))
+                    + Tool("function_call_output", "midnight-pair", midnight.AddSeconds(midspan ? 15 : 4))
+                    + AbortRow("task_aborted", "prior-A", midnight.AddSeconds(midspan ? 16 : 9))
+                    + Modern("midnight", "midnight-request", "inferred-C", midnight.AddSeconds(11))
+                    + Complete("inferred-C", midnight.AddSeconds(12));
+                string complete = midnightMeta + firstStart + competingStart + rows;
+                string initial = change == "irrelevant-history"
+                    ? midnightMeta + Start("earlier-closed", priorDay.AddSeconds(-8))
+                        + AbortRow("task_aborted", "earlier-closed", priorDay.AddSeconds(-7))
+                        + firstStart + competingStart + rows
+                    : complete;
+                string live = fixture.WriteSession("live", initial);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                var first = await monitor.RefreshAsync(AfterMidnight);
+                ExpectMidnightTiming(first, timed: false, lost: false, "both prior-day starts are present");
+
+                bool missing = change is "missing-start" or "missing-start-midspan" or "split-start";
+                string next = missing ? midnightMeta + firstStart + rows
+                    : complete + (change == "late-end" ? lateEnd : earlyEnd);
+                string? sibling = change == "split-start"
+                    ? fixture.WriteSession("separate", midnightMeta + competingStart + earlyEnd, archived: true) : null;
+                ReplaceSession(fixture, live, next);
+                bool timed = change is "complete-replacement" or "irrelevant-history";
+                ExpectMidnightTiming(await monitor.RefreshAsync(AfterMidnight.AddSeconds(1)), timed, lost: missing,
+                    "after replacing the live source");
+                ExpectMidnightTiming(await monitor.RefreshAsync(AfterMidnight.AddSeconds(2)), timed, lost: missing,
+                    "idle refresh retains the same evidence");
+                if (missing)
+                {
+                    if (sibling is not null) File.Delete(sibling);
+                    ReplaceSession(fixture, live, complete + earlyEnd);
+                    ExpectMidnightTiming(await monitor.RefreshAsync(AfterMidnight.AddSeconds(3)), timed: true, lost: false,
+                        "the original competing start and its early end are now together with the tool");
+                }
+            });
+        }
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));
@@ -566,6 +616,23 @@ internal static class ClosureCoverageTests
     private static void ExpectUnavailableTiming(DailySnapshot actual, string context) => Check(actual,
         actual.AverageTps is null && actual.ProcessingSeconds is null && actual.TimedTurnCount == 0,
         context + ": expected unavailable TPS and processing seconds with no timed completed turn");
+
+    private static void ExpectMidnightTiming(DailySnapshot actual, bool timed, bool lost, string context)
+    {
+        Expect(actual, 100, 60, 40, 10, lost, context);
+        Check(actual, actual.Issues.Any(issue => issue.Code == DailyIssueCodes.CoverageLost) == lost
+            && actual.Issues.Any(issue => issue.Code == DailyIssueCodes.SourcePartial) == lost,
+            context + ": expected source coverage diagnostics to reflect the missing ownership evidence");
+        if (timed)
+            Check(actual, actual.ProcessingSeconds == 9 && actual.TimedTurnCount == 1 && actual.ExcludedTimingTurnCount == 0
+                && actual.AverageTps is { } tps && Math.Abs(tps - 40d / 9) < 0.000001,
+                context + ": expected nine seconds of independently verifiable timing");
+        else
+        {
+            ExpectUnavailableTiming(actual, context);
+            Check(actual, actual.ExcludedTimingTurnCount == 1, context + ": expected one excluded completion");
+        }
+    }
 
     private static void ExpectToolCoverage(DailySnapshot actual, int turns, bool timed, bool lost, string context,
         bool activityConflict = false)
