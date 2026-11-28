@@ -455,16 +455,7 @@ internal static class ClosureCoverageTests
                     case "exact-replace":
                     {
                         if (change == "exact-replace") final = originalTools;
-                        // With an unchanged prefix and no coverage-replay request, a reset
-                        // on this separately created replacement proves identity changed.
-                        using var identityProbe = new DailyLogReader(live);
-                        var first = await identityProbe.ReadAvailableAsync(_ => { });
-                        if (first.ResetDetected || first.BytesRead != Utf8.GetByteCount(originalTools))
-                            throw new InvalidOperationException("Identity probe did not establish the original cursor.");
-                        ReplaceSession(fixture, live, final);
-                        var replaced = await identityProbe.ReadAvailableAsync(_ => { });
-                        if (!replaced.ResetDetected || replaced.BytesRead != Utf8.GetByteCount(final))
-                            throw new InvalidOperationException("The byte-preserving replacement did not reset by identity.");
+                        await ReplacePreservedSession(fixture, live, originalTools, final);
                         break;
                     }
                     case "missing":
@@ -498,6 +489,69 @@ internal static class ClosureCoverageTests
             });
         }
 
+        var siblingStart = Start("early-sibling", At);
+        var siblingEnd = AbortRow("task_aborted", "early-sibling", At.AddSeconds(1));
+        var uncertainPair = toolStart + siblingStart + toolCall + toolOutput + toolCompletion;
+        var recoveredPair = uncertainPair + siblingEnd;
+        foreach (var change in new[] { "append", "replace", "archive", "missing-sibling-start", "missing-tool-result", "substitute" })
+        {
+            await Case($"CON-22 tool timing recovery after {change} requires the original evidence", async () =>
+            {
+                using var fixture = new Fixture("tool-recovery-" + change, Now);
+                var live = fixture.WriteSession("current", uncertainPair);
+                using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                ExpectToolCoverage(await monitor.RefreshAsync(Now), 2, timed: false, lost: false,
+                    "the initially uncertain pair excludes timing independently of source coverage", activityConflict: true);
+
+                var final = recoveredPair;
+                var current = live;
+                switch (change)
+                {
+                    case "append":
+                        fixture.AppendSession(live, siblingEnd);
+                        break;
+                    case "replace":
+                        await ReplacePreservedSession(fixture, live, uncertainPair, recoveredPair);
+                        break;
+                    case "archive":
+                        current = Path.Combine(fixture.Home, "archived_sessions", Path.GetFileName(live));
+                        File.Move(live, current);
+                        fixture.AppendSession(current, siblingEnd);
+                        break;
+                    case "missing-sibling-start":
+                        final = toolStart + toolCall + toolOutput + toolCompletion + siblingEnd;
+                        ReplaceSession(fixture, live, final);
+                        break;
+                    case "missing-tool-result":
+                        final = toolStart + siblingStart + toolCall + toolCompletion + siblingEnd;
+                        ReplaceSession(fixture, live, final);
+                        break;
+                    case "substitute":
+                        final = toolStart + siblingStart + Tool("function_call", "replacement-pair", At.AddSeconds(2))
+                            + Tool("function_call_output", "replacement-pair", At.AddSeconds(5)) + toolCompletion + siblingEnd;
+                        ReplaceSession(fixture, live, final);
+                        using (var cold = new SessionLogMonitor(fixture.Home, Zone))
+                            ExpectToolCoverage(await cold.RefreshAsync(Now), 2, timed: true, lost: false,
+                                "the new pair is independently usable without covering the retired pair");
+                        break;
+                }
+                if (!File.ReadAllBytes(current).SequenceEqual(Utf8.GetBytes(final)))
+                    throw new InvalidOperationException("The fixture did not preserve the intended synthetic bytes.");
+
+                bool lost = change is "missing-sibling-start" or "missing-tool-result" or "substitute";
+                ExpectToolCoverage(await monitor.RefreshAsync(Now.AddSeconds(1)), 2, timed: !lost, lost, "after requalification");
+                ExpectToolCoverage(await monitor.RefreshAsync(Now.AddSeconds(2)), 2, timed: !lost, lost, "idle refresh");
+                if (change is "missing-sibling-start" or "missing-tool-result")
+                {
+                    ReplaceSession(fixture, live, recoveredPair);
+                    ExpectToolCoverage(await monitor.RefreshAsync(Now.AddSeconds(3)), 2, timed: true, lost: false,
+                        "exact restoration clears the coverage loss and restores timing");
+                    ExpectToolCoverage(await monitor.RefreshAsync(Now.AddSeconds(4)), 2, timed: true, lost: false,
+                        "exact restoration stays qualified on idle refresh");
+                }
+            });
+        }
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));
@@ -513,13 +567,15 @@ internal static class ClosureCoverageTests
         actual.AverageTps is null && actual.ProcessingSeconds is null && actual.TimedTurnCount == 0,
         context + ": expected unavailable TPS and processing seconds with no timed completed turn");
 
-    private static void ExpectToolCoverage(DailySnapshot actual, int turns, bool timed, bool lost, string context)
+    private static void ExpectToolCoverage(DailySnapshot actual, int turns, bool timed, bool lost, string context,
+        bool activityConflict = false)
     {
-        Expect(actual, 100, 60, 40, 10, lost, context);
+        Expect(actual, 100, 60, 40, 10, lost || activityConflict, context);
         Check(actual, actual.SourceCount == 1 && actual.TurnCount == turns && actual.ActiveTurns == 0
             && actual.ActiveSeconds == 10
             && actual.Issues.Any(issue => issue.Code == DailyIssueCodes.CoverageLost) == lost
-            && actual.Issues.Any(issue => issue.Code == DailyIssueCodes.SourcePartial) == lost,
+            && actual.Issues.Any(issue => issue.Code == DailyIssueCodes.SourcePartial) == lost
+            && actual.Issues.Any(issue => issue.Code == DailyIssueCodes.CurrentStartConflict) == activityConflict,
             context + ": expected unchanged activities and an independent coverage diagnostic");
         if (timed)
             Check(actual, actual.ProcessingSeconds == 6 && actual.TimedTurnCount == 1 && actual.ExcludedTimingTurnCount == 0
@@ -533,6 +589,20 @@ internal static class ClosureCoverageTests
 
     private static void ReplaceSession(Fixture fixture, string path, string contents) =>
         File.Move(fixture.WriteSession("replacement", contents), path, overwrite: true);
+
+    private static async Task ReplacePreservedSession(Fixture fixture, string path, string prefix, string contents)
+    {
+        // The bytes establish the same prefix. With no coverage-replay request,
+        // a cursor reset on the separately created replacement proves identity changed.
+        using var identityProbe = new DailyLogReader(path);
+        var first = await identityProbe.ReadAvailableAsync(_ => { });
+        if (first.ResetDetected || first.BytesRead != Utf8.GetByteCount(prefix))
+            throw new InvalidOperationException("Identity probe did not establish the original cursor.");
+        ReplaceSession(fixture, path, contents);
+        var replaced = await identityProbe.ReadAvailableAsync(_ => { });
+        if (!replaced.ResetDetected || replaced.BytesRead != Utf8.GetByteCount(contents))
+            throw new InvalidOperationException("The byte-preserving replacement did not reset by identity.");
+    }
 
     private static void ExpectAbortSourceDiagnostics(DailySnapshot actual, string context) => Check(actual,
         actual.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable)

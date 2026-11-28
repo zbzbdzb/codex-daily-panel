@@ -338,8 +338,9 @@ public sealed class SessionLogMonitor : IDisposable
     private VerifiedTimingEvidence ReconcileCoverage()
     {
         var drained = DrainedSources().ToArray();
-        var verified = drained.Where(x => !x.BadStatistics).SelectMany(x => x.Evidence)
-            .Where(x => x.Event is not QuotaEvent).ToArray();
+        var checkedSources = drained.Where(x => !x.BadStatistics)
+            .Select(source => (source.Reader, Facts: source.Evidence.Where(x => x.Event is not QuotaEvent).ToArray())).ToArray();
+        var verified = checkedSources.SelectMany(x => x.Facts).ToArray();
         var current = verified.Select(x => x.Event).ToArray();
         var hashes = verified.Select(CoverageDigest).ToHashSet(StringComparer.Ordinal);
         var projections = verified.Select(ProjectionIdentity).ToHashSet();
@@ -351,12 +352,30 @@ public sealed class SessionLogMonitor : IDisposable
             && (guard is not TimingGuard old || !timing.Contains(guard.Digest)
                 || projections.Contains((guard.Digest, EventDigest(old.Evidence)))
                 || timing[guard.Digest].OfType<DailyTimingUnavailableEvent>().Any(row => CoversTiming(row, old.Evidence, starts)));
+        static bool WasUnownedTool(ExclusionGuard guard) =>
+            guard is TimingGuard { Evidence: DailyTimingUnavailableEvent { StartTimestamp: not null } };
+        var possibleRecoveries = _coverageLosses.Any(loss => loss.Guards.Any(WasUnownedTool))
+            ? checkedSources.Where(source => source.Facts.Any(x => x.RawTimingDigest is not null && x.Event is DailyToolEvent))
+                .Select(source => (source.Reader, Digests: source.Facts.Select(CoverageDigest).ToHashSet(StringComparer.Ordinal),
+                    OwnedTools: source.Facts.Where(x => x.RawTimingDigest is not null && x.Event is DailyToolEvent)
+                        .Select(x => x.RawTimingDigest!).ToArray())).ToArray()
+            : [];
         foreach (var loss in _coverageLosses.ToArray())
         {
-            var proven = loss.Guards.RemoveAll(ProvesGuard);
+            bool complete = !loss.Unprovable && loss.Events.All(x => hashes.Contains(x.Digest))
+                && (loss.RawPrefix is not { } prefix || drained.Any(x => x.Reader.Proves(prefix)));
+            if (complete) loss.PositiveResolved = true;
+            // The same raw tool can become attributable after its sibling end
+            // arrives. Require one current source to prove all dependencies of
+            // the retired view before releasing that loss's old uncertainty.
+            var recovered = complete && loss.Guards.Any(WasUnownedTool)
+                ? possibleRecoveries.Where(source => loss.Events.All(x => source.Digests.Contains(x.Digest))
+                        && (loss.RawPrefix is not { } stamp || source.Reader.Proves(stamp)))
+                    .SelectMany(source => source.OwnedTools).ToHashSet(StringComparer.Ordinal)
+                : null;
+            var proven = loss.Guards.RemoveAll(guard => ProvesGuard(guard)
+                || WasUnownedTool(guard) && recovered?.Contains(guard.Digest) == true);
             _coverageEvidenceCount -= proven;
-            if (!loss.Unprovable && loss.Events.All(x => hashes.Contains(x.Digest))
-                && (loss.RawPrefix is not { } prefix || drained.Any(x => x.Reader.Proves(prefix)))) loss.PositiveResolved = true;
             if (!loss.PositiveResolved || loss.Guards.Count > 0) continue;
             _coverageLosses.Remove(loss);
             _coverageEvidenceCount -= loss.EvidenceCount;
@@ -438,14 +457,19 @@ public sealed class SessionLogMonitor : IDisposable
 
     // Metadata and unscoped legacy rows participate in coverage without supplying
     // a turn's timing. A timing row with no turn still constrains the session.
-    private readonly record struct TimingScopeKey(string Session, string? Turn, DateTimeOffset? Start = null)
+    private readonly record struct TimingScopeKey(string Session, string? Turn, DateTimeOffset? Start = null,
+        DateTimeOffset? At = null, string? ToolCall = null)
     {
-        public DailyTimingUnavailableEvent UnavailableAt(DateTimeOffset now) => new(Session, Turn, now, Start);
+        public DailyTimingUnavailableEvent UnavailableAt(DateTimeOffset now) => new(Session, Turn, At ?? now, Start, ToolCall);
     }
 
-    private static TimingScopeKey? TimingScope(StatsEvent row) =>
-        row is MetadataEvent or QuotaEvent or UsageEvent { Legacy: true, TurnKey: null }
-            ? null : new(row.SessionKey, TimingTurn(row)?.Turn, (row as DailyTimingUnavailableEvent)?.StartTimestamp);
+    private static TimingScopeKey? TimingScope(StatsEvent row) => row switch
+    {
+        MetadataEvent or QuotaEvent or UsageEvent { Legacy: true, TurnKey: null } => null,
+        DailyTimingUnavailableEvent { StartTimestamp: { } start } tool =>
+            new(tool.SessionKey, tool.TurnKey, start, tool.Timestamp, tool.ToolCallKey),
+        _ => new(row.SessionKey, TimingTurn(row)?.Turn)
+    };
 
     private static IEnumerable<DailyTimingUnavailableEvent> UnverifiedTiming(Source[] sources,
         VerifiedTimingEvidence verified, DateTimeOffset now)
@@ -489,7 +513,7 @@ public sealed class SessionLogMonitor : IDisposable
         HashSet<string> Roots, HashSet<(string Session, string Request)> TodayRequests, HashSet<string> CandidateSessions,
         Dictionary<string, DateTimeOffset> MetadataTimes,
         Dictionary<(string Session, string Call), (string Session, string Turn)[]> Calls,
-        HashSet<(string Session, DateTimeOffset Start)> Starts);
+        HashSet<(string Session, DateTimeOffset Start)> Starts, ILookup<string, CompletionEvent> CompletionsWithoutStarts);
 
     private static IEnumerable<(string Session, DateTimeOffset At, MetadataEvent[] Rows)> LatestMetadata(IEnumerable<MetadataEvent> metadata) =>
         metadata.GroupBy(x => x.SessionKey).Select(group =>
@@ -518,13 +542,20 @@ public sealed class SessionLogMonitor : IDisposable
         var calls = rows.OfType<DailyToolEvent>().Where(x => x.CallKey is not null && TimingTurn(x) is { } turn && turns.Contains(turn))
             .GroupBy(x => (Session: x.SessionKey, Call: x.CallKey!))
             .ToDictionary(x => x.Key, x => x.Select(TimingTurn).Select(t => t!.Value).Distinct().ToArray());
-        var starts = rows.OfType<StartEvent>().Concat(StartHistory())
-            .Where(x => turns.Contains((x.SessionKey, x.TurnKey))).Select(x => (x.SessionKey, x.Timestamp)).ToHashSet();
-        return new(rows, turns, roots, todayRequests, sessions, times, calls, starts);
+        var startRows = rows.OfType<StartEvent>().Concat(StartHistory())
+            .Where(x => turns.Contains((x.SessionKey, x.TurnKey))).ToArray();
+        var starts = startRows.Select(x => (x.SessionKey, x.Timestamp)).ToHashSet();
+        var startedTurns = startRows.Select(x => (x.SessionKey, x.TurnKey)).ToHashSet();
+        var inferred = rows.OfType<CompletionEvent>().Where(x => x.DurationMs is > 0 && x.Timestamp <= _refreshAt
+            && turns.Contains((x.SessionKey, x.TurnKey)) && !startedTurns.Contains((x.SessionKey, x.TurnKey)))
+            .ToLookup(x => x.SessionKey, StringComparer.Ordinal);
+        return new(rows, turns, roots, todayRequests, sessions, times, calls, starts, inferred);
     }
 
     private static bool ScopeRelevant(TimingScopeKey scope, CoverageView view) => scope.Start is { } start
         ? view.Starts.Contains((scope.Session, start))
+            || scope.At is { } time && view.CompletionsWithoutStarts[scope.Session].Any(end => time <= end.Timestamp
+                && (end.Timestamp - time).TotalMilliseconds <= end.DurationMs)
         : scope.Turn is { } turn ? view.Turns.Contains((scope.Session, turn)) : view.CandidateSessions.Contains(scope.Session);
 
     private static bool GuardActive(ExclusionGuard guard, CoverageView view) => guard switch

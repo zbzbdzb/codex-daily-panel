@@ -227,6 +227,27 @@ internal static class ToolTimingTests
             CheckLifecycleTiming(await ReadRows(metadata + successorRows), 6, false, 10,
                 "the successor times identically when it is the only cohort");
 
+            string CompletedWithoutStart(int endSeconds) => Row("token_usage_record", start.AddSeconds(endSeconds - 1), new
+            {
+                thread_id = "timing-session", session_id = "run", turn_id = "completion-only", root_turn_id = "completion-only",
+                response_id = "completion-only-request", usage = tokens40, turn_token_usage = tokens40
+            }) + Row("event_msg", start.AddSeconds(endSeconds),
+                new { type = "task_complete", turn_id = "completion-only", duration_ms = 10000, time_to_first_token_ms = 1000 });
+            string resolvedPair = Row("event_msg", start.AddSeconds(8), new { type = "task_aborted", turn_id = "turn" })
+                + siblingAbort;
+            string ambiguousPair = tied + implicitTools + resolvedPair;
+            CheckLifecycleTiming(await ReadRows(ambiguousPair + CompletedWithoutStart(10)), null, false, 10,
+                "unowned tool evidence overlapping a duration-derived interval excludes its completion timing");
+            string overlappingStart = Row("event_msg", start, new { type = "task_started", turn_id = "completion-only" });
+            CheckLifecycleTiming(await ReadRows(tied + overlappingStart + implicitTools + resolvedPair + CompletedWithoutStart(10)),
+                null, false, 10, "the same unowned tool evidence excludes an overlapping explicit interval");
+            CheckLifecycleTiming(await ReadRows(ambiguousPair + CompletedWithoutStart(30)), 9, false, 18,
+                "a non-overlapping duration-derived interval retains its zero-wait estimate");
+            CheckLifecycleTiming(await ReadRows(metadata + CompletedWithoutStart(10)), 9, false, 10,
+                "a duration-derived interval without unowned tool evidence retains its zero-wait estimate");
+            CheckLifecycleTiming(await ReadRows(ambiguousPair + successorRows), 6, false, 18,
+                "the unowned pair does not interfere with a non-overlapping verified tool pair");
+
             string unsignedStart = JsonSerializer.Serialize(new
             {
                 type = "event_msg", timestamp = "2026-10-21T12:00:00",
