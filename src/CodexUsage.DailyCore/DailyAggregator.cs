@@ -192,12 +192,11 @@ public static class DailyAggregator
             .Concat(startHistory.Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now)), false);
         // A retired closure may disqualify activity, but cannot supply an old
         // completion, duration, TTFT or interval to the current statistics.
-        var historicalClosedTurns = closureHistory?.Where(x => x.At != DateTimeOffset.MinValue && x.At <= now
+        var historicalEndTimes = (closureHistory ?? []).Where(x => x.At != DateTimeOffset.MinValue && x.At <= now
             && !string.IsNullOrWhiteSpace(x.Session) && !string.IsNullOrWhiteSpace(x.Turn))
-            .Select(x => (x.Session, x.Turn)).ToHashSet() ?? [];
+            .GroupBy(x => (x.Session, x.Turn)).ToDictionary(x => x.Key, x => x.Max(end => end.At));
         var knownClosures = (closureFacts ?? []).Where(x => x.At != DateTimeOffset.MinValue && x.At <= now)
             .GroupBy(x => (x.Session, x.Turn)).ToDictionary(x => x.Key, x => x.Distinct().ToArray());
-        historicalClosedTurns.UnionWith(knownClosures.Keys);
         var knownStarts = (startHistory ?? []).Where(x => x.Timestamp != DateTimeOffset.MinValue && x.Timestamp <= now)
             .GroupBy(x => (x.SessionKey, x.TurnKey)).ToDictionary(x => x.Key, x => x.Select(s => s.Timestamp).Distinct().ToArray());
         var intervals = new List<(DateTimeOffset Start, DateTimeOffset End)>();
@@ -238,37 +237,37 @@ public static class DailyAggregator
                 continue;
             }
             DateTimeOffset? explicitStart = starts.Length == 1 ? starts[0] : null;
+            var endAt = aborts.Length == 1 ? aborts[0] : completions.FirstOrDefault()?.Timestamp;
+            // Compare the sole observed end to the start of this same turn.
+            // Retain all terminal facts above for conflict detection first.
+            bool endInOrder = endAt is { } ended && (startEvidence.Length == 0 || ended >= startEvidence[0]);
             // A tied start matters for current activity only while a candidate
             // lacks an observed, consistent end. Retired evidence may expose a
             // conflict above, but cannot stand in for a current terminal event.
-            if (unresolvedLatestStarts.Count != 0 && explicitStart is { } started
-                && ((aborts.Length == 1 && aborts[0] >= started)
-                    || (completions.Length > 0 && completions[0].Timestamp >= started)))
+            if (endInOrder && explicitStart is not null)
                 unresolvedLatestStarts.Remove((turn.Session, turn.Key));
-            if (aborts.Length == 1)
+            if (endInOrder && aborts.Length == 1)
             {
                 if (explicitStart is { } began) AddInterval(began, aborts[0]);
                 continue;
             }
-            if (completions.Length == 0)
+            // The latest observed start may still indicate activity if the
+            // only end was premature. A log start is not proof of liveness.
+            if (!endInOrder && explicitStart is { } currentStart && InDay(now) && now - currentStart <= RecentObservation
+                && rawLastStarts.TryGetValue(turn.Session, out var rawLatest) && currentStart == rawLatest.At && turn.Key == rawLatest.Key)
             {
-                // A log start is only an observation, not proof the process is alive.
-                // Require the latest start in its root session and a short age limit.
-                if (explicitStart is { } began && InDay(now) && now - began <= RecentObservation
-                    && rawLastStarts.TryGetValue(turn.Session, out var rawLatest) && began == rawLatest.At && turn.Key == rawLatest.Key)
+                if (retiredClosures.Any(end => end.At >= currentStart)
+                    || historicalEndTimes.TryGetValue((turn.Session, turn.Key), out var pastEnd) && pastEnd >= currentStart)
+                    Issue(DailyIssueCodes.HistoricalClosureMissing, "历史回合闭合依据缺失，活动状态无法确认");
+                else if (lastStarts.TryGetValue(turn.Session, out var latest) && currentStart == latest.At && turn.Key == latest.Key)
                 {
-                    if (historicalClosedTurns.Contains((turn.Session, turn.Key)))
-                        Issue(DailyIssueCodes.HistoricalClosureMissing, "历史回合闭合依据缺失，活动状态无法确认");
-                    else if (lastStarts.TryGetValue(turn.Session, out var latest) && began == latest.At && turn.Key == latest.Key)
-                    {
-                        coverageTurns?.Add((turn.Session, turn.Key));
-                        active++;
-                        AddInterval(began, now);
-                    }
-                    else Issue(DailyIssueCodes.HistoricalStartMissing, "历史回合启动依据缺失，活动状态无法确认");
+                    coverageTurns?.Add((turn.Session, turn.Key));
+                    active++;
+                    AddInterval(currentStart, now);
                 }
-                continue;
+                else Issue(DailyIssueCodes.HistoricalStartMissing, "历史回合启动依据缺失，活动状态无法确认");
             }
+            if (completions.Length == 0) continue;
 
             var completed = completions[0];
             var duration = completed.DurationMs is > 0 ? completed.DurationMs : null;
@@ -279,7 +278,7 @@ public static class DailyAggregator
                 catch (ArgumentOutOfRangeException) { }
             }
             var beganAt = explicitStart ?? durationStart;
-            if (beganAt is { } intervalStart) AddInterval(intervalStart, completed.Timestamp);
+            if (endInOrder && beganAt is { } intervalStart) AddInterval(intervalStart, completed.Timestamp);
             if (!InDay(completed.Timestamp)) continue;
             // The completion's declared duration and an explicit start/end pair are
             // independent evidence for the same turn. Allow modest write/scheduling
@@ -293,7 +292,7 @@ public static class DailyAggregator
             if (durationMismatch) Issue(DailyIssueCodes.DurationMismatch, "回合声明耗时与起止时间不一致");
             var reconciliation = Reconcile(turn.Requests, rejectedTurns.Contains((turn.Session, turn.Key)));
             if (!reconciliation && relevantTurn) Issue(DailyIssueCodes.CompletionReconciliation, "完成回合快照缺失或对账不一致");
-            var sameDay = durationStart is { } inferred && InDay(inferred) && beganAt is { } beganSameDay
+            var sameDay = endInOrder && durationStart is { } inferred && InDay(inferred) && beganAt is { } beganSameDay
                 && InDay(beganSameDay) && beganSameDay <= completed.Timestamp
                 && turn.Requests.All(x => InDay(x.OccurredAt) && x.OccurredAt >= beganSameDay && x.OccurredAt <= completed.Timestamp);
             if (!reconciliation || duration is null || !sameDay || durationMismatch)

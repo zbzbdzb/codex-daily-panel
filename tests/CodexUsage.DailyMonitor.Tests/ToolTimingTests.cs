@@ -52,7 +52,7 @@ internal static class ToolTimingTests
                     && snapshot.AverageTps is { } t && Math.Abs(t - 100 / seconds.Value) < 0.000001), name);
         }
         void CheckLifecycleTiming(DailySnapshot snapshot, double? seconds, bool activityConflict, double activitySeconds,
-            string name, bool unreconciledSibling = false)
+            string name, bool unreconciledSibling = false, bool terminalConflict = false)
         {
             bool timingMatches = seconds is null
                 ? snapshot.ProcessingSeconds is null && snapshot.AverageTps is null && snapshot.TimedTurnCount == 0
@@ -62,6 +62,7 @@ internal static class ToolTimingTests
             Check(snapshot.InputTokens == 100 && snapshot.OutputTokens == 40 && timingMatches
                 && snapshot.ActiveSeconds == activitySeconds && snapshot.ExcludedTimingTurnCount == excluded
                 && snapshot.Issues.Any(issue => issue.Code == DailyIssueCodes.CurrentStartConflict) == activityConflict
+                && snapshot.Issues.Any(issue => issue.Code == DailyIssueCodes.TurnTimeConflict) == terminalConflict
                 && snapshot.Issues.Any(issue => issue.Code == DailyIssueCodes.CompletionReconciliation) == unreconciledSibling,
                 $"{name} (net={snapshot.ProcessingSeconds}, TPS={snapshot.AverageTps}, activity={snapshot.ActiveSeconds}, status={snapshot.Status})");
         }
@@ -142,6 +143,33 @@ internal static class ToolTimingTests
                 string Abort(string turn, DateTimeOffset at) => Row("event_msg", at, new { type = abortType, turn_id = turn });
                 var valid = Abort("another-turn", start.AddSeconds(1));
                 var reversed = Abort("another-turn", start.AddMilliseconds(-1));
+                var reversedMain = Abort("turn", start.AddMilliseconds(-1));
+                var settledSibling = tied + valid + explicitTools;
+                CheckLifecycleTiming(await ReadRows(settledSibling + reversedMain + finish), null, true, 1,
+                    $"{abortType}: reversed end written before completion remains conflicting", terminalConflict: true);
+                CheckLifecycleTiming(await ReadRows(settledSibling + finish + reversedMain), null, true, 1,
+                    $"{abortType}: reversed end written after completion remains conflicting", terminalConflict: true);
+                CheckLifecycleTiming(await ReadRows(tied + reversed + valid + explicitTools + finish), 6, true, 10,
+                    $"{abortType}: reversed end before a valid end of the same kind retains the conflict", terminalConflict: true);
+                CheckLifecycleTiming(await ReadRows(tied + valid + reversed + explicitTools + finish), 6, true, 10,
+                    $"{abortType}: reversed end after a valid end of the same kind retains the conflict", terminalConflict: true);
+
+                foreach (bool reverseFirst in new[] { true, false })
+                {
+                    Write(settledSibling + (reverseFirst ? reversedMain : finish));
+                    using var retained = new SessionLogMonitor(home, TimeZoneInfo.Utc);
+                    var first = await retained.RefreshAsync(start.AddMinutes(1));
+                    Check(first.SourceCount == 1 && first.TurnCount == 2
+                        && (reverseFirst ? first.ProcessingSeconds is null && first.IsPartial : first.ProcessingSeconds == 6 && !first.IsPartial),
+                        $"{abortType}: retained reader observes the first terminal before append ({reverseFirst})");
+                    File.AppendAllText(path, reverseFirst ? finish : reversedMain, Utf8);
+                    File.SetLastWriteTimeUtc(path, start.AddMinutes(1).UtcDateTime);
+                    CheckLifecycleTiming(await retained.RefreshAsync(start.AddMinutes(1)), null, true, 1,
+                        $"{abortType}: retained reader preserves appended conflict ({reverseFirst})", terminalConflict: true);
+                    CheckLifecycleTiming(await retained.RefreshAsync(start.AddMinutes(1)), null, true, 1,
+                        $"{abortType}: retained reader keeps the conflict on idle refresh ({reverseFirst})", terminalConflict: true);
+                }
+
                 CheckLifecycleTiming(await ReadRows(tied + valid + implicitTools + finish), 6, false, 10,
                     $"{abortType}: valid same-turn end licenses implicit tool pairing");
                 CheckLifecycleTiming(await ReadRows(tied + implicitTools + finish), null, true, 10,
@@ -163,8 +191,16 @@ internal static class ToolTimingTests
                 {
                     File.WriteAllText(archivedPath, metadata + valid, Utf8);
                     File.SetLastWriteTimeUtc(archivedPath, start.AddMinutes(1).UtcDateTime);
-                    CheckLifecycleTiming(await ReadRows(tied + reversed + explicitTools + finish), 6, false, 10,
-                        $"{abortType}: valid archived end resolves activity without reassigning explicit tools");
+                    CheckLifecycleTiming(await ReadRows(tied + explicitTools + finish), 6, false, 10,
+                        $"{abortType}: a lone valid archived end resolves activity without reassigning explicit tools");
+                    CheckLifecycleTiming(await ReadRows(tied + valid + explicitTools + finish), 6, false, 10,
+                        $"{abortType}: an exact archived replay of a valid end has no conflict");
+                    CheckLifecycleTiming(await ReadRows(tied + reversed + explicitTools + finish), 6, true, 10,
+                        $"{abortType}: a distinct valid archived end exposes conflict and preserves explicit sibling timing", terminalConflict: true);
+                    File.WriteAllText(archivedPath, metadata + reversedMain, Utf8);
+                    File.SetLastWriteTimeUtc(archivedPath, start.AddMinutes(1).UtcDateTime);
+                    CheckLifecycleTiming(await ReadRows(settledSibling + finish), null, true, 1,
+                        $"{abortType}: reversed archived end conflicts with the current completion", terminalConflict: true);
                 }
                 finally { File.Delete(archivedPath); }
             }
@@ -179,6 +215,47 @@ internal static class ToolTimingTests
                 "task_complete: reversed sibling completion preserves explicitly owned tools", unreconciledSibling: true);
             CheckLifecycleTiming(await ReadRows(tied + reversedCompletion + implicitTools + finish), null, true, 10,
                 "task_complete: sibling completion earlier than its start cannot license implicit tool pairing", unreconciledSibling: true);
+            foreach (string endType in new[] { "task_aborted", "turn_aborted", "task_complete" })
+            {
+                string reversedOnly = Row("event_msg", start.AddMilliseconds(-1),
+                    new { type = endType, turn_id = "turn", duration_ms = 0, time_to_first_token_ms = 0 });
+                foreach (string rows in new[] { metadata + reversedOnly + began, metadata + began + reversedOnly })
+                {
+                    var active = await ReadRows(rows);
+                    Check(active.ActiveTurns == 1 && active.ActiveSeconds == 60 && active.ProcessingSeconds is null
+                        && active.AverageTps is null && !active.Issues.Any(issue => issue.Code == DailyIssueCodes.TurnTimeConflict),
+                        $"{endType}: a single reversed end leaves the recent turn open ({rows.IndexOf(reversedOnly, StringComparison.Ordinal)})");
+                }
+            }
+            string reversedMainCompletion = Row("event_msg", start.AddMilliseconds(-1),
+                new { type = "task_complete", turn_id = "turn", duration_ms = 0, time_to_first_token_ms = 0 });
+            foreach (string rows in new[] { metadata + began + explicitTools + reversedMainCompletion + finish,
+                metadata + began + explicitTools + finish + reversedMainCompletion })
+            {
+                var conflict = await ReadRows(rows);
+                Check(conflict.InputTokens == 100 && conflict.OutputTokens == 40 && conflict.IsPartial
+                    && conflict.ActiveTurns == 0 && conflict.ActiveSeconds is null && conflict.ProcessingSeconds is null
+                    && conflict.AverageTps is null && conflict.TimedTurnCount == 0 && conflict.ExcludedTimingTurnCount == 1
+                    && conflict.Issues.Any(issue => issue.Code == DailyIssueCodes.TurnTimeConflict),
+                    "task_complete: two distinct terminal facts exclude the completed turn regardless of line order");
+            }
+
+            string independentPath = Path.Combine(sessions, "independent.jsonl");
+            string independent = metadata + began + explicitTools + finish;
+            independent = independent.Replace("\"timing-session\"", "\"independent-session\"", StringComparison.Ordinal);
+            try
+            {
+                File.WriteAllText(independentPath, independent, Utf8);
+                File.SetLastWriteTimeUtc(independentPath, start.AddMinutes(1).UtcDateTime);
+                var subtotal = await ReadRows(metadata + began + explicitTools + reversedMainCompletion + finish);
+                Check(subtotal.InputTokens == 200 && subtotal.OutputTokens == 80 && subtotal.IsPartial
+                    && subtotal.ActiveSeconds == 10 && subtotal.ProcessingSeconds == 6
+                    && subtotal.AverageTps is { } independentTps && Math.Abs(independentTps - 40 / 6d) < .000001
+                    && subtotal.TimedTurnCount == 1 && subtotal.ExcludedTimingTurnCount == 1
+                    && subtotal.Issues.Any(issue => issue.Code == DailyIssueCodes.TurnTimeConflict),
+                    "same-turn conflict leaves the independently verified other root's timing and the 280-token subtotal");
+            }
+            finally { File.Delete(independentPath); }
             await CheckRows(metadata + began + Row("event_msg", start.AddSeconds(1), new { type = "task_aborted", turn_id = "turn" })
                 + Tool("function_call", 2) + Tool("function_call_output", 5) + usage + complete, null, "aborted lifecycle cannot associate later tools");
             await CheckRows(metadata + began + Tool("function_call", 2).Replace("\"timestamp\":", "\"turn_id\":\"another-turn\",\"timestamp\":", StringComparison.Ordinal)

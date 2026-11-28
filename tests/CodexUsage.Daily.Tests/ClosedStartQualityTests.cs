@@ -64,6 +64,57 @@ internal static class ClosedStartQualityTests
             CheckAmbiguous(s);
             CheckStatistics(s, 100, 40, 1);
         });
+        var early = Began.AddMilliseconds(-1);
+        foreach (var (kind, observed, fact, excluded) in new (string, StatsEvent, DailyClosureFact, int)[]
+        {
+            ("abort", Abort("a", early), DailyClosureFact.From(Abort("a", early)), 0),
+            ("completion", new CompletionEvent(Root, "a", early, 100, 20),
+                DailyClosureFact.From(new CompletionEvent(Root, "a", early, 100, 20)), 1)
+        })
+        {
+            test($"Closed starts: a lone reversed {kind} leaves a recent turn active", () =>
+            {
+                var current = Single();
+                CheckStillActive(Sum(current.Append(observed)), excluded);
+                CheckStillActive(Sum(current.Prepend(observed)), excluded);
+            });
+            test($"Closed starts: a retained reversed {kind} cannot suppress a current start", () =>
+            {
+                CheckStillActive(Sum(Single(), facts: [fact], closureHistory: [(Root, "a", early)]), 0);
+                CheckStillActive(Sum(Single(), closureHistory: [(Root, "a", early)]), 0);
+                var validHistory = Sum(Single(), closureHistory: [(Root, "a", Finished)]);
+                Check(validHistory.ActiveTurns == 0 && validHistory.ActiveSeconds is null
+                    && Has(validHistory, DailyIssueCodes.HistoricalClosureMissing),
+                    "A genuine retained end still limits activity and supplies no interval.");
+            });
+            test($"Closed starts: conflicting reversed {kind} stays visible in either order or history", () =>
+            {
+                var current = Tied().Concat(Complete("a")).Concat(Complete("b")).ToArray();
+                foreach (var snapshot in new[]
+                {
+                    Sum(current.Prepend(observed)), Sum(current.Append(observed)), Sum(current, facts: [fact])
+                })
+                {
+                    CheckAmbiguous(snapshot);
+                    Check(Has(snapshot, DailyIssueCodes.TurnTimeConflict) && snapshot.InputTokens == 200
+                        && snapshot.OutputTokens == 80 && snapshot.ProcessingSeconds == 9 && snapshot.ActiveSeconds == 10
+                        && snapshot.TimedTurnCount == 1 && snapshot.ExcludedTimingTurnCount == 1,
+                        "Distinct terminal facts must exclude the conflicted turn and preserve its sibling's verified time.");
+                }
+            });
+        }
+        test("Closed starts: a retained later start disproves an otherwise plausible completion", () =>
+        {
+            var snapshot = Sum([
+                new MetadataEvent(Root, Began.AddMinutes(-1), false, null),
+                new UsageEvent(Root, "a", "a", "request-a", early.AddMilliseconds(-1), 1, Tokens, Tokens, null),
+                new CompletionEvent(Root, "a", early, 100, 20)
+            ], startHistory: [new StartEvent(Root, "a", Began)]);
+            Check(snapshot.InputTokens == 100 && snapshot.OutputTokens == 40 && snapshot.ActiveTurns == 0
+                && snapshot.ProcessingSeconds is null && snapshot.AverageTps is null && snapshot.ActiveSeconds is null
+                && snapshot.TimedTurnCount == 0 && snapshot.ExcludedTimingTurnCount == 1,
+                "A retained same-turn start rules out a premature completion even within the duration skew tolerance.");
+        });
         test("Closed starts: resolving one root leaves ambiguity in another", () =>
         {
             var rows = Tied().Concat(Complete("a")).Append(Abort("b")).Concat([
@@ -98,11 +149,20 @@ internal static class ClosedStartQualityTests
         new CompletionEvent(Root, turn, Finished, 10000, 1000)
     ];
 
+    private static StatsEvent[] Single() =>
+    [
+        new MetadataEvent(Root, Began.AddMinutes(-1), false, null),
+        new StartEvent(Root, "a", Began),
+        new UsageEvent(Root, "a", "a", "request-a", Finished, 1, Tokens, Tokens, null)
+    ];
+
     private static DailyTurnAbortedEvent Abort(string turn, DateTimeOffset? at = null) => new(Root, turn, at ?? Finished);
     private static DailySnapshot Sum(IEnumerable<StatsEvent> rows, bool partial = false,
         IEnumerable<DailyClosureFact>? facts = null,
-        IEnumerable<(string Session, string Turn, DateTimeOffset At)>? closureHistory = null) =>
-        DailyAggregator.Summarize(rows, Day, Zone, Now, partial, closureFacts: facts, closureHistory: closureHistory);
+        IEnumerable<(string Session, string Turn, DateTimeOffset At)>? closureHistory = null,
+        IEnumerable<StartEvent>? startHistory = null) =>
+        DailyAggregator.Summarize(rows, Day, Zone, Now, partial, closureFacts: facts, closureHistory: closureHistory,
+            startHistory: startHistory);
 
     private static bool Has(DailySnapshot snapshot, string code) => snapshot.Issues.Any(issue => issue.Code == code);
     private static void Check(bool value, string reason)
@@ -120,6 +180,13 @@ internal static class ClosedStartQualityTests
     private static void CheckAmbiguous(DailySnapshot snapshot) =>
         Check(snapshot.IsPartial && Has(snapshot, DailyIssueCodes.CurrentStartConflict) && snapshot.ActiveTurns == 0,
             "Incomplete tied starts must remain ambiguous without guessing an active turn.");
+
+    private static void CheckStillActive(DailySnapshot snapshot, int excluded) =>
+        Check(snapshot.InputTokens == 100 && snapshot.OutputTokens == 40 && snapshot.ActiveTurns == 1
+            && snapshot.ActiveSeconds == 60 && snapshot.ProcessingSeconds is null && snapshot.AverageTps is null
+            && snapshot.TimedTurnCount == 0 && snapshot.ExcludedTimingTurnCount == excluded
+            && !Has(snapshot, DailyIssueCodes.HistoricalClosureMissing) && !Has(snapshot, DailyIssueCodes.TurnTimeConflict),
+            "A single premature end neither closes a recent turn nor supplies timing or a distinct-terminal conflict.");
 
     private static void CheckStatistics(DailySnapshot snapshot, long? input, long? output, int completions)
     {
