@@ -771,6 +771,11 @@ public sealed class SessionLogMonitor : IDisposable
                 if (!Unique(payload)) return;
                 var kind = Field(payload, "type");
                 if (kind.ValueKind != JsonValueKind.String || kind.GetString() is not ("task_aborted" or "turn_aborted")) return;
+                if (!DailyToolTimingParser.HasSupportedVersion(root) || !DailyToolTimingParser.HasSupportedVersion(payload))
+                {
+                    BadStatistics = true;
+                    return;
+                }
                 var turn = Field(payload, "turn_id");
                 var timestamp = Field(root, "timestamp");
                 if (turn.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(turn.GetString())

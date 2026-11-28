@@ -39,7 +39,7 @@ internal sealed class DailyToolTimingParser(string sourceKey)
             }
             if (outer is not ("response_item" or "event_msg")) return [];
             if (outer == "event_msg" && kind is not ("task_started" or "task_complete" or "task_aborted" or "turn_aborted")) return [];
-            if (!Unique(root) || !Unique(payload) || !Version(root) || !Version(payload))
+            if (!Unique(root) || !Unique(payload) || !HasSupportedVersion(root) || !HasSupportedVersion(payload))
             {
                 _lifecycleUncertain |= outer == "event_msg";
                 // Ambiguous envelope/schema can conceal ownership outside the current active turn.
@@ -122,7 +122,7 @@ internal sealed class DailyToolTimingParser(string sourceKey)
         && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var time) ? time : DateTimeOffset.MinValue;
     private static bool Unique(JsonElement node) => node.ValueKind == JsonValueKind.Object
         && node.EnumerateObject().Select(p => p.Name).Distinct(StringComparer.Ordinal).Count() == node.EnumerateObject().Count();
-    private static bool Version(JsonElement node) => Field(node, "schema_version") is var value
+    internal static bool HasSupportedVersion(JsonElement node) => Field(node, "schema_version") is var value
         && (value.ValueKind == JsonValueKind.Undefined || value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out int n) && n == 1
             || value.ValueKind == JsonValueKind.String && value.GetString() == "1");
 }

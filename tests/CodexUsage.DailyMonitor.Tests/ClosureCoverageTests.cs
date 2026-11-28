@@ -209,6 +209,81 @@ internal static class ClosureCoverageTests
                 "restoring the exact original bytes resolves the current tie again");
         });
 
+        foreach (var kind in new[] { "task_aborted", "turn_aborted" })
+        {
+            foreach (var versionInPayload in new[] { false, true })
+            {
+                var scope = versionInPayload ? "payload" : "envelope";
+                await Case($"CON-09 {kind} rejects an unsupported {scope} version", async () =>
+                {
+                    using var fixture = new Fixture($"unsupported-{kind}-{scope}", Now);
+                    var prefix = TiedStartRows() + Complete("tied-first", At.AddSeconds(10));
+                    var path = fixture.WriteSession("tied-starts", prefix);
+                    using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                    ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, true, "before unsupported abort append");
+
+                    fixture.AppendSession(path, AbortRow(kind, "tied-second", At.AddSeconds(12),
+                        envelopeVersion: versionInPayload ? null : 2, payloadVersion: versionInPayload ? 2 : null));
+                    var rejected = await monitor.RefreshAsync(Now);
+                    ExpectTiedStarts(rejected, null, true, "unsupported abort cannot settle the tied start");
+                    Check(rejected, rejected.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable),
+                        "unsupported abort must contribute a source quality diagnostic");
+
+                    fixture.WriteSession("valid-archive", prefix + AbortRow(kind, "tied-second", At.AddSeconds(10)), archived: true);
+                    var restored = await monitor.RefreshAsync(Now);
+                    ExpectTiedStarts(restored, null, false, "a distinct, supported archived abort settles the tie", partial: true);
+                    Check(restored, restored.SourceCount == 2
+                        && restored.Issues.Any(issue => issue.Code == DailyIssueCodes.SourceUnreadable),
+                        "archived recovery must preserve the independent unsupported-source diagnostic");
+                });
+            }
+
+            await Case($"CON-10 {kind} accepts absent, numeric and string version 1", async () =>
+            {
+                foreach (var version in new object?[] { null, 1, "1" })
+                {
+                    using var fixture = new Fixture($"supported-{kind}-{version ?? "absent"}", Now);
+                    var prefix = TiedStartRows() + Complete("tied-first", At.AddSeconds(10));
+                    fixture.WriteSession("tied-starts", prefix + AbortRow(kind, "tied-second", At.AddSeconds(10), version, version));
+                    using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+                    ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, false, $"supported version {version ?? "absent"}");
+                }
+            });
+        }
+
+        await Case("CON-11 an unsupported abort never becomes historical closure evidence", async () =>
+        {
+            using var fixture = new Fixture("unsupported-abort-history", Now);
+            const string turn = "unsupported-abort-history";
+            var prefix = RootMetadata(turn, At.AddMinutes(-1)) + Start(turn, At);
+            var path = fixture.WriteSession("open-turn", prefix + AbortRow("task_aborted", turn, At.AddSeconds(10), payloadVersion: 2));
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            var rejected = await monitor.RefreshAsync(Now);
+            Check(rejected, rejected.IsPartial && rejected.ActiveTurns == 1,
+                "unsupported abort must leave the single verified turn running");
+
+            fixture.TruncateSession(path, Utf8.GetByteCount(prefix));
+            var afterRemoval = await monitor.RefreshAsync(Now);
+            Check(afterRemoval, afterRemoval.ActiveTurns == 1
+                && !afterRemoval.Issues.Any(issue => issue.Code == DailyIssueCodes.HistoricalClosureMissing),
+                "removing the unsupported row must not create missing historical closure evidence");
+        });
+
+        await Case("CON-12 unsupported non-statistics event mentioning abort is ignored", async () =>
+        {
+            using var fixture = new Fixture("unsupported-non-statistics", Now);
+            var prefix = TiedStartRows() + Complete("tied-first", At.AddSeconds(10))
+                + AbortRow("task_aborted", "tied-second", At.AddSeconds(10));
+            var ignored = JsonSerializer.Serialize(new
+            {
+                type = "event_msg", timestamp = At.AddSeconds(11), schema_version = 2,
+                payload = new { type = "user_message", schema_version = 2, message = "synthetic turn_aborted mention" }
+            }) + "\n";
+            fixture.WriteSession("tied-starts", prefix + ignored);
+            using var monitor = new SessionLogMonitor(fixture.Home, Zone);
+            ExpectTiedStarts(await monitor.RefreshAsync(Now), 9, false, "unsupported non-statistics row must not change source quality");
+        });
+
         Console.WriteLine($"RESULT CLOSURE COVERAGE: {passed} passed, {failures.Count} failed");
         if (failures.Count > 0)
             throw new InvalidOperationException("Closure coverage regressions:\n" + string.Join("\n", failures));
@@ -232,15 +307,17 @@ internal static class ClosureCoverageTests
         ExpectUnavailableTiming(actual, context);
     }
 
-    private static void ExpectTiedStarts(DailySnapshot actual, double processing, bool conflict, string context)
+    private static void ExpectTiedStarts(DailySnapshot actual, double? processing, bool conflict, string context, bool? partial = null)
     {
-        Expect(actual, 200, 120, 80, 20, conflict, context);
+        Expect(actual, 200, 120, 80, 20, partial ?? conflict, context);
         Check(actual, actual.Issues.Any(issue => issue.Code == DailyIssueCodes.CurrentStartConflict) == conflict,
             context + ": expected current-start conflict to track the unresolved tie");
-        Check(actual, actual.TurnCount == 2 && actual.ActiveTurns == 0 && actual.ActiveSeconds == 10
-            && actual.ProcessingSeconds == processing && actual.TimedTurnCount == processing / 9
+        Check(actual, actual.TurnCount == 2 && actual.ActiveTurns == 0 && actual.ActiveSeconds == 10,
+            context + ": expected two turns, zero running, and ten active seconds");
+        if (processing is null) ExpectUnavailableTiming(actual, context);
+        else Check(actual, actual.ProcessingSeconds == processing && actual.TimedTurnCount == processing.Value / 9
             && actual.AverageTps is { } tps && Math.Abs(tps - 40d / 9) < 0.000001,
-            context + ": expected two turns, zero running, ten active seconds, and retained completed-turn timing");
+            context + ": expected retained completed-turn timing");
     }
 
     private static void Check(DailySnapshot actual, bool condition, string context)
@@ -285,6 +362,15 @@ internal static class ClosureCoverageTests
     {
         type = "task_complete", turn_id = Turn(turn), duration_ms = 10000, time_to_first_token_ms = 1000
     });
+
+    private static string AbortRow(string kind, string turn, DateTimeOffset timestamp, object? envelopeVersion = null, object? payloadVersion = null)
+    {
+        var payload = new Dictionary<string, object> { ["type"] = kind, ["turn_id"] = Turn(turn) };
+        if (payloadVersion is not null) payload["schema_version"] = payloadVersion;
+        var envelope = new Dictionary<string, object> { ["type"] = "event_msg", ["timestamp"] = timestamp, ["payload"] = payload };
+        if (envelopeVersion is not null) envelope["schema_version"] = envelopeVersion;
+        return JsonSerializer.Serialize(envelope) + "\n";
+    }
 
     private static string EarlyChildRows() => ChildMetadata("A", "parent", At.AddMinutes(-1))
         + Modern("A", "shared-request", "same-day-turn", At.AddSeconds(-30));
